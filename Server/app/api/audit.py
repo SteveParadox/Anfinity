@@ -1,0 +1,169 @@
+"""Audit Log API routes."""
+from typing import List, Optional
+from datetime import datetime
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database.session import get_db
+from app.database.models import AuditLog, User as DBUser
+from app.core.auth import get_current_active_user, get_workspace_context, require_role, WorkspaceRole
+from app.core.audit import AuditAction, EntityType, get_audit_logs, get_recent_activity
+
+router = APIRouter(prefix="/audit", tags=["Audit Logs"])
+
+
+# Schemas
+class AuditLogResponse(BaseModel):
+    """Audit log response schema."""
+    id: str
+    action: str
+    entity_type: Optional[str]
+    entity_id: Optional[str]
+    user_id: Optional[str]
+    metadata: dict
+    ip_address: Optional[str]
+    created_at: str
+
+
+class AuditLogListResponse(BaseModel):
+    """Audit log list response."""
+    items: List[AuditLogResponse]
+    total: int
+
+
+@router.get("/workspace/{workspace_id}", response_model=AuditLogListResponse)
+async def get_workspace_audit_logs(
+    workspace_id: UUID,
+    action: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: DBUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get audit logs for workspace.
+    
+    Args:
+        workspace_id: Workspace UUID
+        action: Filter by action type
+        entity_type: Filter by entity type
+        start_date: Filter by start date
+        end_date: Filter by end date
+        limit: Maximum results
+        offset: Pagination offset
+        current_user: Authenticated user
+        db: Database session
+        
+    Returns:
+        List of audit logs
+    """
+    # Verify workspace membership (viewers can see audit logs)
+    await get_workspace_context(workspace_id, current_user, db)
+    
+    # Parse filters
+    action_filter = AuditAction(action) if action else None
+    entity_filter = EntityType(entity_type) if entity_type else None
+    
+    # Get logs
+    logs = await get_audit_logs(
+        db=db,
+        workspace_id=workspace_id,
+        action=action_filter,
+        entity_type=entity_filter,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+        offset=offset
+    )
+    
+    # Get total count
+    total_logs = await get_audit_logs(
+        db=db,
+        workspace_id=workspace_id,
+        action=action_filter,
+        entity_type=entity_filter,
+        start_date=start_date,
+        end_date=end_date,
+        limit=10000
+    )
+    
+    return AuditLogListResponse(
+        items=[
+            AuditLogResponse(
+                id=str(log.id),
+                action=log.action,
+                entity_type=log.entity_type,
+                entity_id=str(log.entity_id) if log.entity_id else None,
+                user_id=str(log.user_id) if log.user_id else None,
+                metadata=log.metadata or {},
+                ip_address=log.ip_address,
+                created_at=log.created_at.isoformat()
+            )
+            for log in logs
+        ],
+        total=len(total_logs)
+    )
+
+
+@router.get("/workspace/{workspace_id}/recent", response_model=AuditLogListResponse)
+async def get_recent_workspace_activity(
+    workspace_id: UUID,
+    limit: int = Query(20, ge=1, le=100),
+    current_user: DBUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get recent activity for workspace.
+    
+    Args:
+        workspace_id: Workspace UUID
+        limit: Maximum results
+        current_user: Authenticated user
+        db: Database session
+        
+    Returns:
+        List of recent audit logs
+    """
+    # Verify workspace membership
+    await get_workspace_context(workspace_id, current_user, db)
+    
+    logs = await get_recent_activity(db, workspace_id, limit)
+    
+    return AuditLogListResponse(
+        items=[
+            AuditLogResponse(
+                id=str(log.id),
+                action=log.action,
+                entity_type=log.entity_type,
+                entity_id=str(log.entity_id) if log.entity_id else None,
+                user_id=str(log.user_id) if log.user_id else None,
+                metadata=log.metadata or {},
+                ip_address=log.ip_address,
+                created_at=log.created_at.isoformat()
+            )
+            for log in logs
+        ],
+        total=len(logs)
+    )
+
+
+@router.get("/actions")
+async def get_audit_actions(
+    current_user: DBUser = Depends(get_current_active_user)
+):
+    """Get list of available audit actions.
+    
+    Args:
+        current_user: Authenticated user
+        
+    Returns:
+        List of action types
+    """
+    return {
+        "actions": [a.value for a in AuditAction],
+        "entity_types": [e.value for e in EntityType]
+    }

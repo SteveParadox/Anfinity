@@ -1,0 +1,573 @@
+"""Notes API routes for user note management."""
+from typing import Optional, List
+from datetime import datetime
+from uuid import UUID
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, or_, func
+
+from app.database.session import get_db
+from app.database.models import Note, User as DBUser
+from app.core.auth import get_current_user, get_workspace_context
+from app.core.audit import log_audit_event, AuditAction, EntityType
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/notes", tags=["Notes"])
+
+# Helper function for lazy task imports to avoid Celery import hang at startup
+def queue_note_embedding(note_id: str) -> None:
+    """Queue note embedding generation (lazy import to avoid startup hang)."""
+    try:
+        from app.tasks.note_embeddings import generate_note_embedding
+        generate_note_embedding.delay(str(note_id))
+    except Exception as e:
+        # Log but don't fail if task queueing fails
+        print(f"Warning: Failed to queue embedding task: {e}")
+
+def queue_note_summary(note_id: str) -> None:
+    """Queue note summary generation (lazy import to avoid startup hang)."""
+    try:
+        from app.tasks.note_summaries import generate_note_summary
+        generate_note_summary.delay(str(note_id))
+    except Exception as e:
+        # Log but don't fail if task queueing fails
+        print(f"Warning: Failed to queue summary task: {e}")
+
+
+# ==================== Schemas ====================
+
+class NoteCreate(BaseModel):
+    """Schema for creating a note."""
+    title: str = Field(..., min_length=1, max_length=500)
+    content: str = Field(..., min_length=1)
+    workspace_id: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    source_url: Optional[str] = None
+    note_type: str = Field(default='note', pattern='^(note|web-clip|document|voice|ai-generated)$')
+
+
+class NoteUpdate(BaseModel):
+    """Schema for updating a note."""
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    content: Optional[str] = None
+    tags: Optional[List[str]] = None
+    connections: Optional[List[str]] = None
+    note_type: Optional[str] = Field(None, pattern='^(note|web-clip|document|voice|ai-generated)$')
+
+
+class NoteResponse(BaseModel):
+    """Response schema for a note."""
+    id: str
+    workspace_id: Optional[str]
+    user_id: str
+    title: str
+    content: str
+    summary: Optional[str]
+    tags: List[str]
+    connections: List[str]
+    note_type: str
+    word_count: int
+    ai_generated: bool
+    confidence_score: Optional[float]
+    source_url: Optional[str]
+    created_at: str
+    updated_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class NoteListResponse(BaseModel):
+    """Paginated notes response."""
+    items: List[NoteResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+# ==================== Routes ====================
+
+# ==================== Utility Functions ====================
+
+def calculate_word_count(content: str) -> int:
+    """Calculate word count from note content.
+    
+    Args:
+        content: Note content text
+        
+    Returns:
+        Number of words
+    """
+    if not content:
+        return 0
+    return len(content.strip().split())
+
+
+# ==================== Endpoints ====================
+
+@router.post("", response_model=NoteResponse, status_code=status.HTTP_201_CREATED)
+async def create_note(
+    note_data: NoteCreate,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new note in a specific workspace.
+    
+    Args:
+        note_data: Note creation data (includes workspace_id)
+        current_user: Current authenticated user
+        db: Database session
+        
+    Returns:
+        Created note with workspace delegation
+        
+    Raises:
+        HTTPException: If workspace_id is not provided or user lacks access
+    """
+    
+    # Validate workspace - REQUIRED for workspace delegation
+    if not note_data.workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="workspace_id is required when creating notes"
+        )
+    
+    try:
+        workspace_id = UUID(note_data.workspace_id)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid workspace_id format"
+        )
+    
+    logger.info(f"📝 [NOTE CREATE] User {current_user.id} creating note in workspace {workspace_id}")
+    
+    # Verify workspace membership and permission
+    context = await get_workspace_context(workspace_id, current_user, db)
+    logger.debug(f"✅ [WORKSPACE VERIFIED] User has {context.role} role in workspace {workspace_id}")
+    
+    # Create note
+    new_note = Note(
+        workspace_id=workspace_id,
+        user_id=current_user.id,
+        title=note_data.title,
+        content=note_data.content,
+        tags=note_data.tags,
+        source_url=note_data.source_url,
+        note_type=note_data.note_type,
+        word_count=calculate_word_count(note_data.content),
+        ai_generated=False,
+    )
+    
+    db.add(new_note)
+    await db.flush()
+    
+    # Log action
+    await log_audit_event(
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action=AuditAction.NOTE_CREATED,
+        entity_type=EntityType.NOTE,
+        entity_id=new_note.id,
+        db=db
+    )
+    
+    await db.commit()
+    
+    # Queue background tasks for data enrichment
+    # Always generate embedding
+    queue_note_embedding(str(new_note.id))
+    
+    # Generate summary for longer notes
+    if len(note_data.content.split()) > 20:  # >20 words is substantive
+        queue_note_summary(str(new_note.id))
+    
+    return NoteResponse(
+        id=str(new_note.id),
+        workspace_id=str(new_note.workspace_id) if new_note.workspace_id else None,
+        user_id=str(new_note.user_id),
+        title=new_note.title,
+        content=new_note.content,
+        summary=new_note.summary,
+        tags=new_note.tags or [],
+        connections=new_note.connections or [],
+        note_type=new_note.note_type,
+        word_count=new_note.word_count or 0,
+        ai_generated=bool(new_note.ai_generated),
+        confidence_score=new_note.confidence_score,
+        source_url=new_note.source_url,
+        created_at=new_note.created_at.isoformat(),
+        updated_at=new_note.updated_at.isoformat() if new_note.updated_at else new_note.created_at.isoformat(),
+    )
+
+
+@router.get("", response_model=NoteListResponse)
+async def list_notes(
+    workspace_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    tags: Optional[List[str]] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List user's notes with filtering.
+    
+    Args:
+        workspace_id: Filter by workspace
+        search: Search in title and content
+        tags: Filter by tags
+        page: Page number
+        page_size: Items per page
+        current_user: Current user
+        db: Database session
+        
+    Returns:
+        Paginated notes
+    """
+    query = select(Note).where(Note.user_id == current_user.id)
+    
+    # Filter by workspace if provided
+    if workspace_id:
+        query = query.where(Note.workspace_id == UUID(workspace_id))
+    
+    # Search filter
+    if search:
+        search_term = f"%{search}%"
+        query = query.where(
+            or_(
+                Note.title.ilike(search_term),
+                Note.content.ilike(search_term)
+            )
+        )
+    
+    # Tags filter - notes must have ALL specified tags
+    if tags:
+        for tag in tags:
+            query = query.where(Note.tags.contains([tag]))
+    
+    # Get total count - build count query with same filters
+    count_query = select(func.count()).select_from(Note).where(Note.user_id == current_user.id)
+    if workspace_id:
+        count_query = count_query.where(Note.workspace_id == UUID(workspace_id))
+    if search:
+        search_term = f"%{search}%"
+        count_query = count_query.where(
+            or_(
+                Note.title.ilike(search_term),
+                Note.content.ilike(search_term)
+            )
+        )
+    if tags:
+        for tag in tags:
+            count_query = count_query.where(Note.tags.contains([tag]))
+    
+    count_result = await db.execute(count_query)
+    total = count_result.scalar() or 0
+    
+    # Apply pagination
+    offset = (page - 1) * page_size
+    query = query.order_by(Note.updated_at.desc()).offset(offset).limit(page_size)
+    
+    result = await db.execute(query)
+    notes = result.scalars().all()
+    
+    return NoteListResponse(
+        items=[
+            NoteResponse(
+                id=str(note.id),
+                workspace_id=str(note.workspace_id) if note.workspace_id else None,
+                user_id=str(note.user_id),
+                title=note.title,
+                content=note.content,
+                summary=note.summary,
+                tags=note.tags or [],
+                connections=note.connections or [],
+                note_type=note.note_type,
+                word_count=note.word_count or 0,
+                ai_generated=bool(note.ai_generated),
+                confidence_score=note.confidence_score,
+                source_url=note.source_url,
+                created_at=note.created_at.isoformat(),
+                updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
+            )
+            for note in notes
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/{note_id}", response_model=NoteResponse)
+async def get_note(
+    note_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get a specific note.
+    
+    Args:
+        note_id: Note ID
+        current_user: Current user
+        db: Database session
+        
+    Returns:
+        Note details
+    """
+    result = await db.execute(
+        select(Note).where(
+            and_(
+                Note.id == UUID(note_id),
+                Note.user_id == current_user.id
+            )
+        )
+    )
+    note = result.scalar_one_or_none()
+    
+    if not note:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found"
+        )
+    
+    return NoteResponse(
+        id=str(note.id),
+        workspace_id=str(note.workspace_id) if note.workspace_id else None,
+        user_id=str(note.user_id),
+        title=note.title,
+        content=note.content,
+        summary=note.summary,
+        tags=note.tags or [],
+        connections=note.connections or [],
+        note_type=note.note_type,
+        word_count=note.word_count or 0,
+        ai_generated=bool(note.ai_generated),
+        confidence_score=note.confidence_score,
+        source_url=note.source_url,
+        created_at=note.created_at.isoformat(),
+        updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
+    )
+
+
+@router.patch("/{note_id}", response_model=NoteResponse)
+async def update_note(
+    note_id: str,
+    updates: NoteUpdate,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update a note.
+    
+    Args:
+        note_id: Note ID
+        updates: Fields to update
+        current_user: Current user
+        db: Database session
+        
+    Returns:
+        Updated note
+    """
+    result = await db.execute(
+        select(Note).where(
+            and_(
+                Note.id == UUID(note_id),
+                Note.user_id == current_user.id
+            )
+        )
+    )
+    note = result.scalar_one_or_none()
+    
+    if not note:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found"
+        )
+    
+    # Update fields
+    content_updated = False
+    if updates.title is not None:
+        note.title = updates.title
+    if updates.content is not None:
+        note.content = updates.content
+        note.word_count = calculate_word_count(updates.content)
+        content_updated = True
+    if updates.tags is not None:
+        note.tags = updates.tags
+    if updates.connections is not None:
+        note.connections = updates.connections
+    if updates.note_type is not None:
+        note.note_type = updates.note_type
+    
+    note.updated_at = datetime.utcnow()
+    
+    # Log action
+    await log_audit_event(
+        user_id=current_user.id,
+        workspace_id=note.workspace_id,
+        action=AuditAction.NOTE_UPDATED,
+        entity_type=EntityType.NOTE,
+        entity_id=note.id,
+        db=db
+    )
+    
+    await db.commit()
+    
+    # Queue background tasks if content changed
+    if content_updated:
+        # Re-generate embedding for updated content
+        queue_note_embedding(str(note.id))
+        # Re-generate summary if content is substantive
+        if len(note.content.split()) > 20:
+            queue_note_summary(str(note.id))
+    
+    return NoteResponse(
+        id=str(note.id),
+        workspace_id=str(note.workspace_id) if note.workspace_id else None,
+        user_id=str(note.user_id),
+        title=note.title,
+        content=note.content,
+        summary=note.summary,
+        tags=note.tags or [],
+        connections=note.connections or [],
+        note_type=note.note_type,
+        word_count=note.word_count or 0,
+        ai_generated=bool(note.ai_generated),
+        confidence_score=note.confidence_score,
+        source_url=note.source_url,
+        created_at=note.created_at.isoformat(),
+        updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
+    )
+
+
+@router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_note(
+    note_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a note.
+    
+    Args:
+        note_id: Note ID
+        current_user: Current user
+        db: Database session
+    """
+    result = await db.execute(
+        select(Note).where(
+            and_(
+                Note.id == UUID(note_id),
+                Note.user_id == current_user.id
+            )
+        )
+    )
+    note = result.scalar_one_or_none()
+    
+    if not note:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found"
+        )
+    
+    # Log action before deletion
+    await log_audit_event(
+        user_id=current_user.id,
+        workspace_id=note.workspace_id,
+        action=AuditAction.NOTE_DELETED,
+        entity_type=EntityType.NOTE,
+        entity_id=note.id,
+        db=db
+    )
+    
+    await db.delete(note)
+    await db.commit()
+
+
+@router.get("/workspace/{workspace_id}", response_model=NoteListResponse)
+async def get_workspace_notes(
+    workspace_id: str,
+    search: Optional[str] = Query(None),
+    tags: Optional[List[str]] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all notes in a workspace with proper authorization.
+    
+    Args:
+        workspace_id: Workspace UUID
+        search: Search in title and content
+        tags: Filter by tags
+        page: Page number
+        page_size: Items per page
+        current_user: Current user
+        db: Database session
+        
+    Returns:
+        Paginated notes for the workspace
+    """
+    # Verify workspace membership
+    workspace_uuid = UUID(workspace_id)
+    await get_workspace_context(workspace_uuid, current_user, db)
+    
+    # Build base filters
+    filters = [Note.workspace_id == workspace_uuid]
+    
+    # Search filter
+    if search:
+        search_term = f"%{search}%"
+        filters.append(
+            or_(
+                Note.title.ilike(search_term),
+                Note.content.ilike(search_term)
+            )
+        )
+    
+    # Tags filter - notes must have ALL specified tags
+    if tags:
+        for tag in tags:
+            filters.append(Note.tags.contains([tag]))
+    
+    # Build count query with all filters
+    count_query = select(func.count()).select_from(Note).where(and_(*filters))
+    count_result = await db.execute(count_query)
+    total = count_result.scalar() or 0
+    
+    # Build data query with all filters and pagination
+    query = select(Note).where(and_(*filters)).order_by(Note.updated_at.desc())
+    offset = (page - 1) * page_size
+    query = query.offset(offset).limit(page_size)
+    
+    result = await db.execute(query)
+    notes = result.scalars().all()
+    
+    return NoteListResponse(
+        items=[
+            NoteResponse(
+                id=str(note.id),
+                workspace_id=str(note.workspace_id) if note.workspace_id else None,
+                user_id=str(note.user_id),
+                title=note.title,
+                content=note.content,
+                summary=note.summary,
+                tags=note.tags or [],
+                connections=note.connections or [],
+                note_type=note.note_type,
+                word_count=note.word_count or 0,
+                ai_generated=bool(note.ai_generated),
+                confidence_score=note.confidence_score,
+                source_url=note.source_url,
+                created_at=note.created_at.isoformat(),
+                updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
+            )
+            for note in notes
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
