@@ -224,7 +224,7 @@ async def semantic_search(
 
     # ── Semantic search ───────────────────────────────────────────────────
     try:
-        search_service: SemanticSearchService = await get_semantic_search_service(db)
+        search_service: SemanticSearchService = get_semantic_search_service(db)
         results = await search_service.search(
             workspace_id=workspace_id,
             user_id=user_id,

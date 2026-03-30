@@ -25,8 +25,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/query", tags=["Query"])
 
-# Initialize OpenAI client
-openai_client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+# Initialize OpenAI client with timeout
+# LLM operations should timeout after 60 seconds to prevent hanging requests
+openai_client = openai.OpenAI(
+    api_key=settings.OPENAI_API_KEY,
+    timeout=60.0  # 60 second timeout for LLM operations
+)
 
 
 @router.post("/embeddings/process")
@@ -519,6 +523,18 @@ Answer:"""
             tokens_used=tokens_used,
             response_time_ms=response_time_ms
         )
+    
+    except RuntimeError as e:
+        # Catch embedding service errors (priority provider failed, Ollama failed, etc.)
+        error_msg = str(e)
+        if "embedding" in error_msg.lower() or "provider" in error_msg.lower():
+            logger.error(f"Query {query_record.id}: Embedding service failure: {error_msg}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Embedding service is currently unavailable. Please try again later."
+            )
+        # Other RuntimeErrors pass through to generic handler
+        raise
     
     except Exception as e:
         logger.error(f"Query {query_record.id}: Unhandled error: {str(e)}", exc_info=True)
