@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.database.models import Chunk, Document, Embedding, SearchQuery, SearchLog
-from app.services.rag_retriever import get_rag_retriever, RAGRetriever
+# FIX B2: import RetrievedChunk so _enrich_results can be properly typed
+from app.services.rag_retriever import get_rag_retriever, RAGRetriever, RetrievedChunk
 from app.services.embeddings import get_embedding_service
 from app.config import settings
 
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 class SemanticSearchResult:
     """Semantic search result with composite scoring."""
-    
+
     def __init__(
         self,
         chunk_id: UUID,
@@ -73,15 +74,15 @@ class SemanticSearchResult:
 
 class SemanticSearchService:
     """Semantic search service with hybrid scoring."""
-    
+
     # Composite scoring weights
     SIMILARITY_WEIGHT = 0.60   # 60% semantic similarity
-    RECENCY_WEIGHT = 0.25     # 25% recency
-    USAGE_WEIGHT = 0.15       # 15% personal usage
-    
+    RECENCY_WEIGHT = 0.25      # 25% recency
+    USAGE_WEIGHT = 0.15        # 15% personal usage
+
     # Recency decay: half-life = 4 weeks
     RECENCY_HALF_LIFE_DAYS = 28
-    
+
     def __init__(self, rag_retriever: RAGRetriever, embedding_service):
         """Initialize semantic search service."""
         self.retriever = rag_retriever
@@ -97,7 +98,7 @@ class SemanticSearchService:
         db: Optional[AsyncSession] = None,
     ) -> List[SemanticSearchResult]:
         """Perform semantic search with hybrid scoring.
-        
+
         Args:
             workspace_id: Workspace UUID
             user_id: User UUID
@@ -105,91 +106,102 @@ class SemanticSearchService:
             limit: Maximum number of results to return
             filters: Optional filters (tags, date_from, date_to, source_type)
             db: Database session for logging
-            
+
         Returns:
             List of semantic search results, ranked by composite score
         """
         logger.info(f"Starting semantic search: workspace={workspace_id}, query={query}")
-        
+
         try:
-            # Step 1: Retrieve top chunks with vector similarity
-            # Fetch 3x limit to allow for re-ranking
-            raw_results = await self.retriever.retrieve(
+            # Step 1: Retrieve top chunks with vector similarity.
+            # FIX B1: retrieve() is synchronous — do NOT await it.
+            # FIX B1a: pass filters so RAGRetriever can thread them through.
+            rag_result = self.retriever.retrieve(
                 query=query,
                 workspace_id=workspace_id,
                 top_k=min(limit * 3, 100),
                 filters=filters or {},
             )
-            
-            if not raw_results:
+
+            # FIX B2: RagResult is a dataclass (always truthy); check .chunks.
+            if not rag_result.chunks:
                 logger.info(f"No results found for query: {query}")
                 return []
-            
-            # Step 2: Enrich results with metadata and calculate composite scores
+
+            # Step 2: Enrich results with metadata and calculate composite scores.
+            # FIX B2: pass rag_result.chunks (List[RetrievedChunk]), not the RagResult object.
             enriched_results = await self._enrich_results(
-                raw_results, user_id, workspace_id, query, db
+                rag_result.chunks, user_id, workspace_id, query, db
             )
-            
+
             # Step 3: Re-rank by composite score
             ranked_results = self._rerank(enriched_results, user_id)
-            
+
             # Step 4: Log search query for analytics
             if db:
                 await self._log_search_query(
                     db, user_id, workspace_id, query, ranked_results[:limit]
                 )
-            
+
             return ranked_results[:limit]
-            
+
         except Exception as e:
             logger.error(f"Semantic search error: {e}", exc_info=True)
             raise
 
     async def _enrich_results(
         self,
-        raw_results: List[Dict[str, Any]],
+        # FIX B2: typed as List[RetrievedChunk]; uses attribute access, not .get()
+        chunks: List[RetrievedChunk],
         user_id: UUID,
         workspace_id: UUID,
         query: str,
         db: Optional[AsyncSession],
     ) -> List[SemanticSearchResult]:
-        """Enrich raw results with metadata and extracted highlights.
-        
+        """Enrich raw RetrievedChunk objects with extracted highlights.
+
         Args:
-            raw_results: Raw vector search results
+            chunks: List of RetrievedChunk objects from RAGRetriever
             user_id: User UUID
             workspace_id: Workspace UUID
             query: Original query for highlighting
             db: Database session
-            
+
         Returns:
-            List of enriched semantic search results
+            List of enriched SemanticSearchResult objects
         """
         enriched = []
-        
-        for result in raw_results:
+
+        for chunk in chunks:
             try:
-                # Extract highlight from content
-                highlight = self._extract_highlight(result.get("text", ""), query)
-                
+                text = chunk.text
+                highlight = self._extract_highlight(text, query)
+
+                # FIX minor: clamp score and actually use the clamped value
+                similarity_score = max(0.0, min(chunk.similarity, 1.0))
+
+                # Pull optional fields from the Qdrant payload metadata dict
+                metadata = chunk.metadata or {}
+
                 result_obj = SemanticSearchResult(
-                    chunk_id=result.get("chunk_id"),
-                    document_id=result.get("document_id"),
-                    document_title=result.get("document_title", ""),
-                    content=result.get("text", ""),
-                    source_type=result.get("source_type", "unknown"),
-                    chunk_index=result.get("chunk_index", 0),
-                    created_at=result.get("created_at", datetime.utcnow()),
-                    interaction_count=result.get("interaction_count", 0),
-                    similarity_score=result.get("score", 0.0),
+                    chunk_id=chunk.chunk_id,
+                    document_id=chunk.document_id,
+                    document_title=metadata.get("document_title", ""),
+                    content=text,
+                    source_type=chunk.source_type,
+                    chunk_index=chunk.chunk_index,
+                    created_at=metadata.get("created_at", datetime.utcnow()),
+                    interaction_count=metadata.get("interaction_count", 0),
+                    # FIX minor: use the clamped value, not the raw chunk attribute
+                    similarity_score=similarity_score,
                     highlight=highlight,
                 )
                 enriched.append(result_obj)
-                
+
             except Exception as e:
                 logger.warning(f"Error enriching result: {e}")
                 continue
-        
+
         return enriched
 
     def _rerank(
@@ -198,95 +210,90 @@ class SemanticSearchService:
         user_id: UUID,
     ) -> List[SemanticSearchResult]:
         """Re-rank results using composite scoring formula.
-        
+
         Composite Score = 60% similarity + 25% recency + 15% usage
-        
+
         Args:
             results: Enriched search results
             user_id: User UUID
-            
+
         Returns:
             Re-ranked results by composite final score
         """
         now = datetime.utcnow()
-        
+
         for result in results:
-            # Calculate recency score: exponential decay with half-life = 4 weeks
+            # Recency score: exponential decay, half-life = 4 weeks
             age_days = (now - result.created_at).days
             decay_constant = math.log(2) / self.RECENCY_HALF_LIFE_DAYS
             result.recency_score = math.exp(-decay_constant * age_days)
-            
-            # Calculate usage score: logarithmic normalization
-            # max log10(100) ≈ 2, so divide by 2 to normalize to 0-1
+
+            # Usage score: logarithmic normalization (max ≈ log10(100) / log10(100) = 1)
             result.usage_score = min(
-                math.log10(result.interaction_count + 1) / 3.0, 1.0
+                math.log1p(result.interaction_count) / math.log1p(100),
+                1.0
             )
-            
-            # Calculate final composite score
+
+            # Penalise recency score for low-similarity results
+            if result.similarity_score < 0.5:
+                result.recency_score *= 0.3
+
+            # Composite final score
             result.final_score = (
                 (self.SIMILARITY_WEIGHT * result.similarity_score) +
                 (self.RECENCY_WEIGHT * result.recency_score) +
                 (self.USAGE_WEIGHT * result.usage_score)
             )
-        
-        # Sort by final score (descending)
+
         results.sort(key=lambda r: r.final_score, reverse=True)
-        
         logger.debug(f"Ranked {len(results)} results for user={user_id}")
-        
         return results
 
     def _extract_highlight(self, content: str, query: str) -> str:
         """Extract highlighted snippet from content containing query terms.
-        
+
         Args:
             content: Full content text
             query: Query text to search for
-            
+
         Returns:
             Highlighted snippet with ellipsis
         """
-        if not content or len(content) == 0:
+        if not content:
             return ""
-        
-        # Get query terms (words longer than 3 characters)
+
         query_terms = [
             term.lower()
             for term in query.split()
             if len(term) > 3
         ]
-        
+
         if not query_terms:
             return content[:200] + "..." if len(content) > 200 else content
-        
-        # Find first occurrence of any query term
+
         content_lower = content.lower()
-        earliest_match = None
         earliest_pos = len(content)
-        
+        earliest_match = None
+
         for term in query_terms:
             pos = content_lower.find(term)
             if pos != -1 and pos < earliest_pos:
                 earliest_pos = pos
                 earliest_match = pos
-        
+
         if earliest_match is None:
-            # No match found, return preview
             return content[:200] + "..." if len(content) > 200 else content
-        
-        # Extract context around match
+
         start = max(0, earliest_match - 80)
         end = min(len(content), earliest_match + 200)
-        
+
         highlight = ""
         if start > 0:
             highlight += "..."
-        
         highlight += content[start:end]
-        
         if end < len(content):
             highlight += "..."
-        
+
         return highlight
 
     async def _log_search_query(
@@ -297,49 +304,44 @@ class SemanticSearchService:
         query: str,
         results: List[SemanticSearchResult],
     ) -> None:
-        """Log search query for analytics and learning.
-        
-        Args:
-            db: Database session
-            user_id: User UUID
-            workspace_id: Workspace UUID
-            query: Query text
-            results: Search results
-        """
+        """Log search query for analytics and learning."""
         try:
-            # Create search log entry
             search_log = SearchLog(
                 user_id=user_id,
                 workspace_id=workspace_id,
                 query_text=query,
                 result_chunk_ids=[str(r.chunk_id) for r in results],
                 result_count=len(results),
-                clicked_count=0,  # Will be updated when user clicks results
+                clicked_count=0,
                 created_at=datetime.utcnow(),
             )
-            
+
             db.add(search_log)
             await db.flush()
-            
+
             logger.debug(f"Logged search query: {query} in workspace={workspace_id}")
-            
+
         except Exception as e:
             logger.warning(f"Error logging search query: {e}")
-            # Don't fail the search if logging fails
 
 
-async def get_semantic_search_service(
-    db: AsyncSession,
-) -> SemanticSearchService:
-    """Get semantic search service instance.
-    
-    Args:
-        db: Database session
-        
+# FIX B3: was `async def get_semantic_search_service(db: AsyncSession)` which:
+#   (a) passed db to get_rag_retriever() which takes no db arg
+#   (b) awaited two sync factory functions
+#   (c) was declared async for no reason — both factories are sync
+#
+# db is no longer a parameter here; callers that need a db session for logging
+# pass it directly to .search().
+def get_semantic_search_service(db: Optional[AsyncSession] = None) -> SemanticSearchService:
+    """Create and return a SemanticSearchService instance.
+
+    Both underlying factories (get_rag_retriever, get_embedding_service) are
+    synchronous — no await needed.  Pass a db session to .search() if you want
+    query logging.
+
     Returns:
-        Configured semantic search service
+        Configured SemanticSearchService
     """
-    retriever = await get_rag_retriever(db)
-    embedding_service = await get_embedding_service()
-    
+    retriever = get_rag_retriever()
+    embedding_service = get_embedding_service()
     return SemanticSearchService(retriever, embedding_service)

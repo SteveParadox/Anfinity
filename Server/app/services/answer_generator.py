@@ -498,6 +498,7 @@ class AnswerGenerator:
         
         return conflicts, has_conflicts
     
+
     def _build_context(
         self,
         chunks: List[RetrievedChunk],

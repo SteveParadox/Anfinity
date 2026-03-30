@@ -2,6 +2,7 @@
 from typing import List, Dict, Any, Optional
 import logging
 import os
+import time
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -10,11 +11,12 @@ try:
     from qdrant_client import QdrantClient
     from qdrant_client.models import (
         PointStruct, Distance, VectorParams,
-        FieldCondition, MatchValue, Filter, HasIdCondition,
+        FieldCondition, MatchValue, Filter,
     )
     HAS_QDRANT = True
 except ImportError:
     HAS_QDRANT = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Embedding dimension registry
@@ -35,41 +37,59 @@ EMBEDDING_DIMENSIONS: Dict[str, int] = {
     "default": 768,
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Safety constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALLOW_DESTRUCTIVE_RECREATE: bool = (
+    os.getenv("QDRANT_ALLOW_DESTRUCTIVE_RECREATE", "false").lower() == "true"
+)
+
+RECONNECT_COOLDOWN_SECONDS: float = 5.0
+
+DEFAULT_SCORE_THRESHOLD: float = 0.6
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone vector validation helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_valid_vector(vec: Any, expected_dim: int) -> bool:
+    """Return True only if *vec* looks like a real, usable embedding."""
+    if not isinstance(vec, list):
+        return False
+    if len(vec) != expected_dim:
+        return False
+    if len(vec) < 100:
+        return False
+    if all(v == vec[0] for v in vec):
+        return False
+    if len(set(vec)) < 10:
+        return False
+    return True
+
 
 class VectorDBClient:
-    """Client for Qdrant vector database.
-
-    Key design decisions
-    --------------------
-    * **Lazy reconnection** – if Qdrant was down at construction time the
-      singleton has ``self.client = None``.  Every public method calls
-      ``_ensure_connected()`` first so the connection is established as soon as
-      the server comes back, without needing to restart the worker.
-    * **Explicit dimension wins** – callers always pass the actual embedding
-      dimension to ``create_collection`` / ``upsert_vectors``, so the instance-
-      level default is only a last-resort fallback.
-    * **Race-safe collection management** – ``create_collection`` wraps the
-      delete-and-recreate path in a try/except so a concurrent task that already
-      fixed the collection doesn't cause a hard failure.
-    """
+    """Client for the Qdrant vector database."""
 
     def __init__(
         self,
         url: str = None,
         api_key: str = None,
-        embedding_dim: int = 768,   # ← changed default to 768 (safe fallback)
+        embedding_dim: int = 768,
         require_qdrant: bool = True,
     ):
         self.url = url or os.getenv("QDRANT_URL", "http://localhost:6333")
         self.api_key = api_key or os.getenv("QDRANT_API_KEY")
         self.embedding_dim = embedding_dim
         self.require_qdrant = require_qdrant
+
         self.client: Optional["QdrantClient"] = None
-        self.is_connected = False
+        self.is_connected: bool = False
+        self._last_connect_attempt: float = 0.0
 
         self.mock_storage: Dict[str, list] = {}
 
-        # Attempt initial connection (non-fatal – lazy reconnect handles the rest)
         self._attempt_connect()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -77,17 +97,18 @@ class VectorDBClient:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _attempt_connect(self) -> bool:
-        """Try to (re)connect to Qdrant.  Returns True on success."""
+        self._last_connect_attempt = time.monotonic()
+
         if not HAS_QDRANT:
-            logger.warning("Qdrant client not installed. Using mock vector DB.")
+            logger.warning("qdrant-client not installed — using mock vector DB.")
             return False
 
         try:
             client = QdrantClient(url=self.url, api_key=self.api_key, timeout=30.0)
-            client.get_collections()          # lightweight connectivity probe
+            client.get_collections()
             self.client = client
             self.is_connected = True
-            logger.info("✅ Connected to Qdrant at %s", self.url)
+            logger.info("Connected to Qdrant at %s", self.url)
             return True
         except Exception as exc:
             self.client = None
@@ -99,32 +120,35 @@ class VectorDBClient:
                     "Set QDRANT_REQUIRED=false to use mock storage for development."
                 ) from exc
             logger.warning(
-                "Qdrant unavailable – falling back to in-memory mock storage. "
-                "⚠️  VECTORS WILL NOT BE PERSISTED."
+                "Qdrant unavailable — falling back to in-memory mock storage. "
+                "VECTORS WILL NOT BE PERSISTED."
             )
             return False
 
     def _ensure_connected(self) -> None:
-        """Reconnect to Qdrant if the current connection is stale.
-
-        This is the fix for the "singleton created while Qdrant was down" bug:
-        instead of permanently caching a disconnected client, we re-probe on
-        every public operation when ``is_connected`` is False.
-        """
         if self.is_connected and self.client is not None:
-            return  # happy path – already connected
+            return
 
-        logger.info("Qdrant not connected – attempting reconnection…")
+        elapsed = time.monotonic() - self._last_connect_attempt
+        if elapsed < RECONNECT_COOLDOWN_SECONDS:
+            if self.require_qdrant:
+                raise RuntimeError(
+                    f"Qdrant unavailable at {self.url}. "
+                    f"Next reconnect attempt in "
+                    f"{RECONNECT_COOLDOWN_SECONDS - elapsed:.1f}s."
+                )
+            return
+
+        logger.info("Qdrant not connected — attempting reconnection…")
         connected = self._attempt_connect()
 
         if not connected and self.require_qdrant:
             raise RuntimeError(
                 f"Qdrant vector database is required but not connected. "
-                f"Check Qdrant server at {self.url}"
+                f"Check Qdrant server at {self.url}."
             )
 
     def is_healthy(self) -> bool:
-        """Probe Qdrant liveness without raising."""
         try:
             if self.client:
                 self.client.get_collections()
@@ -140,8 +164,11 @@ class VectorDBClient:
 
     @staticmethod
     def get_dimension_for_model(model_name: str) -> int:
-        """Return the vector dimension for *model_name*, falling back to 768."""
         return EMBEDDING_DIMENSIONS.get(model_name, EMBEDDING_DIMENSIONS["default"])
+
+    @staticmethod
+    def versioned_collection_name(base_name: str, dim: int) -> str:
+        return f"{base_name}_{dim}d"
 
     # ─────────────────────────────────────────────────────────────────────────
     # Collection management
@@ -152,34 +179,15 @@ class VectorDBClient:
         collection_name: str,
         embedding_dim: int = None,
     ) -> bool:
-        """Ensure a collection exists with the correct vector dimension.
-
-        If the collection already exists with the *wrong* dimension it is
-        deleted and re-created.  The delete-and-recreate is wrapped in an
-        extra try/except so a concurrent task that already fixed the collection
-        does not cause a hard failure here.
-
-        Args:
-            collection_name: Qdrant collection name (usually workspace_id).
-            embedding_dim:   Required vector size.  Uses the instance default
-                             when omitted, but callers should always pass this
-                             explicitly based on the active embedding model.
-
-        Returns:
-            True on success, False on error.
-        """
-        # ── reconnect if needed ────────────────────────────────────────────
         self._ensure_connected()
 
         dim = embedding_dim or self.embedding_dim
 
-        # ── mock path ─────────────────────────────────────────────────────
         if not self.client:
-            logger.debug("Mock: Creating collection %s (dim=%d)", collection_name, dim)
+            logger.debug("Mock: creating collection '%s' (dim=%d)", collection_name, dim)
             self.mock_storage.setdefault(collection_name, [])
             return True
 
-        # ── real Qdrant path ──────────────────────────────────────────────
         try:
             collections = self.client.get_collections()
             existing_names = {c.name for c in collections.collections}
@@ -195,41 +203,43 @@ class VectorDBClient:
                     )
                     return True
 
-                # ── dimension mismatch: delete and recreate ────────────────
+                if not ALLOW_DESTRUCTIVE_RECREATE:
+                    raise RuntimeError(
+                        f"Dimension mismatch for collection '{collection_name}': "
+                        f"stored={existing_dim}D, required={dim}D.  "
+                        "Refusing to delete — set QDRANT_ALLOW_DESTRUCTIVE_RECREATE=true "
+                        "to enable automatic recreation (DATA WILL BE LOST).  "
+                        "Consider using versioned_collection_name() instead."
+                    )
+
                 logger.warning(
-                    "🔄 DIMENSION MISMATCH in '%s': stored=%dD, required=%dD. "
-                    "Deleting collection and recreating — all existing vectors "
-                    "for this workspace will be lost.",
+                    "DIMENSION MISMATCH in '%s': stored=%dD, required=%dD. "
+                    "ALLOW_DESTRUCTIVE_RECREATE=true — deleting collection.",
                     collection_name, existing_dim, dim,
                 )
                 try:
                     self.client.delete_collection(collection_name)
                     logger.info("Deleted mismatched collection '%s'", collection_name)
                 except Exception as del_exc:
-                    # Another concurrent task may have already deleted it.
                     logger.warning(
-                        "Could not delete collection '%s' (maybe already gone): %s",
+                        "Could not delete collection '%s': %s",
                         collection_name, del_exc,
                     )
 
-            # ── create (or recreate after deletion) ───────────────────────
             self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
             )
-            logger.info(
-                "✅ Created Qdrant collection '%s' (dim=%d)", collection_name, dim
-            )
+            logger.info("Created Qdrant collection '%s' (dim=%d)", collection_name, dim)
             return True
 
+        except RuntimeError:
+            raise
         except Exception as exc:
-            logger.error(
-                "Error creating collection '%s': %s", collection_name, exc
-            )
+            logger.error("Error creating collection '%s': %s", collection_name, exc)
             return False
 
     def delete_collection(self, collection_name: str) -> bool:
-        """Delete a collection entirely."""
         self._ensure_connected()
 
         if not self.client:
@@ -245,7 +255,6 @@ class VectorDBClient:
             return False
 
     def get_collection_dimension(self, collection_name: str) -> Optional[int]:
-        """Return the stored vector dimension for *collection_name*, or None."""
         if not self.client:
             return None
         try:
@@ -263,84 +272,70 @@ class VectorDBClient:
         collection_name: str,
         points: List[Dict[str, Any]],
     ) -> bool:
-        """Insert or update vectors with automatic dimension mismatch recovery.
-
-        Each element of *points* must contain:
-            ``{"id": str, "vector": List[float], "payload": Dict}``
-
-        Returns True on success, False on error.
-        
-        Dimension Mismatch Handling:
-            If vectors don't match the collection's expected dimension,
-            automatically deletes the collection and recreates it with
-            the correct dimension, then retries the upsert once.
-        """
         if not points:
             return True
 
         self._ensure_connected()
 
-        if not self.client:
-            # Mock path
-            bucket = self.mock_storage.setdefault(collection_name, [])
-            existing_ids = {p["id"] for p in bucket}
-            bucket[:] = [p for p in bucket if p["id"] not in existing_ids]
-            bucket.extend(points)
-            logger.debug(
-                "Mock: upserted %d vectors to '%s'", len(points), collection_name
+        first_vec = points[0].get("vector") or []
+        actual_dim = len(first_vec)
+
+        if actual_dim == 0:
+            logger.error(
+                "upsert_vectors: first point '%s' has an empty vector — aborting.",
+                points[0].get("id"),
             )
+            return False
+
+        invalid = [
+            p.get("id")
+            for p in points
+            if not is_valid_vector(p.get("vector"), actual_dim)
+        ]
+        if invalid:
+            logger.error(
+                "upsert_vectors: %d invalid vector(s) detected. Offending IDs: %s. Aborting.",
+                len(invalid), invalid[:10],
+            )
+            return False
+
+        if not self.client:
+            bucket = self.mock_storage.setdefault(collection_name, [])
+            incoming_ids = {p["id"] for p in points}
+            bucket[:] = [p for p in bucket if p["id"] not in incoming_ids]
+            bucket.extend(points)
+            logger.debug("Mock: upserted %d vectors to '%s'", len(points), collection_name)
             return True
 
-        # Sample actual dimension from first vector
-        actual_dim = len(points[0].get("vector", [])) if points else 768
+        try:
+            info = self.client.get_collection(collection_name)
+            stored_dim: int = info.config.params.vectors.size
+
+            if actual_dim != stored_dim:
+                if not ALLOW_DESTRUCTIVE_RECREATE:
+                    logger.error(
+                        "Dimension mismatch for '%s': collection=%dD, vectors=%dD. Aborting.",
+                        collection_name, stored_dim, actual_dim,
+                    )
+                    return False
+
+                logger.warning(
+                    "DIMENSION MISMATCH '%s': collection=%dD vs vectors=%dD. Recreating.",
+                    collection_name, stored_dim, actual_dim,
+                )
+                self.client.delete_collection(collection_name)
+                self.client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(size=actual_dim, distance=Distance.COSINE),
+                )
+
+        except Exception as probe_exc:
+            logger.debug(
+                "Could not probe collection '%s' before upsert: %s",
+                collection_name, probe_exc,
+            )
 
         try:
-            # ── PRE-FLIGHT: Check if collection exists and has matching dimension ──────
-            try:
-                collection_info = self.client.get_collection(collection_name)
-                expected_dim = collection_info.config.params.vectors.size
-                
-                if actual_dim != expected_dim:
-                    # ── MISMATCH DETECTED: Attempt active recovery ────────────────────
-                    logger.warning(
-                        "\n"
-                        "🔄 DIMENSION MISMATCH DETECTED - AUTO-RECOVERY STARTED\n"
-                        f"   Collection:      {collection_name}\n"
-                        f"   Expected:        {expected_dim}D (in schema)\n"
-                        f"   Got:             {actual_dim}D (vectors ready)\n"
-                        f"   Qdrant URL:      {self.url}\n"
-                        "\n"
-                        "ACTION: Deleting mismatched collection and recreating with correct dimension…\n"
-                    )
-                    
-                    # Delete the mismatched collection
-                    try:
-                        self.client.delete_collection(collection_name)
-                        logger.info(f"✅ Deleted mismatched collection: {collection_name} ({expected_dim}D)")
-                    except Exception as del_error:
-                        logger.error(f"❌ Failed to delete collection: {del_error}")
-                        return False
-                    
-                    # Recreate with correct dimension
-                    try:
-                        self.client.create_collection(
-                            collection_name=collection_name,
-                            vectors_config=VectorParams(size=actual_dim, distance=Distance.COSINE),
-                        )
-                        logger.info(
-                            f"✅ Recreated collection: {collection_name} with {actual_dim}D vectors"
-                        )
-                    except Exception as create_error:
-                        logger.error(f"❌ Failed to recreate collection: {create_error}")
-                        return False
-                    
-                    # Continue to upsert with the new collection
-                    
-            except Exception as probe_error:
-                # If collection doesn't exist or we can't check it, just proceed with upsert
-                logger.debug(f"Could not probe collection: {probe_error}")
-            
-            # ── UPSERT: Prepare and upload vectors ──────────────────────────────────
             qdrant_points = [
                 PointStruct(
                     id=p["id"],
@@ -349,75 +344,29 @@ class VectorDBClient:
                 )
                 for p in points
             ]
-            
             self.client.upsert(collection_name=collection_name, points=qdrant_points)
             logger.info(
-                f"✅ Successfully upserted {len(points)} vectors to '{collection_name}' ({actual_dim}D)"
+                "Upserted %d vectors to '%s' (dim=%d)",
+                len(points), collection_name, actual_dim,
             )
             return True
-            
+
         except Exception as exc:
-            error_str = str(exc)
-            
-            # ── FALLBACK: If upsert still fails, try one-time recovery ─────────────────
-            if "dimension" in error_str.lower():
-                logger.warning(
-                    f"\n"
-                    f"⚠️  Upsert failed with dimension error — attempting one-time recovery\n"
-                    f"   Collection: {collection_name}\n"
-                    f"   Error: {error_str}\n"
-                )
-                
-                try:
-                    # Delete and recreate
-                    self.client.delete_collection(collection_name)
-                    logger.info(f"✅ Deleted collection for recovery: {collection_name}")
-                    
-                    self.client.create_collection(
-                        collection_name=collection_name,
-                        vectors_config=VectorParams(size=actual_dim, distance=Distance.COSINE),
-                    )
-                    logger.info(f"✅ Recreated collection for recovery: {collection_name} ({actual_dim}D)")
-                    
-                    # ONE RETRY: Attempt upsert again
-                    qdrant_points = [
-                        PointStruct(
-                            id=p["id"],
-                            vector=p["vector"],
-                            payload=p.get("payload", {}),
-                        )
-                        for p in points
-                    ]
-                    
-                    self.client.upsert(collection_name=collection_name, points=qdrant_points)
-                    logger.info(
-                        f"✅ Recovery successful! Upserted {len(points)} vectors after recreation"
-                    )
-                    return True
-                    
-                except Exception as recovery_error:
-                    logger.error(
-                        f"❌ Recovery failed: {recovery_error}",
-                        exc_info=True,
-                    )
-                    return False
-                    
-            # Not a dimension error - other issue
-            elif "collection" in error_str.lower() and "not found" in error_str.lower():
-                logger.error(
-                    f"Collection '{collection_name}' not found in Qdrant at {self.url} — will retry",
-                )
-            elif "connection" in error_str.lower():
-                logger.error(
-                    f"Connection error to Qdrant at {self.url}: {error_str}",
-                )
+            error_str = str(exc).lower()
+
+            if "connection" in error_str:
+                logger.error("Connection error to Qdrant at %s: %s", self.url, exc)
                 self.is_connected = False
+            elif "not found" in error_str and "collection" in error_str:
+                logger.error(
+                    "Collection '%s' not found — call create_collection() first.",
+                    collection_name,
+                )
             else:
                 logger.error(
-                    f"Error upserting {len(points)} vectors to '{collection_name}': {error_str}",
-                    exc_info=True,
+                    "Error upserting %d vectors to '%s': %s",
+                    len(points), collection_name, exc, exc_info=True,
                 )
-            
             return False
 
     def search_similar(
@@ -426,21 +375,32 @@ class VectorDBClient:
         query_vector: List[float],
         workspace_id: str = None,
         limit: int = 10,
-        score_threshold: float = 0.0,
+        score_threshold: float = DEFAULT_SCORE_THRESHOLD,
     ) -> List[Dict[str, Any]]:
-        """Return the *limit* most similar vectors to *query_vector*.
+        """Return the *limit* most similar vectors to *query_vector*."""
+        if not query_vector:
+            logger.error("search_similar: query_vector is empty — returning []")
+            return []
 
-        Each result dict contains ``{"id", "similarity", "payload"}``.
-        """
+        expected_dim = self.get_collection_dimension(collection_name) or self.embedding_dim
+        if not is_valid_vector(query_vector, expected_dim):
+            logger.error(
+                "search_similar: query vector is invalid (dim=%d, distinct=%d, "
+                "expected_dim=%d) — returning [].",
+                len(query_vector) if isinstance(query_vector, list) else -1,
+                len(set(query_vector)) if isinstance(query_vector, list) else 0,
+                expected_dim,
+            )
+            return []
+
         self._ensure_connected()
 
         if not self.client:
-            # Mock: return stored points in insertion order
             points = self.mock_storage.get(collection_name, [])
             return [
                 {
                     "id": p["id"],
-                    "similarity": 0.85 - (i * 0.05),
+                    "similarity": round(0.85 - (i * 0.05), 4),
                     "payload": p.get("payload", {}),
                 }
                 for i, p in enumerate(points[:limit])
@@ -448,12 +408,12 @@ class VectorDBClient:
 
         try:
             query_filter = None
-            if workspace_id:
+            if workspace_id is not None:
                 query_filter = Filter(
                     must=[
                         FieldCondition(
                             key="workspace_id",
-                            match=MatchValue(value=workspace_id),
+                            match=MatchValue(value=str(workspace_id)),
                         )
                     ]
                 )
@@ -474,9 +434,7 @@ class VectorDBClient:
                 for r in results
             ]
         except Exception as exc:
-            logger.error(
-                "Error searching collection '%s': %s", collection_name, exc
-            )
+            logger.error("Error searching collection '%s': %s", collection_name, exc)
             return []
 
     def delete_points(
@@ -484,33 +442,25 @@ class VectorDBClient:
         collection_name: str,
         ids: List[str],
     ) -> bool:
-        """Delete specific vector IDs from a collection."""
         if not ids:
             return True
 
         self._ensure_connected()
 
         if not self.client:
-            bucket = self.mock_storage.get(collection_name, [])
             id_set = set(ids)
+            bucket = self.mock_storage.get(collection_name, [])
             self.mock_storage[collection_name] = [
                 p for p in bucket if p["id"] not in id_set
             ]
             return True
 
         try:
-            self.client.delete(
-                collection_name=collection_name,
-                points_selector=ids,
-            )
-            logger.debug(
-                "Deleted %d vectors from '%s'", len(ids), collection_name
-            )
+            self.client.delete(collection_name=collection_name, points_selector=ids)
+            logger.debug("Deleted %d vectors from '%s'", len(ids), collection_name)
             return True
         except Exception as exc:
-            logger.error(
-                "Error deleting vectors from '%s': %s", collection_name, exc
-            )
+            logger.error("Error deleting vectors from '%s': %s", collection_name, exc)
             return False
 
     def delete_by_filter(
@@ -518,19 +468,14 @@ class VectorDBClient:
         collection_name: str,
         filters: Dict[str, Any],
     ) -> bool:
-        """Delete all vectors whose payload matches *filters*.
-
-        Only ``str`` equality filters are supported here.
-        """
         self._ensure_connected()
 
         if not self.client:
-            # Mock: naive scan
             bucket = self.mock_storage.get(collection_name, [])
             self.mock_storage[collection_name] = [
                 p for p in bucket
                 if not all(
-                    p.get("payload", {}).get(k) == v
+                    str(p.get("payload", {}).get(k)) == str(v)
                     for k, v in filters.items()
                 )
             ]
@@ -538,7 +483,7 @@ class VectorDBClient:
 
         try:
             conditions = [
-                FieldCondition(key=k, match=MatchValue(value=v))
+                FieldCondition(key=k, match=MatchValue(value=str(v)))
                 for k, v in filters.items()
             ]
             self.client.delete(
@@ -560,10 +505,6 @@ class VectorDBClient:
 # ─────────────────────────────────────────────────────────────────────────────
 # Singleton factory
 # ─────────────────────────────────────────────────────────────────────────────
-# NOTE: The singleton caches the *client connection*, NOT the embedding
-# dimension.  Callers must always pass `embedding_dim` explicitly to
-# `create_collection` so the correct dimension is used regardless of which
-# model was active when the singleton was first initialised.
 
 _vector_db_client: Optional[VectorDBClient] = None
 
@@ -571,23 +512,45 @@ _vector_db_client: Optional[VectorDBClient] = None
 def get_vector_db_client(embedding_dim: int = None) -> VectorDBClient:
     """Return the shared VectorDBClient, creating it on first call.
 
-    ``embedding_dim`` is intentionally NOT baked into the singleton – it must
-    be supplied to ``create_collection`` at call-time so the correct dimension
-    is always used regardless of which embedding model is active.
+    FIX B6: the original code defaulted embedding_dim to 768 when the arg was
+    omitted, which means any caller that didn't know the active model's dimension
+    at construction time silently stamped the singleton with the wrong value.
+    `search_similar` then fell back to `self.embedding_dim` (768) for the
+    `is_valid_vector` check whenever `get_collection_dimension` returned None
+    (e.g. collection not yet created), rejecting valid 1536-D query vectors.
 
-    The client will transparently reconnect to Qdrant on each public method
-    call if the previous connection was unavailable (e.g. Qdrant restarted
-    while the Celery worker was running).
+    Resolution: when no dim is provided, derive it from the EmbeddingService
+    singleton so the VectorDBClient always knows the true active dimension.
+    `create_collection` and `upsert_vectors` still accept explicit `embedding_dim`
+    overrides — this only fixes the instance-level fallback default.
     """
     global _vector_db_client
 
     if _vector_db_client is None:
+        if embedding_dim is None:
+            # Derive the correct dimension from the active EmbeddingService
+            # rather than hard-coding 768.  Import locally to avoid circular
+            # imports at module load time.
+            try:
+                from app.services.embeddings import get_embedding_service
+                embedding_dim = get_embedding_service().get_dimension()
+                logger.debug(
+                    "VectorDBClient singleton: derived embedding_dim=%d from EmbeddingService",
+                    embedding_dim,
+                )
+            except Exception as exc:
+                embedding_dim = 768
+                logger.warning(
+                    "Could not derive embedding_dim from EmbeddingService (%s); "
+                    "defaulting to %d.  Ensure EMBEDDING_PROVIDER is configured "
+                    "before the first vector search.",
+                    exc, embedding_dim,
+                )
+
         from app.config import settings
 
         _vector_db_client = VectorDBClient(
-            # Default dim is irrelevant – create_collection always receives it
-            # explicitly from _index_vectors.  Set to a safe value nonetheless.
-            embedding_dim=embedding_dim or 768,
+            embedding_dim=embedding_dim,
             require_qdrant=settings.QDRANT_REQUIRED,
         )
 

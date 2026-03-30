@@ -3,13 +3,16 @@ import logging
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from uuid import UUID
-from datetime import datetime
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_
 
-from app.database.models import Chunk, Document, Embedding
-from app.ingestion.embedder import Embedder
+# FIX B5: removed `from app.ingestion.embedder import Embedder` — that class
+# has its own provider initialisation path that can diverge from the
+# EmbeddingService singleton (different model, different dimension), which
+# would silently corrupt Qdrant searches against the wrong-sized collection.
+# Use the shared singleton instead so the embed model is always identical to
+# what wrote the vectors.
+from app.services.embeddings import get_embedding_service
 from app.services.vector_db import get_vector_db_client
 from app.config import settings
 
@@ -30,7 +33,7 @@ class RetrievedChunk:
     context_before: Optional[str] = None
     context_after: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to response dictionary."""
         return {
@@ -61,14 +64,14 @@ class RetrievalResult:
 
 class TopKRetriever:
     """Top-K chunk retriever using semantic similarity.
-    
+
     STEP 3 Implementation:
-    1. Embed query using same model as chunks
+    1. Embed query using the shared EmbeddingService singleton (same model as chunks)
     2. Search vector DB with workspace filtering
     3. Retrieve top K (10-15) nearest neighbors
     4. Return with similarity scores and metadata
     """
-    
+
     def __init__(
         self,
         db: Session,
@@ -76,25 +79,35 @@ class TopKRetriever:
         similarity_threshold: float = 0.0
     ):
         """Initialize retriever.
-        
+
         Args:
             db: Database session
             top_k: Number of top chunks to retrieve (10-15 recommended)
             similarity_threshold: Minimum similarity threshold (0.0 = disabled)
         """
         self.db = db
-        self.top_k = min(top_k, 20)  # Cap at 20
+        self.top_k = min(top_k, 20)
         self.similarity_threshold = similarity_threshold
-        self.embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+
+        # FIX B5: use the shared EmbeddingService singleton.
+        # This guarantees the query embedding uses the exact same model and
+        # dimension as the embeddings that were written to Qdrant by the
+        # ingestion pipeline.
+        self.embedding_service = get_embedding_service()
+
+        # Pass the actual active dimension so VectorDBClient constructs
+        # (or validates) the collection with the right size.
         self.vector_db = get_vector_db_client(
-            embedding_dim=self.embedder.dimension
+            embedding_dim=self.embedding_service.get_dimension()
         )
-        
+
         logger.info(
-            f"TopKRetriever initialized: top_k={self.top_k}, "
-            f"provider={self.embedder._provider.__class__.__name__}"
+            "TopKRetriever initialized: top_k=%d, provider=%s, dim=%d",
+            self.top_k,
+            settings.EMBEDDING_PROVIDER,
+            self.embedding_service.get_dimension(),
         )
-    
+
     def retrieve(
         self,
         query: str,
@@ -103,78 +116,83 @@ class TopKRetriever:
         similarity_threshold: Optional[float] = None
     ) -> RetrievalResult:
         """Retrieve top K chunks most similar to query.
-        
+
         STEP 3 Pipeline:
-        1. Embed query text
+        1. Embed query text via shared EmbeddingService
         2. Search Qdrant with workspace filter
         3. Get top K results with similarity scores
-        4. Fetch full chunk details from PostgreSQL
-        5. Construct result payloads with metadata
-        
+        4. Construct result payloads with metadata
+
         Args:
             query: User query text
             workspace_id: Workspace ID for filtering
             top_k: Override default top_k
             similarity_threshold: Override default threshold
-            
+
         Returns:
             RetrievalResult with retrieved chunks and metadata
         """
         import time
         start_time = time.time()
-        
+
         top_k = top_k or self.top_k
-        threshold = similarity_threshold if similarity_threshold is not None else self.similarity_threshold
-        
+        threshold = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else self.similarity_threshold
+        )
+        workspace_id_str = str(workspace_id)
+
         logger.info(f"Retrieving top {top_k} chunks for query: '{query[:50]}...'")
-        
+
         try:
-            # Step 1: Embed query using same model as chunks
-            logger.debug(f"Embedding query with {self.embedder._provider.model_name}...")
-            query_embedding = self.embedder._provider.embed([query])[0]
-            
+            # Step 1: Embed query using the shared singleton.
+            # FIX B5: was `self.embedder._provider.embed([query])[0]` which
+            # bypassed all EmbeddingService validation and could produce a
+            # vector of a different dimension if the Embedder was initialised
+            # with a different provider config.
+            logger.debug(
+                "Embedding query with %s (dim=%d)...",
+                settings.EMBEDDING_PROVIDER,
+                self.embedding_service.get_dimension(),
+            )
+            query_embedding = self.embedding_service.embed_text(query)
+            # embed_text raises RuntimeError on failure; no silent empty-vector
+            # path exists, so we only need to guard against an unexpected None.
             if not query_embedding:
-                logger.error("Failed to generate query embedding")
-                return RetrievalResult(
-                    chunks=[],
-                    total_retrieved=0,
-                    average_similarity=0.0,
-                    query_embedding_dim=0,
-                    retrieval_time_ms=0,
-                    workspace_id=str(workspace_id)
-                )
-            
+                logger.error("embed_text returned empty vector unexpectedly")
+                return self._empty_result(workspace_id_str, start_time)
+
             embedding_dim = len(query_embedding)
             logger.debug(f"Query embedding generated: {embedding_dim} dimensions")
-            
+
             # Step 2: Search vector DB with workspace filtering
-            collection_name = str(workspace_id)
-            
+            collection_name = workspace_id_str
+
             logger.debug(
-                f"Searching Qdrant collection '{collection_name}' "
-                f"with threshold {threshold}..."
+                "Searching Qdrant collection '%s' with threshold %s...",
+                collection_name,
+                threshold,
             )
-            
+
             vector_results = self.vector_db.search_similar(
                 collection_name=collection_name,
                 query_vector=query_embedding,
-                workspace_id=str(workspace_id),
+                workspace_id=workspace_id_str,
                 limit=top_k,
                 score_threshold=threshold
             )
-            
+
             logger.info(f"Vector DB returned {len(vector_results)} results")
-            
+
             # Step 3: Convert to RetrievedChunk objects with full metadata
             retrieved_chunks = []
-            
+
             for i, result in enumerate(vector_results):
                 try:
-                    # Extract payload from vector search result
                     payload = result.get("payload", {})
                     similarity = result.get("similarity", 0.0)
-                    
-                    # Build chunk object from payload
+
                     chunk = RetrievedChunk(
                         chunk_id=payload.get("chunk_id", result.get("id", "")),
                         document_id=payload.get("document_id", ""),
@@ -188,54 +206,54 @@ class TopKRetriever:
                         context_after=payload.get("context_after"),
                         metadata=payload.get("metadata")
                     )
-                    
+
                     retrieved_chunks.append(chunk)
                     logger.debug(
-                        f"  [{i+1}] chunk_id={chunk.chunk_id} "
-                        f"similarity={chunk.similarity:.4f} "
-                        f"doc={chunk.document_title}"
+                        "  [%d] chunk_id=%s similarity=%.4f doc=%s",
+                        i + 1, chunk.chunk_id, chunk.similarity, chunk.document_title,
                     )
-                
+
                 except Exception as e:
                     logger.error(f"Error processing result {i}: {e}")
                     continue
-            
-            # Calculate average similarity
+
             avg_similarity = (
                 sum(c.similarity for c in retrieved_chunks) / len(retrieved_chunks)
                 if retrieved_chunks else 0.0
             )
-            
-            # Build result
+
             retrieval_time_ms = (time.time() - start_time) * 1000
-            
+
             logger.info(
-                f"✓ Retrieved {len(retrieved_chunks)} chunks "
-                f"(avg_similarity={avg_similarity:.4f}, time={retrieval_time_ms:.1f}ms)"
+                "✓ Retrieved %d chunks (avg_similarity=%.4f, time=%.1fms)",
+                len(retrieved_chunks), avg_similarity, retrieval_time_ms,
             )
-            
+
             return RetrievalResult(
                 chunks=retrieved_chunks,
                 total_retrieved=len(retrieved_chunks),
                 average_similarity=avg_similarity,
                 query_embedding_dim=embedding_dim,
                 retrieval_time_ms=retrieval_time_ms,
-                workspace_id=str(workspace_id)
+                workspace_id=workspace_id_str
             )
-        
+
         except Exception as e:
             logger.error(f"Error during retrieval: {e}", exc_info=True)
-            retrieval_time_ms = (time.time() - start_time) * 1000
-            
-            return RetrievalResult(
-                chunks=[],
-                total_retrieved=0,
-                average_similarity=0.0,
-                query_embedding_dim=0,
-                retrieval_time_ms=retrieval_time_ms,
-                workspace_id=str(workspace_id)
-            )
-    
+            return self._empty_result(workspace_id_str, start_time)
+
+    def _empty_result(self, workspace_id_str: str, start_time: float) -> RetrievalResult:
+        """Return a zero-result RetrievalResult."""
+        import time
+        return RetrievalResult(
+            chunks=[],
+            total_retrieved=0,
+            average_similarity=0.0,
+            query_embedding_dim=0,
+            retrieval_time_ms=(time.time() - start_time) * 1000,
+            workspace_id=workspace_id_str
+        )
+
     def retrieve_with_reranking(
         self,
         query: str,
@@ -244,105 +262,81 @@ class TopKRetriever:
         rerank_model: str = "similarity"
     ) -> RetrievalResult:
         """Retrieve top K chunks with optional re-ranking.
-        
+
         Args:
             query: User query
             workspace_id: Workspace ID
             top_k: Number of chunks
             rerank_model: Reranker to use ("similarity", "diversity", "recency")
-            
+
         Returns:
             RetrievalResult with re-ranked chunks
         """
-        # Get initial results with larger top_k for reranking
         initial_top_k = (top_k or self.top_k) * 2
-        
+
         result = self.retrieve(
             query=query,
             workspace_id=workspace_id,
             top_k=initial_top_k
         )
-        
+
         if not result.chunks:
             return result
-        
-        # Apply re-ranking strategy
+
         if rerank_model == "diversity":
             result.chunks = self._rerank_by_diversity(result.chunks)
         elif rerank_model == "recency":
             result.chunks = self._rerank_by_recency(result.chunks)
-        # else: keep similarity ranking (default)
-        
-        # Trim to requested top_k
+
         result.chunks = result.chunks[:top_k or self.top_k]
         result.total_retrieved = len(result.chunks)
-        
+
         return result
-    
+
     def _rerank_by_diversity(
         self,
         chunks: List[RetrievedChunk]
     ) -> List[RetrievedChunk]:
-        """Re-rank chunks to maximize document diversity.
-        
-        Ensures chunks from different documents are prioritized.
-        """
+        """Re-rank chunks to maximise document diversity."""
         if not chunks:
             return chunks
-        
-        # Sort by similarity first
+
         sorted_chunks = sorted(chunks, key=lambda c: c.similarity, reverse=True)
-        
-        # Greedy selection for diversity
+
         reranked = []
         seen_docs = set()
-        
-        # First pass: take best from each document
+
         for chunk in sorted_chunks:
             if chunk.document_id not in seen_docs:
                 reranked.append(chunk)
                 seen_docs.add(chunk.document_id)
-        
-        # Second pass: fill remaining slots with any chunks
+
         for chunk in sorted_chunks:
-            if len(reranked) < len(chunks):
-                if chunk not in reranked:
-                    reranked.append(chunk)
-        
+            if len(reranked) < len(chunks) and chunk not in reranked:
+                reranked.append(chunk)
+
         return reranked
-    
+
     def _rerank_by_recency(
         self,
         chunks: List[RetrievedChunk]
     ) -> List[RetrievedChunk]:
-        """Re-rank chunks by recency (newer first).
-        
-        Assumes metadata contains timestamps.
-        """
-        # For now, just return similarity-sorted
-        # In production, would use created_at from metadata
+        """Re-rank chunks by recency (similarity fallback until timestamps in metadata)."""
         return sorted(chunks, key=lambda c: c.similarity, reverse=True)
-    
+
     def get_query_stats(
         self,
         result: RetrievalResult
     ) -> Dict[str, Any]:
-        """Get statistics about retrieval result.
-        
-        Args:
-            result: RetrievalResult
-            
-        Returns:
-            Statistics dictionary
-        """
+        """Get statistics about retrieval result."""
         unique_docs = len(set(c.document_id for c in result.chunks))
         high_sim_count = sum(1 for c in result.chunks if c.similarity >= 0.75)
-        
+
         return {
             "total_chunks_retrieved": result.total_retrieved,
             "average_similarity": round(result.average_similarity, 4),
             "unique_documents": unique_docs,
-            "high_confidence_chunks": high_sim_count,  # similarity >= 0.75
+            "high_confidence_chunks": high_sim_count,
             "query_embedding_dimension": result.query_embedding_dim,
             "retrieval_time_ms": round(result.retrieval_time_ms, 2)
         }
@@ -353,16 +347,7 @@ def get_top_k_retriever(
     top_k: int = 10,
     similarity_threshold: float = 0.0
 ) -> TopKRetriever:
-    """Factory function to create TopKRetriever instance.
-    
-    Args:
-        db: Database session
-        top_k: Top K value (10-15 recommended)
-        similarity_threshold: Minimum similarity threshold
-        
-    Returns:
-        TopKRetriever instance
-    """
+    """Factory function to create TopKRetriever instance."""
     return TopKRetriever(
         db=db,
         top_k=top_k,
