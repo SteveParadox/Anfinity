@@ -777,11 +777,10 @@ class ApiClient {
     workspaceId: string,
     options?: {
       limit?: number;
-      score_threshold?: number;
-      filters?: Record<string, any>;
+      model?: string;
     }
   ): Promise<{
-    id: string;
+    query_id: string;
     query: string;
     answer: string;
     sources: Array<{
@@ -791,19 +790,26 @@ class ApiClient {
       text: string;
       similarity: number;
     }>;
-    confidence_score: number;
+    confidence: number;
+    confidence_factors: Record<string, number>;
     model_used: string;
-    tokens_used: number;
-    created_at: string;
   }> {
-    return this.request(`/query?workspace_id=${workspaceId}`, {
+    // RAG queries can take longer due to embedding generation + vector search + LLM generation
+    // Timeout: 120 seconds (2 minutes) to allow for:
+    // - Query embedding: ~5-10s
+    // - Vector search: ~2-5s
+    // - LLM generation with context: ~30-90s (depending on provider)
+    // - Network/retry overhead: ~5-10s
+    return this.request(`/query`, {
       method: 'POST',
       body: JSON.stringify({
+        workspace_id: workspaceId,
         query,
-        limit: options?.limit || 10,
-        score_threshold: options?.score_threshold,
-        filters: options?.filters || {},
+        top_k: options?.limit || 5,
+        include_sources: true,
+        model: options?.model || 'gpt-4o-mini',
       }),
+      timeout: 120000, // 120 seconds for RAG queries
     });
   }
 

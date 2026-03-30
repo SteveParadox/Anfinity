@@ -205,11 +205,21 @@ export function SearchView() {
     setActiveFilters((p) => (p.includes(tag) ? p.filter((t) => t !== tag) : [...p, tag]));
 
   // Execute semantic search via backend API
-  const doSearch = async () => {
-    console.log('🔍 [SEARCH START] Executing semantic search - Query: "%s", Workspace: %s', query, workspaceId);
+  const doSearch = async (searchQuery?: string) => {
+    // Ensure queryToUse is a string
+    let queryToUse = typeof searchQuery === 'string' ? searchQuery : (typeof query === 'string' ? query : '');
     
-    if (!query.trim() || !workspaceId) {
-      console.warn('⚠️ [VALIDATION] Query or workspace is missing');
+    console.log('🔍 [SEARCH START] Executing semantic search - Query: "%s", Workspace: %s', queryToUse, workspaceId);
+    
+    if (!queryToUse.trim()) {
+      console.warn('⚠️ [VALIDATION] Query is empty');
+      setError('Please enter a search query');
+      return;
+    }
+    
+    if (!workspaceId) {
+      console.warn('⚠️ [VALIDATION] Workspace context not loaded');
+      setError('Workspace is not loaded. Please try again.');
       return;
     }
     
@@ -218,21 +228,21 @@ export function SearchView() {
     
     try {
       console.debug('📡 [API CALL] Calling api.query()');
-      const result = await api.query(query, workspaceId);
-      console.log('✅ [SEARCH SUCCESS] Got %d results - Confidence: %d', result.sources?.length || 0, result.confidence_score);
+      const result = await api.query(queryToUse, workspaceId);
+      console.log('✅ [SEARCH SUCCESS] Got %d results - Confidence: %d', result.sources?.length || 0, result.confidence);
       
       setQueryResults({
-        query_id: result.id || '',
+        query_id: result.query_id,
         answer: result.answer,
-        confidence: result.confidence_score,
-        confidence_factors: {
+        confidence: result.confidence,
+        confidence_factors: result.confidence_factors || {
           similarity_avg: 0,
           document_diversity: 0,
           source_coverage: 0,
         },
         sources: result.sources,
         model_used: result.model_used,
-        tokens_used: result.tokens_used,
+        tokens_used: 0,
         response_time_ms: 0,
       });
     } catch (err) {
@@ -240,14 +250,20 @@ export function SearchView() {
       
       if (err instanceof Error) {
         const msg = err.message.toLowerCase();
-        if (msg.includes('timeout')) {
-          errorMsg = 'Query took too long. Try rephrasing or uploading more specific documents.';
+        if (msg.includes('503') || msg.includes('unavailable')) {
+          errorMsg = 'Embedding service is currently unavailable. Please try again in a few moments.';
+        } else if (msg.includes('timeout') && msg.includes('120000')) {
+          errorMsg = 'The query took too long to process. This might indicate the backend services are slow or overwhelmed. Please try again or simplify your query.';
+        } else if (msg.includes('timeout')) {
+          errorMsg = 'The search request timed out. Try rephrasing your query or uploading more specific documents.';
         } else if (msg.includes('429')) {
           errorMsg = 'Too many requests. Please wait a moment and try again.';
         } else if (msg.includes('no documents') || msg.includes('no results')) {
           errorMsg = 'No matching documents found. Try uploading more documents or use different keywords.';
         } else if (msg.includes('network')) {
           errorMsg = 'Network error. Check your connection and try again.';
+        } else if (msg.includes('validation')) {
+          errorMsg = 'Request validation failed. Please check your input and try again.';
         } else {
           errorMsg = err.message;
         }
@@ -440,7 +456,7 @@ export function SearchView() {
           }}
         />
         <button
-          onClick={doSearch}
+          onClick={() => doSearch()}
           style={{
             position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)',
             height: 40, padding: '0 16px',
@@ -464,7 +480,11 @@ export function SearchView() {
           {suggested.map((q) => (
             <button
               key={q}
-              onClick={() => { setQuery(q); doSearch(); }}
+              onClick={async () => {
+                setQuery(q);
+                // Call doSearch with the query directly to avoid state timing issues
+                await doSearch(q);
+              }}
               style={{
                 height: 28, padding: '0 12px',
                 background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3,
