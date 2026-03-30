@@ -68,6 +68,9 @@ class OpenAIEmbedder(EmbeddingProvider):
         self._dimension = self._get_dimension()
         self._fallback_provider = fallback_provider
         self._fallback_max_retries = settings.EMBEDDING_FALLBACK_MAX_RETRIES
+        
+        # Track which provider actually succeeded (for accurate model_name/dimension reporting)
+        self._actual_provider_used = "openai"  # Default, updated if fallback succeeds
 
     def _get_dimension(self) -> int:
         dimensions = {
@@ -132,6 +135,8 @@ class OpenAIEmbedder(EmbeddingProvider):
                 try:
                     fallback_embeddings = self._fallback_provider.embed(batch)
                     all_embeddings.extend(fallback_embeddings)
+                    # Track that we successfully used the fallback provider
+                    self._actual_provider_used = "fallback"
                     logger.info(f"✅ Successfully embedded batch using {self._fallback_provider.model_name}")
                 except Exception as fallback_error:
                     logger.error(
@@ -156,10 +161,16 @@ class OpenAIEmbedder(EmbeddingProvider):
 
     @property
     def dimension(self) -> int:
+        # Return dimension of the provider that actually succeeded
+        if self._actual_provider_used == "fallback" and self._fallback_provider:
+            return self._fallback_provider.dimension
         return self._dimension
 
     @property
     def model_name(self) -> str:
+        # Return model name of the provider that actually succeeded
+        if self._actual_provider_used == "fallback" and self._fallback_provider:
+            return self._fallback_provider.model_name
         return self._model
 
 
