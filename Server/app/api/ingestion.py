@@ -81,6 +81,7 @@ async def _build_status_dict(document: Document, db: AsyncSession) -> Dict[str, 
 
     FIXED: document.source_type and document.status were returned as raw ORM
     objects — SQLAlchemy enum instances are not JSON-serialisable without .value.
+    Uses efficient aggregate SQL counts instead of loading entire rows.
     """
     logs_result = await db.execute(
         select(IngestionLog)
@@ -89,20 +90,28 @@ async def _build_status_dict(document: Document, db: AsyncSession) -> Dict[str, 
     )
     logs = logs_result.scalars().all()
 
-    chunks_result = await db.execute(
-        select(Chunk).where(Chunk.document_id == document.id)
+    # Use SQL COUNT aggregate instead of loading all chunks
+    chunks_count_result = await db.execute(
+        select(func.count())
+        .select_from(Chunk)
+        .where(Chunk.document_id == document.id)
     )
-    chunks = chunks_result.scalars().all()
+    chunks_count = chunks_count_result.scalar() or 0
 
+    # Use SQL COUNT aggregate for embeddings instead of loading all rows
     embedding_count = 0
-    if chunks:
-        chunk_ids = [c.id for c in chunks]
-        emb_result = await db.execute(
+    if chunks_count > 0:
+        # Subquery to count embeddings for this document's chunks
+        emb_count_result = await db.execute(
             select(func.count())
             .select_from(Embedding)
-            .where(Embedding.chunk_id.in_(chunk_ids))
+            .where(
+                Embedding.chunk_id.in_(
+                    select(Chunk.id).where(Chunk.document_id == document.id)
+                )
+            )
         )
-        embedding_count = emb_result.scalar() or 0
+        embedding_count = emb_count_result.scalar() or 0
 
     return {
         "document_id": str(document.id),
@@ -111,7 +120,7 @@ async def _build_status_dict(document: Document, db: AsyncSession) -> Dict[str, 
         "source_type": _enum_value(document.source_type),
         "status": _enum_value(document.status),
         "progress": {
-            "chunks_created": len(chunks),
+            "chunks_created": chunks_count,
             "embeddings_created": embedding_count,
             "total_tokens": document.token_count or 0,
         },
@@ -199,13 +208,11 @@ async def get_workspace_ingestion_status(
     recent_logs = recent_result.scalar() or 0
 
     # ── Per-document summaries (first 10) ───────────────────────────────────
-    # FIXED: original used `[await f(doc) for doc in docs[:10]]` which is valid
-    # Python 3.6+ syntax but runs sequentially. asyncio.gather runs all
-    # coroutines concurrently, reducing wall-clock time for 10 docs from
-    # ~10× single-query latency to ~1× single-query latency.
-    document_statuses = await asyncio.gather(
-        *[_build_status_dict(doc, db) for doc in documents[:10]]
-    )
+    # FIXED: asyncio.gather over the same AsyncSession can cause connection/session
+    # weirdness. Use sequential calls on the shared session instead.
+    document_statuses = [
+        await _build_status_dict(doc, db) for doc in documents[:10]
+    ]
 
     return {
         "workspace_id": str(workspace_uuid),
