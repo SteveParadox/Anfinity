@@ -47,6 +47,10 @@ class Chunker:
       2. Paragraphs (double newline)
       3. Sentences
       4. Hard character-limit fallback (for pathological single-sentence blobs)
+    
+    OPTIMIZED: Token count caching prevents repeated re-encoding of the same
+    text fragments during chunk building and merging, significantly reducing
+    CPU overhead for large documents.
     """
 
     # Compiled once at class level to avoid re-compiling on every call.
@@ -73,14 +77,24 @@ class Chunker:
             )
 
         self._tokenizer = tiktoken.get_encoding("cl100k_base")
+        # Token count cache to avoid re-encoding the same text fragments
+        self._token_cache: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def count_tokens(self, text: str) -> int:
-        """Return the number of tokens in *text*."""
-        return len(self._tokenizer.encode(text))
+        """Return the number of tokens in *text*.
+        
+        Uses a simple cache to avoid re-encoding the same text fragments
+        during chunk building and merging (significant CPU savings).
+        """
+        if text in self._token_cache:
+            return self._token_cache[text]
+        count = len(self._tokenizer.encode(text))
+        self._token_cache[text] = count
+        return count
 
     def chunk_text(
         self,
@@ -97,7 +111,8 @@ class Chunker:
             Ordered list of :class:`TextChunk` objects.
         """
         meta = metadata or {}
-        cleaned = text.strip()
+        # Normalize newlines early: convert \r\n and \r to \n for consistency
+        cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
         if not cleaned:
             return []
 
@@ -164,7 +179,11 @@ class Chunker:
                 chunk_index += 1
                 overlap = self._get_overlap_text(current, separator="")
                 current = [overlap, part] if overlap else [part]
-                current_tokens = self.count_tokens("".join(current))
+                # Use cached count from overlap + current part (avoid recount)
+                current_tokens = (
+                    (self.count_tokens(overlap) if overlap else 0) +
+                    self.count_tokens(part)
+                )
             else:
                 current.append(part)
                 current_tokens += part_tokens
@@ -236,7 +255,11 @@ class Chunker:
                 chunk_index += 1
                 overlap = self._get_overlap_text(current, separator="\n\n")
                 current = [overlap, para] if overlap else [para]
-                current_tokens = self.count_tokens("\n\n".join(current))
+                # Use cached count from overlap + current part (avoid recount)
+                current_tokens = (
+                    (self.count_tokens(overlap) if overlap else 0) +
+                    para_tokens
+                )
             else:
                 current.append(para)
                 current_tokens += para_tokens
@@ -306,7 +329,11 @@ class Chunker:
                 chunk_index += 1
                 overlap = self._get_overlap_text(current, separator=" ")
                 current = [overlap, sentence] if overlap else [sentence]
-                current_tokens = self.count_tokens(" ".join(current))
+                # Use cached count from overlap + current part (avoid recount)
+                current_tokens = (
+                    (self.count_tokens(overlap) if overlap else 0) +
+                    sentence_tokens
+                )
             else:
                 current.append(sentence)
                 current_tokens += sentence_tokens
@@ -408,7 +435,7 @@ class Chunker:
                 current = TextChunk(
                     text=current.text + "\n\n" + chunk.text,
                     index=current.index,
-                    token_count=self.count_tokens(current.text + "\n\n" + chunk.text),
+                    token_count=current.token_count + 2 + chunk.token_count,  # 2 tokens for "\n\n"
                     metadata=current.metadata,
                 )
             else:

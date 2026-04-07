@@ -1,12 +1,12 @@
 """Batch embedding processor for efficient vectorization of document chunks."""
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from uuid import UUID, uuid4
 import logging
-import asyncio
 from dataclasses import dataclass, asdict
 
 from sqlalchemy import select, and_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Chunk, Embedding, Document, IngestionLog, DocumentStatus
@@ -186,10 +186,7 @@ class BatchEmbeddingProcessor:
                 document = doc_res.scalars().first()
                 if document:
                     document.status = DocumentStatus.FAILED
-                    try:
-                        await self.db.commit()
-                    except Exception:
-                        await self.db.rollback()
+                    await self.db.commit()
             except Exception:
                 pass
         
@@ -238,6 +235,18 @@ class BatchEmbeddingProcessor:
                 batch_result["failed"] = len(batch_chunks)
                 return batch_result
             
+            # FIX: Capture ACTUAL model info AFTER embeddings generated (reflects fallback if it happened)
+            actual_model_info = {
+                "provider": self.embedding_provider.__class__.__name__,
+                "model_name": self.embedding_provider.model_name,
+                "model_dimension": self.embedding_provider.dimension,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            logger.info(
+                f"📝 [EMBEDDING METADATA] Used: {actual_model_info['model_name']} "
+                f"({actual_model_info['model_dimension']}D) from {actual_model_info['provider']}"
+            )
+            
             # Prepare vector points for Qdrant
             vector_points = []
             embedding_records = []
@@ -260,7 +269,11 @@ class BatchEmbeddingProcessor:
                         token_count=chunk.token_count,
                         context_before=chunk.context_before,
                         context_after=chunk.context_after,
-                        metadata=chunk.chunk_metadata or {}
+                        metadata={
+                            **(chunk.chunk_metadata or {}),
+                            "interaction_count": 0,
+                            "text": chunk.text
+                        }
                     )
                     
                     # Create point for vector DB
@@ -271,13 +284,14 @@ class BatchEmbeddingProcessor:
                     }
                     vector_points.append(point)
                     
-                    # Prepare embedding record for metadata tracking
+                    # FIX: Use ACTUAL model info (reflects provider that really generated this embedding)
                     embedding_record = {
                         "chunk_id": chunk.id,
                         "vector_id": vector_id,
                         "collection_name": collection_name,
-                        "model_used": self.model_version["model_name"],
-                        "embedding_dimension": self.model_version["model_dimension"],
+                        "model_used": actual_model_info["model_name"],
+                        "embedding_dimension": actual_model_info["model_dimension"],
+                        "provider_used": actual_model_info["provider"],
                         "vector": embedding  # Store for reference (could be in separate vector store)
                     }
                     embedding_records.append(embedding_record)
@@ -319,33 +333,29 @@ class BatchEmbeddingProcessor:
         return batch_result
     
     async def _save_embedding_metadata(self, embedding_records: List[Dict[str, Any]]):
-        """Save embedding metadata to PostgreSQL for tracking.
-        
-        Args:
-            embedding_records: List of embedding metadata to save
-        """
+        """Stage embedding metadata in PostgreSQL without per-batch commits."""
+        if not embedding_records:
+            return
+
         try:
-            for record in embedding_records:
-                embedding = Embedding(
-                    chunk_id=record["chunk_id"],
-                    vector_id=record["vector_id"],
-                    collection_name=record["collection_name"],
-                    model_used=record["model_used"],
-                    embedding_dimension=record["embedding_dimension"],
-                    created_at=datetime.utcnow()
-                )
-                self.db.add(embedding)
-
-            try:
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-
-            logger.debug(f"Saved {len(embedding_records)} embedding metadata records")
-
+            values = [
+                {
+                    "id": uuid4(),
+                    "chunk_id": record["chunk_id"],
+                    "vector_id": record["vector_id"],
+                    "collection_name": record["collection_name"],
+                    "model_used": record["model_used"],
+                    "embedding_dimension": record["embedding_dimension"],
+                }
+                for record in embedding_records
+            ]
+            stmt = pg_insert(Embedding).values(values)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["chunk_id"])
+            await self.db.execute(stmt)
+            await self.db.flush()
+            logger.debug("Staged %d embedding metadata records", len(embedding_records))
         except Exception as e:
-            logger.error(f"Error saving embedding metadata: {e}")
+            logger.error(f"Error staging embedding metadata: {e}")
             raise
     
     async def process_pending_chunks(

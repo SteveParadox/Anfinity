@@ -128,19 +128,45 @@ class OpenAIEmbedder(EmbeddingProvider):
 
             # Fall back to Ollama if OpenAI failed with quota error
             if embedding_failed and self._fallback_provider and is_quota_error:
+                # FIX: Check if fallback provider has compatible dimensions
+                primary_dim = self._dimension
+                fallback_dim = self._fallback_provider.dimension
+                
+                if primary_dim != fallback_dim:
+                    logger.error(
+                        "Cannot fall back to %s: dimension mismatch detected! "
+                        "Primary provider uses %dD, fallback uses %dD. "
+                        "This would corrupt the collection. "
+                        "SOLUTION: Either increase OpenAI quota, or re-index all documents with "
+                        "EMBEDDING_PROVIDER='%s' (dimension %dD) to match your fallback provider.",
+                        self._fallback_provider.__class__.__name__,
+                        primary_dim,
+                        fallback_dim,
+                        self._fallback_provider.__class__.__name__.lower(),
+                        fallback_dim,
+                    )
+                    raise RuntimeError(
+                        f"OpenAI quota exceeded and fallback provider has incompatible dimensions "
+                        f"({primary_dim}D vs {fallback_dim}D). Cannot embed. "
+                        f"SOLUTION: Increase OpenAI quota or re-index with compatible provider. "
+                        f"Original error: {last_error}"
+                    ) from last_error
+                
                 logger.warning(
-                    f"⚠️  OpenAI embedding quota/rate limit exceeded. "
-                    f"Attempting fallback to {self._fallback_provider.model_name}..."
+                    "⚠️ OpenAI embedding quota/rate limit exceeded. "
+                    "Attempting fallback to %s (dimension-compatible: %dD)...",
+                    self._fallback_provider.model_name,
+                    fallback_dim
                 )
                 try:
                     fallback_embeddings = self._fallback_provider.embed(batch)
                     all_embeddings.extend(fallback_embeddings)
                     # Track that we successfully used the fallback provider
                     self._actual_provider_used = "fallback"
-                    logger.info(f"✅ Successfully embedded batch using {self._fallback_provider.model_name}")
+                    logger.info(f" Successfully embedded batch using {self._fallback_provider.model_name}")
                 except Exception as fallback_error:
                     logger.error(
-                        f"❌ Fallback embedding failed: {fallback_error}\n"
+                        f" Fallback embedding failed: {fallback_error}\n"
                         f"   Fallback provider: {self._fallback_provider.__class__.__name__}\n"
                         f"   Base URL: {getattr(self._fallback_provider, '_base_url', 'N/A')}\n"
                         f"   Original OpenAI error: {last_error}"
@@ -152,7 +178,7 @@ class OpenAIEmbedder(EmbeddingProvider):
                     ) from fallback_error
             elif embedding_failed and not is_quota_error:
                 # Non-quota error from OpenAI, don't try fallback
-                logger.error(f"❌ OpenAI embedding failed (non-quota error): {last_error}")
+                logger.error(f" OpenAI embedding failed (non-quota error): {last_error}")
                 raise RuntimeError(f"OpenAI embedding failed: {last_error}") from last_error
             elif embedding_failed and not self._fallback_provider:
                 raise RuntimeError(f"OpenAI embedding failed with quota/rate limit, but no fallback provider configured")
@@ -256,12 +282,13 @@ class BGEEmbedder(EmbeddingProvider):
 class OllamaEmbedder(EmbeddingProvider):
     """Ollama embedding provider (local embeddings via nomic-embed-text or similar)."""
 
-    def __init__(self, model: Optional[str] = None, base_url: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, base_url: Optional[str] = None, fallback_provider: Optional[EmbeddingProvider] = None):
         """Initialize Ollama embedder.
         
         Args:
             model: Ollama model name (default: nomic-embed-text)
             base_url: Ollama server URL (default: http://localhost:11434)
+            fallback_provider: Provider to fall back to if Ollama fails
         """
         try:
             import requests
@@ -272,6 +299,9 @@ class OllamaEmbedder(EmbeddingProvider):
         self._base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
         self._dimension = 768  # Default for nomic-embed-text; will be updated after first call
         self._requests = requests
+        self._session = requests.Session()
+        self._fallback_provider = fallback_provider
+        self._actual_provider_used = "ollama"  # Track which provider was actually used
         
         logger.info(f"🔧 OllamaEmbedder initializing with base_url={self._base_url}, model={self._model}")
         
@@ -285,56 +315,91 @@ class OllamaEmbedder(EmbeddingProvider):
             logger.error(error_msg)
             raise ConnectionError(error_msg) from e
 
+    def _normalise_embeddings_payload(self, data: Dict[str, Any], expected: int) -> List[List[float]]:
+        embeddings = data.get("embeddings")
+        if embeddings is None and "embedding" in data:
+            embeddings = [data["embedding"]]
+        if not isinstance(embeddings, list) or len(embeddings) != expected:
+            raise ValueError(
+                f"Ollama returned malformed embeddings payload (expected {expected}, got {type(embeddings).__name__ if embeddings is not None else 'None'})"
+            )
+        return embeddings
+
     def embed(self, texts: List[str]) -> List[List[float]]:
-        """Embed texts using Ollama.
-        
-        Args:
-            texts: List of texts to embed
-            
-        Returns:
-            List of embedding vectors
-        """
-        batch_size = 32
+        """Embed texts using Ollama, with OpenAI fallback if available."""
+        if not texts:
+            return []
+
+        batch_size = max(1, min(getattr(settings, "EMBEDDING_BATCH_SIZE", 48), 64))
         all_embeddings: List[List[float]] = []
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-
-            # Ollama expects one embedding request per text
-            for text in batch:
+        try:
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
                 try:
-                    url = f"{self._base_url}/api/embeddings"
-                    logger.debug(f"📤 Sending embedding request to Ollama: {url}")
-                    response = self._requests.post(
-                        url,
-                        json={"model": self._model, "prompt": text},
+                    response = self._session.post(
+                        f"{self._base_url}/api/embed",
+                        json={"model": self._model, "input": batch},
                         timeout=settings.OLLAMA_TIMEOUT,
                     )
+                    if response.status_code == 404:
+                        raise RuntimeError("/api/embed unsupported")
                     response.raise_for_status()
-                    
-                    data = response.json()
-                    embedding = data.get("embedding")
-                    if not embedding:
-                        raise ValueError("Ollama returned empty embedding")
-                    
-                    # Update dimension on first call
+                    batch_embeddings = self._normalise_embeddings_payload(response.json(), len(batch))
+                except Exception as batch_error:
+                    logger.warning(
+                        "Batch Ollama embedding failed for %d texts, falling back to legacy mode: %s",
+                        len(batch),
+                        batch_error,
+                    )
+                    batch_embeddings = []
+                    for text in batch:
+                        response = self._session.post(
+                            f"{self._base_url}/api/embeddings",
+                            json={"model": self._model, "prompt": text},
+                            timeout=settings.OLLAMA_TIMEOUT,
+                        )
+                        response.raise_for_status()
+                        batch_embeddings.extend(self._normalise_embeddings_payload(response.json(), 1))
+
+                for embedding in batch_embeddings:
                     if self._dimension != len(embedding):
                         self._dimension = len(embedding)
-                    
-                    all_embeddings.append(embedding)
-                except Exception as e:
-                    error_msg = f"Ollama embedding failed for text (len={len(text)}): {e}"
-                    logger.error(f"❌ {error_msg}")
-                    raise RuntimeError(error_msg) from e
+                all_embeddings.extend(batch_embeddings)
+
+        except Exception as ollama_err:
+            if self._fallback_provider:
+                logger.warning(
+                    f"⚠️ Ollama embedding failed. Attempting fallback to {self._fallback_provider.model_name}..."
+                )
+                try:
+                    all_embeddings = self._fallback_provider.embed(texts)
+                    self._actual_provider_used = "fallback"
+                    logger.info(f"✅ Successfully embedded using {self._fallback_provider.model_name}")
+                    return all_embeddings
+                except Exception as fallback_err:
+                    logger.error(f"❌ Fallback embedding also failed: {fallback_err}")
+                    raise RuntimeError(
+                        f"Both Ollama and fallback embedding failed. "
+                        f"Ollama: {ollama_err}. "
+                        f"Fallback: {fallback_err}"
+                    ) from fallback_err
+            raise RuntimeError(f"Ollama embedding failed and no fallback provider configured: {ollama_err}") from ollama_err
 
         return all_embeddings
 
     @property
     def dimension(self) -> int:
+        # Return dimension of provider that actually succeeded
+        if self._actual_provider_used == "fallback" and self._fallback_provider:
+            return self._fallback_provider.dimension
         return self._dimension
 
     @property
     def model_name(self) -> str:
+        # Return model name of provider that actually succeeded
+        if self._actual_provider_used == "fallback" and self._fallback_provider:
+            return self._fallback_provider.model_name
         return self._model
 
 
@@ -414,8 +479,27 @@ class Embedder:
             self._use_tiktoken = False
     
     def _create_provider(self) -> EmbeddingProvider:
-        """Create embedding provider based on configuration."""
-        if self.provider_name == "openai":
+        """Create embedding provider based on configuration.
+        
+        Note: Swapped to use Ollama as primary (768D) and OpenAI as fallback (1536D)
+        because OpenAI quota is exhausted. This avoids dimension conflicts.
+        """
+        # FIX: Use Ollama as PRIMARY provider (more reliable locally)
+        # and OpenAI as FALLBACK (when Ollama unavailable)
+        if self.provider_name == "ollama":
+            # Ollama is primary - create OpenAI fallback if enabled
+            fallback_provider = None
+            if settings.EMBEDDING_FALLBACK_ENABLED:
+                try:
+                    fallback_provider = OpenAIEmbedder()
+                    logger.info(f" OpenAI fallback initialized for embeddings ({fallback_provider.model_name})")
+                except Exception as e:
+                    logger.warning(f" OpenAI fallback unavailable: {e}. Will proceed without fallback.")
+            
+            return OllamaEmbedder(fallback_provider=fallback_provider)
+        
+        # Original providers still available if explicitly configured
+        elif self.provider_name == "openai":
             # Create fallback provider if enabled
             fallback_provider = None
             if settings.EMBEDDING_FALLBACK_ENABLED:
@@ -430,8 +514,6 @@ class Embedder:
             return CohereEmbedder()
         elif self.provider_name == "bge":
             return BGEEmbedder()
-        elif self.provider_name == "ollama":
-            return OllamaEmbedder()
         else:
             raise ValueError(f"Unknown embedding provider: {self.provider_name}")
     
