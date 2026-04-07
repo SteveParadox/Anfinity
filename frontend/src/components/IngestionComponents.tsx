@@ -130,11 +130,11 @@ export function DocumentIngestionCard({
               Downloaded: {(progress.details.bytes_downloaded / 1024).toFixed(1)} KB
             </div>
           )}
-          {progress.details.chunks_created && (
+          {"chunks_created" in progress.details && (
             <div>Chunks: {progress.details.chunks_created}</div>
           )}
-          {progress.details.vectors_created && (
-            <div>Embeddings: {progress.details.vectors_created}</div>
+          {"embeddings_created" in progress.details && (
+            <div>Embeddings: {progress.details.embeddings_created}</div>
           )}
           {estimatedRemaining > 0 && (
             <div>

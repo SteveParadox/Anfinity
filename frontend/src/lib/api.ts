@@ -504,6 +504,73 @@ class ApiClient {
     return this.request(`/documents/${documentId}`);
   }
 
+  /**
+   * Get detailed ingestion status for a document.
+   * CRITICAL FIX: Provides a fallback to fetch actual status from backend
+   * when event streaming misses updates.
+   */
+  async getIngestionStatus(
+    documentId: string
+  ): Promise<{
+    document_id: string;
+    title: string;
+    source_type: string;
+    status: string;
+    progress: {
+      chunks_created: number;
+      embeddings_created: number;
+      total_tokens: number;
+    };
+    logs: Array<{
+      stage: string;
+      status: string;
+      duration_ms: number;
+      timestamp: string;
+    }>;
+    created_at: string;
+    updated_at: string | null;
+  }> {
+    return this.request(`/ingestion/status/${documentId}`);
+  }
+
+  /**
+   * Get workspace-level ingestion statistics.
+   * CRITICAL FIX: Provides accurate chunk/embedding counts from database
+   * when event streaming is out of sync.
+   */
+  async getWorkspaceIngestionStatus(
+    workspaceId: string,
+    statusFilter?: string
+  ): Promise<{
+    workspace_id: string;
+    total_documents: number;
+    status_breakdown: Record<string, number>;
+    aggregated_stats: {
+      total_chunks: number;
+      total_tokens: number;
+      recent_activities_24h: number;
+    };
+    document_statuses: Array<{
+      document_id: string;
+      title: string;
+      source_type: string;
+      status: string;
+      progress: {
+        chunks_created: number;
+        embeddings_created: number;
+        total_tokens: number;
+      };
+      created_at: string;
+      updated_at: string | null;
+    }>;
+  }> {
+    const queryParams = new URLSearchParams();
+    if (statusFilter) queryParams.append('status_filter', statusFilter);
+    return this.request(
+      `/ingestion/workspace/${workspaceId}${queryParams.toString() ? `?${queryParams}` : ''}`
+    );
+  }
+
   async deleteDocument(documentId: string): Promise<void> {
     await this.request(`/documents/${documentId}`, { method: 'DELETE' });
   }
@@ -800,6 +867,7 @@ class ApiClient {
     // - Vector search: ~2-5s
     // - LLM generation with context: ~30-90s (depending on provider)
     // - Network/retry overhead: ~5-10s
+    // - Cold start (if Ollama preload failed): ~60-80s additional
     return this.request(`/query`, {
       method: 'POST',
       body: JSON.stringify({
@@ -809,7 +877,7 @@ class ApiClient {
         include_sources: true,
         model: options?.model || 'gpt-4o-mini',
       }),
-      timeout: 120000, // 120 seconds for RAG queries
+      timeout: 300000, // 300s for RAG queries (180s backend LLM + 30s retrieval + 90s buffer for slow Ollama)
     });
   }
 
@@ -826,7 +894,7 @@ class ApiClient {
   ): Promise<{ answer_id: string; feedback_status: string; chunks_updated: Array<{ chunk_id: string; document_id: string; old_weight: number; new_weight: number; accuracy: number }> }> {
     return this.request(`/answers/${answerId}/feedback`, {
       method: 'POST',
-      body: JSON.stringify({ status, comment }),
+      body: JSON.stringify({ answer_id: answerId, status, comment }),
     });
   }
 

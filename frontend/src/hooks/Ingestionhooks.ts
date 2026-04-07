@@ -38,6 +38,7 @@ import { useEventListener } from '../contexts/EventsContext';
 import type { Event } from '../types/events';
 import { EventType } from '../types/events';
 import { isValidUUID } from '../lib/uuidValidator';
+import { api } from '../lib/api';
 
 // ─── Module-level constants ───────────────────────────────────────────────────
 

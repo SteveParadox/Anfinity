@@ -22,6 +22,8 @@ interface DashboardProps {
   user: User | null;
   onCreateNote: () => void;
   onViewGraph: () => void;
+  onViewAllNotes: () => void;
+  onViewAllInsights: () => void;
 }
 
 function cn(...classes: (string | undefined | false)[]) {
@@ -82,6 +84,8 @@ export function Dashboard({
   user,
   onCreateNote,
   onViewGraph,
+  onViewAllNotes,
+  onViewAllInsights,
 }: DashboardProps) {
   const [notes, setNotes] = useState<Note[]>([]);
   const [insights, setInsights] = useState<AIInsight[]>([]);
@@ -458,6 +462,7 @@ export function Dashboard({
                 </span>
               </div>
               <button
+                onClick={onViewAllNotes}
                 className="flex items-center gap-1 transition-colors duration-150"
                 style={{
                   fontFamily: "'IBM Plex Mono', monospace",
@@ -621,6 +626,7 @@ export function Dashboard({
 
             <div className="px-4 pb-4">
               <button
+                onClick={onViewAllInsights}
                 className="w-full h-9 text-[13px] uppercase tracking-[0.1em] transition-all duration-150"
                 style={{
                   fontFamily: "'Bebas Neue', sans-serif",

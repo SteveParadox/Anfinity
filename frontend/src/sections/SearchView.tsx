@@ -214,20 +214,24 @@ export function SearchView() {
     if (!queryToUse.trim()) {
       console.warn('⚠️ [VALIDATION] Query is empty');
       setError('Please enter a search query');
+      setIsSearching(false);
       return;
     }
     
     if (!workspaceId) {
       console.warn('⚠️ [VALIDATION] Workspace context not loaded');
       setError('Workspace is not loaded. Please try again.');
+      setIsSearching(false);
       return;
     }
     
+    // Ensure isSearching is set to true BEFORE async call
     setIsSearching(true);
     setError(null);
+    setQueryResults(null);  // Clear previous results to signal new search
     
     try {
-      console.debug('📡 [API CALL] Calling api.query()');
+      console.debug('📡 [API CALL] Calling api.query() at', new Date().toISOString());
       const result = await api.query(queryToUse, workspaceId);
       console.log('✅ [SEARCH SUCCESS] Got %d results - Confidence: %d', result.sources?.length || 0, result.confidence);
       
@@ -271,7 +275,9 @@ export function SearchView() {
       
       console.error('❌ [SEARCH FAILED] Search error:', errorMsg, err);
       setError(errorMsg);
+      setQueryResults(null);  // Clear any partial results
     } finally {
+      console.debug('🏁 [SEARCH END] Search completed');
       setIsSearching(false);
     }
   };

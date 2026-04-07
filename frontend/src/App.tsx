@@ -29,7 +29,8 @@ import { PricingView } from './sections/PricingView';
 import { DocumentUploadView } from './sections/UploadView';
 import { DocumentsView } from './sections/DocumentsView';
 import { AIInsightsPanel } from './components/AIInsightsPanel';
-import { Sparkles, Menu, LogOut, AlertCircle } from 'lucide-react';
+import { AskPastSelf } from './components/chat/AskPastSelf';
+import { Sparkles, Menu, LogOut, AlertCircle, MessageCircle } from 'lucide-react';
 import type { User } from './types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -104,7 +105,7 @@ function useStableStats() {
 
 function App() {
   const navigate   = useNavigate();
-  const { user: contextUser, logout, loading: authLoading } = useAuth();
+  const { user: contextUser, logout, isLoading: authLoading, currentWorkspaceId } = useAuth();
   const windowWidth = useWindowWidth();
   const stats       = useStableStats();
 
@@ -115,6 +116,7 @@ function App() {
   const [sidebarCollapsed,  setSidebarCollapsed]  = useState(isMobile);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [insightsOpen,      setInsightsOpen]      = useState(false);
+  const [chatOpen,          setChatOpen]          = useState(false);
   const [logoutError,       setLogoutError]       = useState<string | null>(null);
 
   // Collapse sidebar automatically when viewport crosses the mobile breakpoint
@@ -153,6 +155,8 @@ function App() {
           user={contextUser}
           onCreateNote={() => setCurrentView('notes')}
           onViewGraph={() => setCurrentView('graph')}
+          onViewAllNotes={() => setCurrentView('notes')}
+          onViewAllInsights={() => setCurrentView('search')}
         />
       ),
       notes:      <NotesView />,
@@ -365,6 +369,53 @@ function App() {
               </div>
             )}
 
+            {/* Ask Past Self button */}
+            <button
+              onClick={() => setChatOpen((o) => !o)}
+              aria-pressed={chatOpen}
+              aria-label="Ask Your Past Self"
+              title="Ask Your Past Self - Chat with your knowledge base"
+              style={{
+                height: 32,
+                padding: '0 12px',
+                background: chatOpen ? 'rgba(139,92,246,0.1)' : 'transparent',
+                border: `1px solid ${chatOpen ? 'rgba(139,92,246,0.3)' : TT.inkBorder}`,
+                borderRadius: 3,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 7,
+                transition: 'all 0.15s',
+                color: chatOpen ? '#8B5CF6' : TT.inkMuted,
+              }}
+              onMouseEnter={(e) => {
+                if (!chatOpen) {
+                  e.currentTarget.style.borderColor = 'rgba(139,92,246,0.25)';
+                  e.currentTarget.style.color = '#8B5CF6';
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!chatOpen) {
+                  e.currentTarget.style.borderColor = TT.inkBorder;
+                  e.currentTarget.style.color = TT.inkMuted;
+                }
+              }}
+            >
+              <MessageCircle size={12} aria-hidden />
+              {!isSmall && (
+                <span
+                  style={{
+                    fontFamily: TT.fontMono,
+                    fontSize: 10,
+                    letterSpacing: '0.08em',
+                    textTransform: 'uppercase',
+                  }}
+                >
+                  Ask
+                </span>
+              )}
+            </button>
+
             {/* AI Insights toggle */}
             <button
               onClick={() => setInsightsOpen((o) => !o)}
@@ -576,6 +627,51 @@ function App() {
         isOpen={insightsOpen}
         onClose={() => setInsightsOpen(false)}
       />
+
+      {/* ── Ask Your Past Self Chat Modal ─────────────────────────── */}
+      {chatOpen && contextUser && (
+        <>
+          {/* Backdrop */}
+          <div
+            role="presentation"
+            onClick={() => setChatOpen(false)}
+            style={{
+              position: 'fixed',
+              inset: 0,
+              background: 'rgba(0,0,0,0.75)',
+              zIndex: 990,
+              backdropFilter: 'blur(4px)',
+            }}
+          />
+          
+          {/* Modal */}
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="chat-title"
+            style={{
+              position: 'fixed',
+              bottom: 20,
+              right: 20,
+              width: Math.min(500, windowWidth - 40),
+              height: Math.min(600, window.innerHeight - 40),
+              background: TT.inkBlack,
+              borderRadius: 6,
+              border: `1px solid ${TT.inkBorder}`,
+              boxShadow: '0 20px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(139,92,246,0.2)',
+              zIndex: 999,
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+            }}
+          >
+            <AskPastSelf
+              workspaceId={currentWorkspaceId || ''}
+              onClose={() => setChatOpen(false)}
+            />
+          </div>
+        </>
+      )}
 
       <style>{`
         @keyframes pulse {
