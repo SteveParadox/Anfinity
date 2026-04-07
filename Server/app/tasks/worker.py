@@ -51,23 +51,26 @@ def _task_prerun_handler(sender=None, task_id=None, task=None, **kwargs) -> None
 def _task_postrun_handler(
     sender=None, task_id=None, task=None, state=None, **kwargs
 ) -> None:
-    """Log when a task finishes."""
+    """Log when a task finishes and clean up any remaining sessions."""
     logger.info(
         "Task %s[%s] finished — state: %s",
         task.name if task else sender,
         task_id,
         state,
     )
+    # FIX: Explicitly close SyncSessionLocal to prevent phantom ROLLBACK on connection return
+    # This ensures pool_reset_on_return=None doesn't start implicit transactions
+    SyncSessionLocal.remove()
 
 
-# ✅ FIXED: Explicitly connect signal handlers to the celery_app instance
+#  FIXED: Explicitly connect signal handlers to the celery_app instance
 # This ensures they're registered before the worker starts processing tasks
 # weak=False prevents the handlers from being garbage collected
 task_prerun.connect(_task_prerun_handler, sender=celery_app, weak=False)
 task_postrun.connect(_task_postrun_handler, sender=celery_app, weak=False)
 
 
-# ✅ FIXED: Register app finalization handler to ensure proper initialization
+#  FIXED: Register app finalization handler to ensure proper initialization
 # This runs after all tasks are registered, ensuring the app context is set up
 @celery_app.on_after_finalize.connect
 def setup_app_context(sender, **kwargs):
@@ -477,7 +480,7 @@ def process_document(self, document_id: str) -> dict:
             )
             broadcast_stage_update_sync(
                 workspace_id, document_id, "embedding", "completed",
-                progress={"vectors_created": len(vector_ids), "duration_ms": index_ms},
+                progress={"embeddings_created": len(vector_ids), "duration_ms": index_ms},
             )
 
             # ── Finalise ───────────────────────────────────────────────────

@@ -33,6 +33,7 @@ from app.celery_app import celery_app
 from app.database.session import SyncSessionLocal
 from app.database.models import Note
 from app.services.llm_service import get_llm_service
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ def generate_note_summary(
 
     Args:
         note_id: UUID of the note to summarise.
-        model: LLM model identifier. Defaults to ``gpt-4o-mini``.
+        model: LLM model identifier. Defaults to Ollama phi3 (settings.OLLAMA_MODEL).
         force: Re-generate even if a summary already exists or content is short.
 
     Returns:
@@ -141,7 +142,7 @@ def generate_note_summary(
                 "existing_summary_length": len(note.summary),
             }
 
-        llm_service = get_llm_service(model=model or "gpt-4o-mini")
+        llm_service = get_llm_service(model=model or settings.OLLAMA_MODEL)
         prompt = _build_summary_prompt(content_length)
 
         llm_response = llm_service.generate_answer(
