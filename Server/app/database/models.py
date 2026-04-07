@@ -436,7 +436,8 @@ class Note(Base):
     
     # Embedding for semantic similarity (pgvector)
     # From 'embed_note' function or during note creation
-    embedding = Column(String(10000), nullable=True)  # Store as text for pgvector compatibility
+    # Stores 1536D OpenAI embeddings as JSON (~20-25KB when serialized)
+    embedding = Column(Text, nullable=True)  # Changed from String(10000) to Text for larger embeddings
     
     # Content metrics
     word_count = Column(Integer, default=0)
@@ -551,7 +552,8 @@ class SearchQuery(Base):
     query_text = Column(String(2000), nullable=False)
     
     # Query embedding for similarity clustering
-    query_embedding = Column(String(10000), nullable=True)  # Store as text for pgvector compatibility
+    # Stores 1536D OpenAI embeddings as JSON (~20-25KB when serialized)
+    query_embedding = Column(Text, nullable=True)  # Changed from String(10000) to Text for larger embeddings
     
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)

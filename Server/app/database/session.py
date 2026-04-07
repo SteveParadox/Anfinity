@@ -18,6 +18,7 @@ async_engine = create_async_engine(
     pool_size=settings.DATABASE_POOL_SIZE,
     max_overflow=settings.DATABASE_MAX_OVERFLOW,
     pool_pre_ping=True,
+    pool_reset_on_return=None,  # FIX: Skip ROLLBACK on connection return (improves performance)
     echo=settings.DEBUG,
 )
 
@@ -36,6 +37,7 @@ sync_engine = create_engine(
     pool_size=10,
     max_overflow=5,
     pool_pre_ping=True,
+    pool_reset_on_return=None,  # FIX: Skip ROLLBACK on connection return (improves performance)
     echo=settings.DEBUG,
 )
 
