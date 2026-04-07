@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 
 from app.config import settings
 from app.database.session import init_db
-from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture
+from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat
 from app.events import websocket_router
 from app.middleware.logging import RequestLoggingMiddleware
 
@@ -35,6 +35,42 @@ async def lifespan(app: FastAPI):
     # Initialize rate limiter with Redis
     from app.middleware.rate_limit import rate_limiter
     await rate_limiter.init()
+    
+    # Preload Ollama model to avoid cold start latency
+    # Without this, first request triggers model load (~15-30s),
+    # with this, requests complete in 10-15s once model is resident in VRAM
+    if settings.OLLAMA_ENABLED:
+        try:
+            import httpx
+            logger.info(f"🚀 Preloading Ollama model '{settings.OLLAMA_MODEL}' from {settings.OLLAMA_BASE_URL}...")
+            preload_start = time.time()
+            # FIX: Use OLLAMA_TIMEOUT (150s) instead of hardcoded 60s to allow cold start
+            async with httpx.AsyncClient(timeout=float(settings.OLLAMA_TIMEOUT)) as client:
+                try:
+                    response = await client.post(
+                        f"{settings.OLLAMA_BASE_URL}/api/generate",
+                        json={
+                            "model": settings.OLLAMA_MODEL,
+                            "prompt": " ",
+                            "stream": False
+                        }
+                    )
+                    preload_time = (time.time() - preload_start) * 1000
+                    if response.status_code == 200:
+                        logger.info(f"✅ Ollama model '{settings.OLLAMA_MODEL}' preloaded and ready ({preload_time:.0f}ms)")
+                    else:
+                        # Check if model not found (404) vs other errors
+                        if response.status_code == 404:
+                            logger.warning(f"⚠️  Ollama model '{settings.OLLAMA_MODEL}' not found. Available models can be checked with 'ollama list'")
+                        else:
+                            logger.warning(f"⚠️  Ollama preload returned status {response.status_code} after {preload_time:.0f}ms: {response.text[:200]}")
+                except httpx.TimeoutException as te:
+                    preload_time = (time.time() - preload_start) * 1000
+                    logger.warning(f"⚠️  Ollama preload timed out after {preload_time:.0f}ms. Check if Ollama is running: 'ollama serve'")
+                except httpx.ConnectError as ce:
+                    logger.warning(f"⚠️  Cannot connect to Ollama at {settings.OLLAMA_BASE_URL}. Start Ollama with: 'ollama serve'")
+        except Exception as e:
+            logger.warning(f"⚠️  Ollama preload failed (non-critical, requests will trigger lazy load): {type(e).__name__}: {e}")
     
     yield
     
@@ -147,6 +183,7 @@ app.include_router(conflicts.router)
 app.include_router(query.router)
 app.include_router(retrieval.router)
 app.include_router(answers.router)
+app.include_router(chat.router)  # Ask Your Past Self chat
 app.include_router(knowledge_graph.router)
 app.include_router(audit.router)
 app.include_router(connectors.router)

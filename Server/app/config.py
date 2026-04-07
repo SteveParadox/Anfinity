@@ -45,34 +45,39 @@ class Settings(BaseSettings):
     S3_BUCKET_NAME: str = Field(default="cogniflow")
     S3_REGION: str = Field(default="us-east-1")
     
+    # LLM - Provider Selection (Primary)
+    # FIX: Changed default from "openai" to "ollama" (more reliable locally, avoids quota conflicts)
+    LLM_PROVIDER: str = Field(default="ollama")  # ollama (primary), openai (fallback)
+    
     # LLM - OpenAI
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_TIMEOUT: int = 30  # seconds
     
-    # LLM - Ollama Fallback
-    OLLAMA_ENABLED: bool = Field(default=True)  # Enable Ollama fallback
+    # LLM - Ollama (Primary)
+    OLLAMA_ENABLED: bool = Field(default=True)  # Enable Ollama
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434")  # Ollama server URL
-    OLLAMA_MODEL: str = Field(default="phi3")  # Default Ollama model
-    OLLAMA_TIMEOUT: int = 60  # Ollama can be slower
+    OLLAMA_MODEL: str = Field(default="phi3:mini")  # Default Ollama model (phi3 better than qwen2:0.5b for RAG)
+    OLLAMA_TIMEOUT: int = 150  # 120-180s for phi3 with context (was 60s, causing timeouts)
     
     # LLM Settings
     LLM_TEMPERATURE: float = 0.3
     LLM_MAX_TOKENS: int = 1000
-    LLM_USE_FALLBACK: bool = True  # Enable fallback on OpenAI errors
+    LLM_USE_FALLBACK: bool = True  # Enable fallback on provider errors
     
     # Embeddings
-    EMBEDDING_PROVIDER: str = Field(default="openai")  # openai, cohere, bge
+    # FIX: Changed default from "openai" to "ollama" (more reliable locally, avoids quota conflicts)
+    EMBEDDING_PROVIDER: str = Field(default="ollama")  # ollama (primary), openai/cohere/bge (fallback)
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     COHERE_API_KEY: Optional[str] = None
     COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"
     BGE_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
-    EMBEDDING_DIMENSION: int = 1536  # Depends on model
-    EMBEDDING_BATCH_SIZE: int = 100
+    EMBEDDING_DIMENSION: int = 768  # Ollama default: nomic-embed-text is 768D
+    EMBEDDING_BATCH_SIZE: int = 32  # Optimal for nomic-embed-text via Ollama (balances GPU util. & memory)
     
-    # Embedding Fallback (OpenAI -> Ollama)
-    EMBEDDING_FALLBACK_ENABLED: bool = Field(default=True)  # Enable fallback to Ollama on OpenAI errors
-    EMBEDDING_FALLBACK_MAX_RETRIES: int = Field(default=2)  # Max retries on OpenAI before fallback
+    # Embedding Fallback (Ollama -> OpenAI)
+    EMBEDDING_FALLBACK_ENABLED: bool = Field(default=True)  # Enable fallback to OpenAI if Ollama fails
+    EMBEDDING_FALLBACK_MAX_RETRIES: int = Field(default=2)  # Max retries before fallback
     OLLAMA_EMBEDDING_MODEL: str = Field(default="nomic-embed-text")  # Ollama embedding model
     
     # Chunking
