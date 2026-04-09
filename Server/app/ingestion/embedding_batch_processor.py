@@ -5,11 +5,11 @@ from uuid import UUID, uuid4
 import logging
 from dataclasses import dataclass, asdict
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Chunk, Embedding, Document, IngestionLog, DocumentStatus
+from app.database.models import Chunk, ChunkStatus, Embedding, Document, DocumentStatus
 from app.ingestion.embedder import EmbeddingProvider
 from app.services.vector_db import VectorDBClient
 from app.config import settings
@@ -64,6 +64,11 @@ class BatchEmbeddingProcessor:
         self.vector_db = vector_db
         self.batch_size = batch_size
         self.model_version = self._get_model_info()
+
+    @staticmethod
+    def _build_vector_id(chunk: Chunk) -> str:
+        """Use a deterministic vector ID so re-embeds update instead of duplicating."""
+        return str(chunk.id)
     
     def _get_model_info(self) -> Dict[str, Any]:
         """Get model information for reproducibility tracking.
@@ -123,15 +128,27 @@ class BatchEmbeddingProcessor:
                 result["errors"].append(f"Document {document_id} not found")
                 return result
 
-            # Fetch all chunks for document ordered by chunk_index
+            # Fetch only chunks that do not already have an embedding record.
             chunks_res = await self.db.execute(
-                select(Chunk).where(Chunk.document_id == document_id).order_by(Chunk.chunk_index)
+                select(Chunk)
+                .outerjoin(Embedding, Embedding.chunk_id == Chunk.id)
+                .where(
+                    Chunk.document_id == document_id,
+                    Embedding.id.is_(None),
+                )
+                .order_by(Chunk.chunk_index)
             )
             chunks = chunks_res.scalars().all()
 
             if not chunks:
-                logger.warning(f"No chunks found for document {document_id}")
+                logger.info("No pending chunks left to embed for document %s", document_id)
                 result["total_chunks"] = 0
+                document.status = DocumentStatus.INDEXED
+                document.processed_at = datetime.utcnow()
+                try:
+                    await self.db.commit()
+                except Exception:
+                    await self.db.rollback()
                 return result
 
             result["total_chunks"] = len(chunks)
@@ -254,7 +271,7 @@ class BatchEmbeddingProcessor:
             for chunk, embedding in zip(batch_chunks, embeddings):
                 try:
                     # Create vector ID (Qdrant expects hashable identifier)
-                    vector_id = str(uuid4())  # Use unique UUID for vector ID
+                    vector_id = self._build_vector_id(chunk)
                     
                     # Build payload
                     payload = ChunkEmbeddingPayload(
@@ -263,7 +280,11 @@ class BatchEmbeddingProcessor:
                         workspace_id=str(workspace_id),
                         source_type=document.source_type.value,
                         chunk_index=chunk.chunk_index,
-                        created_at=datetime.utcnow().isoformat(),
+                        created_at=(
+                            chunk.created_at.isoformat()
+                            if getattr(chunk, "created_at", None)
+                            else datetime.utcnow().isoformat()
+                        ),
                         document_title=document.title,
                         chunk_text=chunk.text,
                         token_count=chunk.token_count,
@@ -272,7 +293,6 @@ class BatchEmbeddingProcessor:
                         metadata={
                             **(chunk.chunk_metadata or {}),
                             "interaction_count": 0,
-                            "text": chunk.text
                         }
                     )
                     
@@ -324,6 +344,7 @@ class BatchEmbeddingProcessor:
                 
                 # Save embedding metadata to PostgreSQL
                 await self._save_embedding_metadata(embedding_records)
+                await self._mark_chunks_embedded([chunk.id for chunk in batch_chunks])
             
         except Exception as e:
             logger.error(f"Error processing batch: {e}", exc_info=True)
@@ -357,6 +378,21 @@ class BatchEmbeddingProcessor:
         except Exception as e:
             logger.error(f"Error staging embedding metadata: {e}")
             raise
+
+    async def _mark_chunks_embedded(self, chunk_ids: List[UUID]) -> None:
+        """Mark successfully embedded chunks in a single bulk update."""
+        if not chunk_ids:
+            return
+
+        await self.db.execute(
+            update(Chunk)
+            .where(Chunk.id.in_(chunk_ids))
+            .values(
+                chunk_status=ChunkStatus.EMBEDDED,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        await self.db.flush()
     
     async def process_pending_chunks(
         self,
