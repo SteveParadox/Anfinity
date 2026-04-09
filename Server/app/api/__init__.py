@@ -1,13 +1,4 @@
-"""API routes module."""
-from app.api import auth, workspaces, documents, notes, query, knowledge_graph, audit, connectors, ingestion
+"""Services module for business logic."""
+from app.services.ingestion_orchestrator import IngestionOrchestrator
 
-__all__ = [
-    "auth",
-    "workspaces",
-    "documents",
-    "notes",
-    "knowledge_graph",
-    "audit",
-    "connectors",
-    "ingestion",
-]
+__all__ = ["IngestionOrchestrator"]
