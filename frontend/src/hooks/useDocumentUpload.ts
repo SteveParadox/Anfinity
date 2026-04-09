@@ -28,7 +28,7 @@ export interface IngestionStatus {
     timestamp?: string;
   }>;
   created_at?: string;
-  updated_at?: string;
+  updated_at?: string | null;
   error?: string;
 }
 
@@ -97,24 +97,26 @@ export function useIngestionStatus(options: UseIngestionStatusOptions = {}) {
   useEffect(() => {
     if (!enabled || !documentId) return;
 
-    // Fetch immediately
-    let shouldContinue = true;
+    let cancelled = false;
+    const interval = setInterval(() => {
+      if (cancelled) return;
+      fetchStatus().then((canContinue) => {
+        if (canContinue === false || cancelled) {
+          clearInterval(interval);
+        }
+      });
+    }, pollInterval);
+
     fetchStatus().then((canContinue) => {
-      shouldContinue = canContinue !== false;
+      if (canContinue === false || cancelled) {
+        clearInterval(interval);
+      }
     });
 
-    // Set up interval
-    if (shouldContinue) {
-      const interval = setInterval(() => {
-        fetchStatus().then((canContinue) => {
-          if (canContinue === false) {
-            clearInterval(interval);
-          }
-        });
-      }, pollInterval);
-
-      return () => clearInterval(interval);
-    }
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [documentId, enabled, pollInterval, fetchStatus]);
 
   return { status, loading, error, refetch: fetchStatus };
@@ -128,16 +130,26 @@ export function useDocumentUpload() {
   const [error, setError] = useState<string | null>(null);
   const [uploadedDocumentId, setUploadedDocumentId] = useState<string | null>(null);
 
+  interface UploadOptions {
+    signal?: AbortSignal;
+  }
+
   const uploadDocument = useCallback(
-    async (file: File, workspaceId: string) => {
+    async (file: File, workspaceId: string, options: UploadOptions = {}) => {
       try {
         setUploading(true);
         setError(null);
 
-        const data = await api.uploadDocument(file, workspaceId);
+        const data = await api.uploadDocument(file, workspaceId, {
+          signal: options.signal,
+        });
         setUploadedDocumentId(data.id);
         return data;
       } catch (err) {
+        if ((err as Error)?.name === 'AbortError') {
+          throw err;
+        }
+
         let errorMessage = 'Document upload failed. Please try again.';
         
         if (err instanceof Error) {

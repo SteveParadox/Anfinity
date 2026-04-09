@@ -33,6 +33,10 @@ export function useSemanticSearch(apiUrl: string, workspaceId: string, debounceM
     new SemanticSearchClient(apiUrl, workspaceId)
   );
 
+  useEffect(() => {
+    clientRef.current = new SemanticSearchClient(apiUrl, workspaceId);
+  }, [apiUrl, workspaceId]);
+
   // Debounced search function
   const performSearch = useCallback(
     debounce(async (searchQuery: string, filters?: SearchFilter) => {
@@ -117,6 +121,10 @@ export function useTrendingSearches(
     new SemanticSearchClient(apiUrl, workspaceId)
   );
 
+  useEffect(() => {
+    clientRef.current = new SemanticSearchClient(apiUrl, workspaceId);
+  }, [apiUrl, workspaceId]);
+
   const fetchTrending = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -155,6 +163,10 @@ export function useSearchClick(apiUrl: string, workspaceId: string) {
   const clientRef = useRef<SemanticSearchClient>(
     new SemanticSearchClient(apiUrl, workspaceId)
   );
+
+  useEffect(() => {
+    clientRef.current = new SemanticSearchClient(apiUrl, workspaceId);
+  }, [apiUrl, workspaceId]);
 
   const logClick = useCallback(
     async (searchLogId: string, chunkId: string) => {
@@ -290,7 +302,7 @@ export function useSearchAnalytics(results: SemanticSearchResult[]) {
 export function useDebouncedSearchQuery(initialQuery: string = '', debounceMs: number = 300) {
   const [inputValue, setInputValue] = useState(initialQuery);
   const [debouncedValue, setDebouncedValue] = useState(initialQuery);
-  const debounceTimer = useRef<NodeJS.Timeout>();
+  const debounceTimer = useRef<NodeJS.Timeout | undefined>(undefined);
 
   useEffect(() => {
     debounceTimer.current = setTimeout(() => {

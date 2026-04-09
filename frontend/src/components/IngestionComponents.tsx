@@ -125,16 +125,16 @@ export function DocumentIngestionCard({
       {/* Details */}
       {progress.details && Object.keys(progress.details).length > 0 && (
         <div style={{ marginTop: '12px', fontSize: '12px', color: '#6b7280' }}>
-          {progress.details.bytes_downloaded && (
+          {((progress.details as Record<string, number | undefined>).bytes_downloaded ?? 0) > 0 && (
             <div>
-              Downloaded: {(progress.details.bytes_downloaded / 1024).toFixed(1)} KB
+              Downloaded: {(((progress.details as Record<string, number | undefined>).bytes_downloaded ?? 0) / 1024).toFixed(1)} KB
             </div>
           )}
           {"chunks_created" in progress.details && (
-            <div>Chunks: {progress.details.chunks_created}</div>
+            <div>Chunks: {(progress.details as Record<string, number | undefined>).chunks_created ?? 0}</div>
           )}
           {"embeddings_created" in progress.details && (
-            <div>Embeddings: {progress.details.embeddings_created}</div>
+            <div>Embeddings: {(progress.details as Record<string, number | undefined>).embeddings_created ?? 0}</div>
           )}
           {estimatedRemaining > 0 && (
             <div>
@@ -350,7 +350,7 @@ export function IngestionErrorNotifications({
 
   return (
     <div style={{ position: 'fixed', top: '20px', right: '20px', zIndex: 1000 }}>
-      {Object.entries(errors).map(([docId, error]) => (
+      {Object.entries(errors as Record<string, { message: string; timestamp: number }>).map(([docId, error]) => (
         <div
           key={docId}
           style={{

@@ -22,8 +22,8 @@ import {
   useCallback,
   useMemo,
   useEffect,
-  KeyboardEvent,
 } from 'react';
+import type { KeyboardEvent } from 'react';
 import {
   Upload,
   Check,
@@ -185,16 +185,16 @@ export function DocumentUploadView({
   const [validationError, setValidationError] = useState<string | null>(null);
 
   const { uploadDocument, uploading, error: uploadError, clearError } = useDocumentUpload();
-  const [selectedUploadWorkspaceId, setSelectedUploadWorkspaceId] = useState<string | null>(currentWorkspaceId);
+  const [selectedUploadWorkspaceId, setSelectedUploadWorkspaceId] = useState<string | null>(currentWorkspaceId ?? null);
 
   // Sync workspace selection with context changes
   useEffect(() => {
-    setSelectedUploadWorkspaceId(currentWorkspaceId);
+    setSelectedUploadWorkspaceId(currentWorkspaceId ?? null);
   }, [currentWorkspaceId]);
 
   const { status, progress, error: ingestionError } = useDocumentIngestion(
     uploadedDocumentId ?? '',
-    selectedUploadWorkspaceId || currentWorkspaceId,
+    selectedUploadWorkspaceId || currentWorkspaceId || undefined,
   );
 
   // ── Notify parent of status changes ──────────────────────────────────────
@@ -679,9 +679,9 @@ export function DocumentUploadView({
                     marginBottom: '24px',
                   }}
                 >
-                  <StatCard label="Chunks" value={progress.details.chunks_created ?? 0} />
-                  <StatCard label="Embeddings" value={progress.details.embeddings_created ?? 0} />
-                  <StatCard label="Tokens" value={progress.details.total_tokens ?? 0} />
+                  <StatCard label="Chunks" value={Number((progress.details as Record<string, number | undefined>).chunks_created ?? 0)} />
+                  <StatCard label="Embeddings" value={Number((progress.details as Record<string, number | undefined>).embeddings_created ?? 0)} />
+                  <StatCard label="Tokens" value={Number((progress.details as Record<string, number | undefined>).total_tokens ?? 0)} />
                 </div>
               )}
 

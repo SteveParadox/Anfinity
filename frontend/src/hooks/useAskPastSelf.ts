@@ -1,8 +1,3 @@
-/**
- * FEATURE 2: "ASK YOUR PAST SELF" - Frontend RAG Service Hook
- * Handles streaming chat requests to knowledge base with source attribution.
- */
-
 import React from 'react';
 import { api } from '../lib/api';
 
@@ -33,21 +28,49 @@ export interface AskPastSelfOptions {
   history?: ChatMessage[];
   topK?: number;
   similarityThreshold?: number;
+  signal?: AbortSignal;
 }
 
-/**
- * Stream RAG chat response from backend.
- * 
- * Yields chunks containing:
- * 1. Sources metadata first
- * 2. Streamed LLM tokens
- * 3. Follow-up questions last
- */
+type ChatStateMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+  sources?: RAGSource[];
+};
+
+function parseSseEvents(buffer: string): {
+  events: ChatStreamMessage[];
+  remainder: string;
+} {
+  const events: ChatStreamMessage[] = [];
+  const rawEvents = buffer.split('\n\n');
+  const remainder = rawEvents.pop() ?? '';
+
+  for (const rawEvent of rawEvents) {
+    const data = rawEvent
+      .split('\n')
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n')
+      .trim();
+
+    if (!data || data === '[DONE]') {
+      continue;
+    }
+
+    try {
+      events.push(JSON.parse(data) as ChatStreamMessage);
+    } catch (error) {
+      console.error('Failed to parse chat stream event:', data, error);
+    }
+  }
+
+  return { events, remainder };
+}
+
 export async function* streamAskPastSelf(
   options: AskPastSelfOptions
 ): AsyncGenerator<ChatStreamMessage> {
-  const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
-
+  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8080';
   const payload = {
     workspace_id: options.workspaceId,
     query: options.query,
@@ -57,18 +80,28 @@ export async function* streamAskPastSelf(
   };
 
   try {
-    const response = await fetch(`${API_BASE}/chat/ask`, {
+    const response = await fetch(`${apiBase}/chat/ask`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${api.getToken() || ''}`,
+        Authorization: `Bearer ${api.getToken() || ''}`,
       },
       body: JSON.stringify(payload),
+      signal: options.signal,
     });
 
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      let detail = `HTTP ${response.status}`;
+      try {
+        const errorBody = await response.json();
+        detail = errorBody.detail || detail;
+      } catch {
+        const errorText = await response.text().catch(() => '');
+        if (errorText) {
+          detail = errorText;
+        }
+      }
+      throw new Error(detail);
     }
 
     if (!response.body) {
@@ -77,30 +110,35 @@ export async function* streamAskPastSelf(
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
 
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
 
-      // Parse Server-Sent Events format
-      const text = decoder.decode(value);
-      const lines = text.split('\n\n');
+      const parsed = parseSseEvents(buffer);
+      buffer = parsed.remainder;
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
+      for (const event of parsed.events) {
+        yield event;
+      }
 
-        const data = line.slice('data: '.length).trim();
-        if (!data || data === '[DONE]') continue;
+      if (done) {
+        break;
+      }
+    }
 
-        try {
-          const message = JSON.parse(data) as ChatStreamMessage;
-          yield message;
-        } catch (e) {
-          console.error('Failed to parse chat chunk:', data, e);
-        }
+    if (buffer.trim()) {
+      const parsed = parseSseEvents(`${buffer}\n\n`);
+      for (const event of parsed.events) {
+        yield event;
       }
     }
   } catch (error) {
+    if ((error as Error)?.name === 'AbortError') {
+      throw error;
+    }
+
     yield {
       type: 'error',
       message: error instanceof Error ? error.message : 'Unknown error',
@@ -108,10 +146,6 @@ export async function* streamAskPastSelf(
   }
 }
 
-/**
- * Non-streaming variant for simpler use cases.
- * Returns complete response synchronously.
- */
 export async function askPastSelfSync(
   options: AskPastSelfOptions
 ): Promise<{
@@ -120,8 +154,7 @@ export async function askPastSelfSync(
   confidence: 'high' | 'medium' | 'low' | 'not_found';
   followUpQuestions: string[];
 }> {
-  const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
-
+  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8080';
   const payload = {
     workspace_id: options.workspaceId,
     query: options.query,
@@ -130,93 +163,157 @@ export async function askPastSelfSync(
     similarity_threshold: options.similarityThreshold ?? 0.3,
   };
 
-  const response = await fetch(`${API_BASE}/chat/ask/sync`, {
+  const response = await fetch(`${apiBase}/chat/ask/sync`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${api.getToken() || ''}`,
+      Authorization: `Bearer ${api.getToken() || ''}`,
     },
     body: JSON.stringify(payload),
+    signal: options.signal,
   });
 
   if (!response.ok) {
-    const error = await response.json();
+    const error = await response.json().catch(() => ({}));
     throw new Error(error.detail || `HTTP ${response.status}`);
   }
 
   return response.json();
 }
 
-/**
- * React hook for managing chat state and streaming.
- */
 export function useAskPastSelf() {
-  const [messages, setMessages] = React.useState<
-    Array<{ role: 'user' | 'assistant'; content: string; sources?: RAGSource[] }>
-  >([]);
+  const [messages, setMessages] = React.useState<ChatStateMessage[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [streamingSources, setStreamingSources] = React.useState<RAGSource[]>([]);
+  const [followUpQuestions, setFollowUpQuestions] = React.useState<string[]>([]);
+
+  const messagesRef = React.useRef<ChatStateMessage[]>([]);
+  const abortRef = React.useRef<AbortController | null>(null);
+
+  React.useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const replaceLastAssistant = React.useCallback(
+    (content: string, sources: RAGSource[]) => {
+      setMessages((prev) => {
+        const updated = [...prev];
+        for (let index = updated.length - 1; index >= 0; index -= 1) {
+          if (updated[index].role === 'assistant') {
+            updated[index] = {
+              ...updated[index],
+              content,
+              sources,
+            };
+            return updated;
+          }
+        }
+        return [...updated, { role: 'assistant', content, sources }];
+      });
+    },
+    []
+  );
 
   const chat = React.useCallback(
     async (query: string, workspaceId: string) => {
-      setLoading(true);
-      setMessages((prev) => [...prev, { role: 'user', content: query }]);
+      if (loading) {
+        return;
+      }
+
+      const history = messagesRef.current.map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
+
+      const controller = new AbortController();
+      abortRef.current = controller;
 
       let assistantContent = '';
       let sources: RAGSource[] = [];
+
+      setLoading(true);
+      setStreamingSources([]);
+      setFollowUpQuestions([]);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', content: query },
+        { role: 'assistant', content: '', sources: [] },
+      ]);
 
       try {
         for await (const chunk of streamAskPastSelf({
           query,
           workspaceId,
-          history: messages.map((m) => ({ role: m.role, content: m.content })),
+          history,
+          signal: controller.signal,
         })) {
           if (chunk.type === 'sources' && chunk.sources) {
             sources = chunk.sources;
             setStreamingSources(sources);
-          } else if (chunk.type === 'token' && chunk.text) {
+            replaceLastAssistant(assistantContent, sources);
+            continue;
+          }
+
+          if (chunk.type === 'token' && chunk.text) {
             assistantContent += chunk.text;
-            setMessages((prev) => {
-              const updated = [...prev];
-              if (updated[updated.length - 1]?.role === 'assistant') {
-                updated[updated.length - 1].content = assistantContent;
-                updated[updated.length - 1].sources = sources;
-              }
-              return updated;
-            });
-          } else if (chunk.type === 'error') {
+            replaceLastAssistant(assistantContent, sources);
+            continue;
+          }
+
+          if (chunk.type === 'done') {
+            setFollowUpQuestions(chunk.followUpQuestions || []);
+            continue;
+          }
+
+          if (chunk.type === 'error') {
             throw new Error(chunk.message || 'Stream error');
           }
         }
 
-        // Add assistant message with sources
-        setMessages((prev) => [...prev, { role: 'assistant', content: assistantContent, sources }]);
+        replaceLastAssistant(assistantContent, sources);
       } catch (error) {
-        console.error('Chat error:', error);
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          },
-        ]);
+        if ((error as Error)?.name === 'AbortError') {
+          setMessages((prev) => prev.filter((message, index) => {
+            const isLast = index === prev.length - 1;
+            return !(
+              isLast &&
+              message.role === 'assistant' &&
+              !message.content &&
+              (!message.sources || message.sources.length === 0)
+            );
+          }));
+          return;
+        }
+
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        replaceLastAssistant(`Error: ${message}`, []);
       } finally {
+        abortRef.current = null;
         setLoading(false);
         setStreamingSources([]);
       }
     },
-    [messages]
+    [loading, replaceLastAssistant]
   );
 
   const clearChat = React.useCallback(() => {
+    abortRef.current?.abort();
     setMessages([]);
+    setStreamingSources([]);
+    setFollowUpQuestions([]);
+  }, []);
+
+  const cancelChat = React.useCallback(() => {
+    abortRef.current?.abort();
   }, []);
 
   return {
     messages,
     loading,
     streamingSources,
+    followUpQuestions,
     chat,
     clearChat,
+    cancelChat,
   };
 }

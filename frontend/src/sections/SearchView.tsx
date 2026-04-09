@@ -2,15 +2,16 @@ import { useState, useMemo, useEffect, useContext } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Search, Sparkles, Brain, Filter, Clock,
-  ArrowRight, X, Lightbulb, Quote, CheckCircle, XCircle,
+  ArrowRight, X, Lightbulb, Quote,
 } from 'lucide-react';
-import type { Note, SearchResult } from '@/types';
+import type { Note } from '@/types';
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
 
 interface QueryResult {
   query_id: string;
+  answer_id: string;
   answer: string;
   confidence: number;
   confidence_factors?: {
@@ -22,7 +23,6 @@ interface QueryResult {
     chunk_id: string;
     document_id: string;
     document_title: string;
-    text: string;
     similarity: number;
   }>;
   model_used: string;
@@ -30,25 +30,20 @@ interface QueryResult {
   response_time_ms: number;
 }
 
-interface QueryResult {
-  query_id: string;
-  answer: string;
-  confidence: number;
-  confidence_factors?: {
-    similarity_avg?: number;
-    document_diversity?: number;
-    source_coverage?: number;
-  };
-  sources: Array<{
-    chunk_id: string;
-    document_id: string;
-    document_title: string;
-    text: string;
-    similarity: number;
-  }>;
-  model_used: string;
-  tokens_used: number;
-  response_time_ms: number;
+interface SemanticResult {
+  chunk_id: string;
+  document_id: string;
+  document_title: string;
+  content: string;
+  highlight: string;
+  source_type: string;
+  chunk_index: number;
+  created_at: string;
+  interaction_count: number;
+  similarity_score: number;
+  recency_score: number;
+  usage_score: number;
+  final_score: number;
 }
 
 const TT = {
@@ -73,6 +68,7 @@ export function SearchView() {
   const [isSearching, setIsSearching] = useState(false);
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [activeFilters, setActiveFilters] = useState<string[]>([]);
+  const [semanticResults, setSemanticResults] = useState<SemanticResult[]>([]);
   const [queryResults, setQueryResults] = useState<QueryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
@@ -84,9 +80,7 @@ export function SearchView() {
   const [showFeedbackComment, setShowFeedbackComment] = useState(false);
   const [answerFeedbackStatus, setAnswerFeedbackStatus] = useState<'verified' | 'rejected' | null>(null);
   
-  // STEP 7: Output format state
   const [showStep7Format, setShowStep7Format] = useState(false);
-  const [step7Output, setStep7Output] = useState<{ answer: string; confidence: number; sources: Array<{ document_id: string; chunk_index: number; similarity: number }> } | null>(null);
   
   // STEP 8: Credibility analytics state
   const [showCredibilityAnalytics, setShowCredibilityAnalytics] = useState(false);
@@ -169,30 +163,37 @@ export function SearchView() {
 
   // Transform query results to Note format for display
   const displayResults = useMemo(() => {
-    if (!queryResults?.sources) return [];
-    
-    return queryResults.sources.map((source) => ({
+    return semanticResults.map((result) => ({
       note: {
-        id: source.chunk_id,
-        title: source.document_title,
-        content: source.text,
-        summary: source.text.substring(0, 150),
+        id: result.chunk_id,
+        title: result.document_title,
+        content: result.content,
+        summary: result.highlight || result.content.substring(0, 150),
         tags: [] as string[],
         connections: [] as string[],
         userId: '',
-        workspaceId: '',
+        workspaceId: workspaceId || '',
         type: 'document' as const,
-        createdAt: new Date(),
-        updatedAt: new Date(),
+        createdAt: new Date(result.created_at),
+        updatedAt: new Date(result.created_at),
       },
-      score: source.similarity,
-      highlights: [source.text.substring(0, 100) + '...'],
+      score: result.final_score,
+      highlights: [result.highlight || result.content.substring(0, 100) + '...'],
+      sourceType: result.source_type,
     }));
-  }, [queryResults]);
+  }, [semanticResults, workspaceId]);
 
   const filteredResults = useMemo(() => {
     if (!activeFilters.length) return displayResults;
-    return displayResults.filter((r) => activeFilters.some((f) => r.note.tags.includes(f)));
+    return displayResults.filter((result) =>
+      activeFilters.some((filter) => {
+        const needle = filter.toLowerCase();
+        return (
+          result.note.title.toLowerCase().includes(needle) ||
+          result.note.content.toLowerCase().includes(needle)
+        );
+      })
+    );
   }, [displayResults, activeFilters]);
 
   const allTags = useMemo(() => {
@@ -205,7 +206,7 @@ export function SearchView() {
     setActiveFilters((p) => (p.includes(tag) ? p.filter((t) => t !== tag) : [...p, tag]));
 
   // Execute semantic search via backend API
-  const doSearch = async (searchQuery?: string) => {
+  const legacyDoSearch = async (searchQuery?: string) => {
     // Ensure queryToUse is a string
     let queryToUse = typeof searchQuery === 'string' ? searchQuery : (typeof query === 'string' ? query : '');
     
@@ -237,6 +238,7 @@ export function SearchView() {
       
       setQueryResults({
         query_id: result.query_id,
+        answer_id: result.answer_id,
         answer: result.answer,
         confidence: result.confidence,
         confidence_factors: result.confidence_factors || {
@@ -246,8 +248,8 @@ export function SearchView() {
         },
         sources: result.sources,
         model_used: result.model_used,
-        tokens_used: 0,
-        response_time_ms: 0,
+        tokens_used: result.tokens_used,
+        response_time_ms: result.response_time_ms,
       });
     } catch (err) {
       let errorMsg = 'Search failed. Please try again.';
@@ -282,14 +284,111 @@ export function SearchView() {
     }
   };
 
+  const doSearch = async (searchQuery?: string) => {
+    const queryToUse =
+      typeof searchQuery === 'string' ? searchQuery : (typeof query === 'string' ? query : '');
+
+    if (!queryToUse.trim()) {
+      setError('Please enter a search query');
+      setIsSearching(false);
+      return;
+    }
+
+    if (!workspaceId) {
+      setError('Workspace is not loaded. Please try again.');
+      setIsSearching(false);
+      return;
+    }
+
+    setIsSearching(true);
+    setError(null);
+    setSelectedNote(null);
+    setSemanticResults([]);
+    setQueryResults(null);
+    setAnswerFeedbackStatus(null);
+    setFeedbackMessage(null);
+    setFeedbackComment('');
+    setShowFeedbackComment(false);
+    setShowStep7Format(false);
+
+    try {
+      const [searchResult, answerResult] = await Promise.allSettled([
+        api.search(queryToUse, workspaceId, { limit: 10 }),
+        api.query(queryToUse, workspaceId, { limit: 5 }),
+      ]);
+
+      const partialErrors: string[] = [];
+
+      if (searchResult.status === 'fulfilled') {
+        setSemanticResults(searchResult.value.results as SemanticResult[]);
+      } else {
+        partialErrors.push('Semantic search is unavailable right now.');
+      }
+
+      if (answerResult.status === 'fulfilled') {
+        const result = answerResult.value;
+        setQueryResults({
+          query_id: result.query_id,
+          answer_id: result.answer_id,
+          answer: result.answer,
+          confidence: result.confidence,
+          confidence_factors: result.confidence_factors || {
+            similarity_avg: 0,
+            document_diversity: 0,
+            source_coverage: 0,
+          },
+          sources: result.sources,
+          model_used: result.model_used,
+          tokens_used: result.tokens_used,
+          response_time_ms: result.response_time_ms,
+        });
+      } else {
+        partialErrors.push('Grounded answer generation is unavailable right now.');
+      }
+
+      if (searchResult.status === 'rejected' && answerResult.status === 'rejected') {
+        throw searchResult.reason || answerResult.reason;
+      }
+
+      setError(partialErrors.length ? partialErrors.join(' ') : null);
+    } catch (err) {
+      let errorMsg = 'Search failed. Please try again.';
+
+      if (err instanceof Error) {
+        const msg = err.message.toLowerCase();
+        if (msg.includes('503') || msg.includes('unavailable')) {
+          errorMsg = 'Embedding service is currently unavailable. Please try again in a few moments.';
+        } else if (msg.includes('timeout')) {
+          errorMsg = 'The search request timed out. Try rephrasing your query or uploading more specific documents.';
+        } else if (msg.includes('429')) {
+          errorMsg = 'Too many requests. Please wait a moment and try again.';
+        } else if (msg.includes('no documents') || msg.includes('no results')) {
+          errorMsg = 'No matching documents found. Try uploading more documents or use different keywords.';
+        } else if (msg.includes('network')) {
+          errorMsg = 'Network error. Check your connection and try again.';
+        } else if (msg.includes('validation')) {
+          errorMsg = 'Request validation failed. Please check your input and try again.';
+        } else {
+          errorMsg = err.message;
+        }
+      }
+
+      setError(errorMsg);
+      setSemanticResults([]);
+      setQueryResults(null);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
   const suggested = generateSuggestions();
 
   // STEP 8: Submit feedback on answer quality
   const handleSubmitFeedback = async (status: 'verified' | 'rejected') => {
-    console.log('👍 [FEEDBACK START] Submitting feedback - Status: %s, Query ID: %s', status, queryResults?.query_id);
+    console.log('👍 [FEEDBACK START] Submitting feedback - Status: %s, Answer ID: %s', status, queryResults?.answer_id);
     
-    if (!queryResults?.query_id) {
-      console.warn('⚠️ [VALIDATION] No query ID found');
+    if (!queryResults?.answer_id) {
+      console.warn('⚠️ [VALIDATION] No answer ID found');
       return;
     }
     
@@ -299,7 +398,7 @@ export function SearchView() {
     try {
       console.debug('📡 [API CALL] Calling api.submitAnswerFeedback()');
       const result = await api.submitAnswerFeedback(
-        queryResults.query_id,
+        queryResults.answer_id,
         status,
         feedbackComment || undefined
       );
@@ -704,7 +803,9 @@ export function SearchView() {
                             ))}
                             <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMid }}>
                               <Clock size={9} />
-                              Semantic match
+                              {Number.isNaN(result.note.createdAt.getTime())
+                                ? 'Semantic match'
+                                : formatDistanceToNow(result.note.createdAt, { addSuffix: true })}
                             </span>
                           </div>
                         </div>

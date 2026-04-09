@@ -22,6 +22,12 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../lib/api';
+export {
+  useDocumentIngestion,
+  useWorkspaceIngestionStats,
+  useIngestionErrors,
+  useMultipleDocumentsIngestion,
+} from './Ingestionhooks';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,7 +54,7 @@ export interface IngestionStatus {
     timestamp?: string;
   }>;
   created_at?: string;
-  updated_at?: string;
+  updated_at?: string | null;
   error?: string;
 }
 

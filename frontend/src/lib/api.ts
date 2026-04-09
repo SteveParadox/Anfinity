@@ -115,14 +115,17 @@ export interface Workspace {
 export interface SearchResult {
   chunk_id: string;
   document_id: string;
-  workspace_id: string;
-  score: number;
-  text: string;
-  text_preview: string;
-  chunk_index: number;
+  document_title: string;
+  content: string;
+  highlight: string;
   source_type: string;
-  metadata: Record<string, any>;
+  chunk_index: number;
   created_at: string;
+  interaction_count: number;
+  similarity_score: number;
+  recency_score: number;
+  usage_score: number;
+  final_score: number;
 }
 
 export interface SearchResponse {
@@ -260,6 +263,37 @@ class ApiClient {
     return this.logger.getLogs();
   }
 
+  private mergeAbortSignals(
+    timeoutController: AbortController,
+    externalSignal?: AbortSignal | null
+  ): AbortSignal {
+    if (!externalSignal) {
+      return timeoutController.signal;
+    }
+
+    if (externalSignal.aborted) {
+      timeoutController.abort();
+      return timeoutController.signal;
+    }
+
+    const mergedController = new AbortController();
+    const forwardAbort = () => {
+      if (!mergedController.signal.aborted) {
+        mergedController.abort();
+      }
+      timeoutController.abort();
+      externalSignal.removeEventListener('abort', onExternalAbort);
+      timeoutController.signal.removeEventListener('abort', onTimeoutAbort);
+    };
+    const onExternalAbort = () => forwardAbort();
+    const onTimeoutAbort = () => forwardAbort();
+
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    timeoutController.signal.addEventListener('abort', onTimeoutAbort, { once: true });
+
+    return mergedController.signal;
+  }
+
   /**
    * Retry logic with exponential backoff
    */
@@ -307,11 +341,17 @@ class ApiClient {
     options: RequestInit & { timeout?: number; retries?: boolean } = {}
   ): Promise<T> {
     const startTime = performance.now();
-    const { timeout = API_TIMEOUT, retries = true, ...fetchOptions } = options;
+    const {
+      timeout = API_TIMEOUT,
+      retries = true,
+      signal: externalSignal,
+      ...fetchOptions
+    } = options;
 
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), timeout);
     const requestKey = `${options.method || 'GET'} ${endpoint}`;
+    const requestSignal = this.mergeAbortSignals(abortController, externalSignal);
 
     try {
       this.abortControllers.set(requestKey, abortController);
@@ -336,7 +376,7 @@ class ApiClient {
         const response = await fetch(url, {
           ...fetchOptions,
           headers,
-          signal: abortController.signal,
+          signal: requestSignal,
         });
 
         return this.handleResponse<T>(response);
@@ -468,7 +508,11 @@ class ApiClient {
 
   // ==================== Documents Endpoints ====================
 
-  async uploadDocument(file: File, workspaceId: string): Promise<Document> {
+  async uploadDocument(
+    file: File,
+    workspaceId: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<Document> {
     const formData = new FormData();
     formData.append('file', file);
 
@@ -476,6 +520,7 @@ class ApiClient {
     return this.request(`/documents/upload?workspace_id=${encodeURIComponent(workspaceId)}`, {
       method: 'POST',
       body: formData,
+      signal: options?.signal,
     });
   }
 
@@ -515,7 +560,7 @@ class ApiClient {
     document_id: string;
     title: string;
     source_type: string;
-    status: string;
+    status: 'pending' | 'processing' | 'indexed' | 'failed';
     progress: {
       chunks_created: number;
       embeddings_created: number;
@@ -529,6 +574,7 @@ class ApiClient {
     }>;
     created_at: string;
     updated_at: string | null;
+    error?: string;
   }> {
     return this.request(`/ingestion/status/${documentId}`);
   }
@@ -567,7 +613,7 @@ class ApiClient {
     const queryParams = new URLSearchParams();
     if (statusFilter) queryParams.append('status_filter', statusFilter);
     return this.request(
-      `/ingestion/workspace/${workspaceId}${queryParams.toString() ? `?${queryParams}` : ''}`
+      `/ingestion/workspace/${workspaceId}/status${queryParams.toString() ? `?${queryParams}` : ''}`
     );
   }
 
@@ -703,19 +749,34 @@ class ApiClient {
     workspaceId: string,
     options?: {
       limit?: number;
-      score_threshold?: number;
-      filters?: Record<string, any>;
+      filters?: {
+        tags?: string[];
+        date_from?: string;
+        date_to?: string;
+        source_type?: string;
+      };
     }
   ): Promise<SearchResponse> {
-    return this.request(`/query?workspace_id=${workspaceId}`, {
-      method: 'POST',
-      body: JSON.stringify({
-        query,
-        limit: options?.limit || 10,
-        score_threshold: options?.score_threshold,
-        filters: options?.filters || {},
-      }),
+    const queryParams = new URLSearchParams({
+      workspace_id: workspaceId,
+      q: query,
+      limit: String(options?.limit || 10),
     });
+
+    if (options?.filters?.tags?.length) {
+      queryParams.append('tags', options.filters.tags.join(','));
+    }
+    if (options?.filters?.date_from) {
+      queryParams.append('date_from', options.filters.date_from);
+    }
+    if (options?.filters?.date_to) {
+      queryParams.append('date_to', options.filters.date_to);
+    }
+    if (options?.filters?.source_type) {
+      queryParams.append('source_type', options.filters.source_type);
+    }
+
+    return this.request(`/search/semantic?${queryParams.toString()}`);
   }
 
   // ==================== Audit Endpoints ====================
@@ -784,43 +845,6 @@ class ApiClient {
 
   // ==================== Ingestion Endpoints ====================
 
-  async getIngestionStatus(documentId: string): Promise<{
-    document_id: string;
-    title: string;
-    status: 'pending' | 'processing' | 'indexed' | 'failed';
-    progress: {
-      chunks_created: number;
-      embeddings_created: number;
-      total_tokens: number;
-    };
-    stages: Array<{
-      stage: string;
-      status: string;
-      duration_ms: number;
-      error?: string;
-    }>;
-  }> {
-    return this.request(`/ingestion/status/${documentId}`);
-  }
-
-  async getWorkspaceIngestionStatus(workspaceId: string): Promise<{
-    workspace_id: string;
-    total_documents: number;
-    status_breakdown: Record<string, number>;
-    aggregated_stats: {
-      total_chunks: number;
-      total_tokens: number;
-      recent_activities_24h: number;
-    };
-    document_statuses: Array<{
-      document_id: string;
-      title: string;
-      status: string;
-    }>;
-  }> {
-    return this.request(`/ingestion/workspace/${workspaceId}/status`);
-  }
-
   async retryIngestion(documentId: string): Promise<{ status: string; new_status: string }> {
     return this.request(`/ingestion/documents/${documentId}/retry`, {
       method: 'POST',
@@ -845,21 +869,23 @@ class ApiClient {
     options?: {
       limit?: number;
       model?: string;
+      signal?: AbortSignal;
     }
   ): Promise<{
     query_id: string;
-    query: string;
+    answer_id: string;
     answer: string;
     sources: Array<{
       chunk_id: string;
       document_id: string;
       document_title: string;
-      text: string;
       similarity: number;
     }>;
     confidence: number;
     confidence_factors: Record<string, number>;
     model_used: string;
+    tokens_used: number;
+    response_time_ms: number;
   }> {
     // RAG queries can take longer due to embedding generation + vector search + LLM generation
     // Timeout: 120 seconds (2 minutes) to allow for:
@@ -868,15 +894,21 @@ class ApiClient {
     // - LLM generation with context: ~30-90s (depending on provider)
     // - Network/retry overhead: ~5-10s
     // - Cold start (if Ollama preload failed): ~60-80s additional
+    const payload: Record<string, any> = {
+      workspace_id: workspaceId,
+      query,
+      top_k: options?.limit || 5,
+      include_sources: true,
+    };
+
+    if (options?.model) {
+      payload.model = options.model;
+    }
+
     return this.request(`/query`, {
       method: 'POST',
-      body: JSON.stringify({
-        workspace_id: workspaceId,
-        query,
-        top_k: options?.limit || 5,
-        include_sources: true,
-        model: options?.model || 'gpt-4o-mini',
-      }),
+      body: JSON.stringify(payload),
+      signal: options?.signal,
       timeout: 300000, // 300s for RAG queries (180s backend LLM + 30s retrieval + 90s buffer for slow Ollama)
     });
   }

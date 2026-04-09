@@ -68,7 +68,7 @@ const TT = {
 
 interface StatusBadgeProps {
   status: string;
-  error?: string;
+  error?: string | null;
 }
 
 type StatusConfig = {
@@ -248,7 +248,7 @@ function DocumentRow({
     // user gets immediate feedback.
     onRetryOptimistic(doc.id);
     try {
-      await api.request(`/ingestion/documents/${doc.id}/retry`, { method: 'POST' });
+      await api.retryIngestion(doc.id);
       await onReload();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Retry failed';

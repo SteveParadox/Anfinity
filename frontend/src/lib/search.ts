@@ -51,7 +51,7 @@ export interface TrendingSearchResponse {
  */
 export class SemanticSearchClient {
   private apiUrl: string;
-  private workspaceId: string;
+  workspaceId: string;
 
   constructor(apiUrl: string, workspaceId: string) {
     this.apiUrl = apiUrl;
@@ -91,6 +91,7 @@ export class SemanticSearchClient {
 
     try {
       const params = new URLSearchParams({
+        workspace_id: this.workspaceId,
         q: query,
         limit: limit.toString(),
       });
@@ -142,8 +143,13 @@ export class SemanticSearchClient {
     }
 
     try {
+      const params = new URLSearchParams({
+        workspace_id: this.workspaceId,
+        limit: limit.toString(),
+      });
+
       const response = await fetch(
-        `${this.apiUrl}/search/trending?limit=${limit}`,
+        `${this.apiUrl}/search/trending?${params.toString()}`,
         {
           method: 'GET',
           headers: this.getHeaders(),
@@ -170,6 +176,7 @@ export class SemanticSearchClient {
   async logClick(searchLogId: string, chunkId: string): Promise<{ status: string; clicked_count: number }> {
     try {
       const params = new URLSearchParams({
+        workspace_id: this.workspaceId,
         search_log_id: searchLogId,
         chunk_id: chunkId,
       });

@@ -151,7 +151,7 @@ export function Dashboard({
           },
           {
             id: '3',
-            type: 'metric',
+            type: 'summary',
             content: `${stats.documents.processing} documents are currently being processed.`,
             sources: [],
             confidence: 0.92,
