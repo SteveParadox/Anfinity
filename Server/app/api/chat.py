@@ -1,30 +1,34 @@
 """FEATURE 2: "ASK YOUR PAST SELF" CHAT - RAG Pipeline Chat Endpoint."""
 
+import asyncio
 import json
 import logging
-import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+import re
+from typing import AsyncGenerator, List, Optional
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import insert, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.auth import get_current_active_user
-from app.database.models import User as DBUser, Workspace, WorkspaceMember, Document
+from app.database.models import User as DBUser, Workspace, WorkspaceMember
 from app.database.session import get_db
-from app.services.answer_generator import get_answer_generator
 from app.services.top_k_retriever import get_top_k_retriever
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+_OLLAMA_STREAM_CONCURRENCY = max(1, int(getattr(settings, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2))
+_OLLAMA_STREAM_SEMAPHORE = asyncio.Semaphore(_OLLAMA_STREAM_CONCURRENCY)
 
 
 # ============================================================================
-# STPE 2.1: Models & Types
+# STEP 2.1: Models & Types
 # ============================================================================
 
 class RAGSource(BaseModel):
@@ -46,7 +50,9 @@ class AskPastSelfRequest(BaseModel):
     """Request to chat with knowledge base."""
     workspace_id: UUID
     query: str = Field(..., min_length=1, max_length=2000)
-    history: Optional[List[ChatMessage]] = Field(default=None, description="Last 4 message exchanges for context")
+    history: Optional[List[ChatMessage]] = Field(
+        default=None, description="Up to 4 prior exchanges for context"
+    )
     top_k: int = Field(default=6, ge=1, le=20)
     similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
 
@@ -60,8 +66,88 @@ class AskPastSelfResponse(BaseModel):
 
 
 # ============================================================================
-# STEP 2.1: RAG Core Pipeline Functions
+# STEP 2.2: Shared Helpers
 # ============================================================================
+
+async def _verify_workspace_access(
+    workspace_id: UUID,
+    user: DBUser,
+    db: AsyncSession,
+) -> Workspace:
+    """
+    Verify the user has access to the requested workspace.
+    Raises HTTPException on any failure — call this *before* starting a stream.
+
+    Returns the workspace on success.
+    """
+    result = await db.execute(select(Workspace).where(Workspace.id == workspace_id))
+    workspace = result.scalar_one_or_none()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+    if workspace.owner_id != user.id:
+        membership = await db.execute(
+            select(WorkspaceMember).where(
+                WorkspaceMember.workspace_id == workspace_id,
+                WorkspaceMember.user_id == user.id,
+            )
+        )
+        if not membership.scalar_one_or_none():
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to workspace")
+
+    return workspace
+
+
+def _determine_confidence(sources: List[RAGSource]) -> str:
+    """Map top-source similarity to a confidence tier."""
+    if not sources:
+        return "not_found"
+    top = sources[0].similarity
+    if top > 0.75:
+        return "high"
+    if top > 0.50:
+        return "medium"
+    return "low"
+
+
+def _build_messages(
+    system_prompt: str,
+    query: str,
+    history: Optional[List[ChatMessage]],
+) -> List[dict]:
+    """
+    Assemble the full message list for the LLM.
+    Keeps at most the last 4 exchanges (8 messages) of history.
+    """
+    messages: List[dict] = [{"role": "system", "content": system_prompt}]
+    if history:
+        messages.extend(
+            {"role": m.role, "content": m.content} for m in history[-8:]
+        )
+    messages.append({"role": "user", "content": query})
+    return messages
+
+
+# ============================================================================
+# STEP 2.3: Context Retrieval
+# ============================================================================
+
+def extract_excerpt(content: str, query: str, max_length: int = 300) -> str:
+    """
+    Return the sentence from *content* that best matches *query*.
+    Falls back to the first sentence when nothing matches.
+    """
+    sentences = re.split(r"[.!?]+", content)
+    query_words = set(query.lower().split())
+
+    best, best_score = sentences[0] if sentences else "", 0
+    for sentence in sentences:
+        score = sum(1 for w in query_words if w in sentence.lower())
+        if score > best_score:
+            best_score, best = score, sentence
+
+    return best.strip()[:max_length]
+
 
 async def retrieve_context(
     query: str,
@@ -71,56 +157,40 @@ async def retrieve_context(
     threshold: float = 0.3,
 ) -> List[RAGSource]:
     """
-    Retrieve top-k notes relevant to the query.
-    
-    Args:
-        query: User's query text
-        workspace_id: Workspace to search within
-        db: Database session
-        k: Number of results to retrieve
-        threshold: Minimum similarity threshold (0.3 = 30%)
-    
-    Returns:
-        List of RAG sources with attribution data
+    Retrieve the top-k notes relevant to *query* from the given workspace.
+
+    Runs the (potentially blocking) retriever in a thread executor so it
+    never stalls the event loop.
     """
     try:
-        # Get retriever service
         retriever = get_top_k_retriever(db=db, top_k=k, similarity_threshold=threshold)
-        
-        # Retrieve documents
-        result = retriever.retrieve(
-            query=query,
-            workspace_id=workspace_id,
-            top_k=k,
-            similarity_threshold=threshold,
+
+        # Offload sync retriever to a thread so the event loop stays clear.
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: retriever.retrieve(
+                query=query,
+                workspace_id=workspace_id,
+                top_k=k,
+                similarity_threshold=threshold,
+            ),
         )
-        
+
         if not result.chunks:
             return []
-        
-        # Get unique document IDs for metadata lookup
-        doc_ids = {chunk.document_id for chunk in result.chunks}
-        
-        # Fetch document metadata (title, dates, etc)
-        doc_stmt = select(Document).where(Document.id.in_(doc_ids))
-        doc_result = await db.execute(doc_stmt)
-        docs_by_id = {str(d.id): d for d in doc_result.scalars().all()}
-        
-        # Map to RAGSource format with complete metadata
-        sources = []
+
+        sources: List[RAGSource] = []
         for chunk in result.chunks:
-            doc = docs_by_id.get(str(chunk.document_id))
-            
-            # Determine title
-            title = (doc.title if doc else None) or getattr(chunk, "document_title", None) or "Untitled Note"
-            
-            # Determine date - try multiple sources
+            title = (
+                getattr(chunk, "document_title", None)
+                or "Untitled Note"
+            )
             created_at = ""
-            if doc and hasattr(doc, "created_at") and doc.created_at:
-                created_at = doc.created_at.isoformat() if hasattr(doc.created_at, "isoformat") else str(doc.created_at)
-            elif hasattr(chunk, "created_at") and chunk.created_at:
-                created_at = chunk.created_at.isoformat() if hasattr(chunk.created_at, "isoformat") else str(chunk.created_at)
-            
+            raw_date = getattr(chunk, "created_at", None)
+            if raw_date:
+                created_at = raw_date.isoformat() if hasattr(raw_date, "isoformat") else str(raw_date)
+
             sources.append(
                 RAGSource(
                     noteId=str(chunk.document_id),
@@ -130,57 +200,23 @@ async def retrieve_context(
                     similarity=float(chunk.similarity),
                 )
             )
-        
+
         return sources
-    except Exception as exc:
-        logger.error("Error retrieving context: %s", exc, exc_info=True)
+
+    except Exception:
+        logger.exception("Error retrieving context for query=%r workspace=%s", query, workspace_id)
         return []
 
 
-def extract_excerpt(content: str, query: str, max_length: int = 300) -> str:
-    """
-    Extract most relevant sentence from content based on query.
-    
-    Args:
-        content: Full text content
-        query: Query to match against
-        max_length: Max excerpt length
-    
-    Returns:
-        Relevant excerpt from content
-    """
-    import re
-    sentences = re.split(r'[.!?]+', content)
-    query_words = query.lower().split()
-    
-    # Find sentence with most query word matches
-    best_sentence = sentences[0] if sentences else ""
-    best_score = 0
-    
-    for sentence in sentences:
-        score = sum(1 for word in query_words if word.lower() in sentence.lower())
-        if score > best_score:
-            best_score = score
-            best_sentence = sentence
-    
-    return best_sentence.strip()[:max_length]
-
+# ============================================================================
+# STEP 2.4: Prompt Construction
+# ============================================================================
 
 def build_rag_system_prompt(query: str, sources: List[RAGSource]) -> str:
-    """
-    Build system prompt with strict grounding instructions.
-    
-    Args:
-        query: User's query
-        sources: Retrieved sources from knowledge base
-    
-    Returns:
-        System prompt for LLM
-    """
+    """Build a strictly-grounded system prompt from retrieved sources."""
     if not sources:
         return f'The user\'s knowledge base contains no notes relevant to: "{query}"'
-    
-    # Format sources with structured context
+
     source_context = "\n".join(
         f"""
 [SOURCE {i + 1}]
@@ -191,8 +227,8 @@ Content: {s.excerpt}
 ---"""
         for i, s in enumerate(sources)
     )
-    
-    return f"""You are the user's personal AI assistant with access ONLY to their private notes. 
+
+    return f"""You are the user's personal AI assistant with access ONLY to their private notes.
 Your job is to answer their question using ONLY information from the provided sources.
 
 STRICT RULES:
@@ -212,211 +248,225 @@ Answer (cite sources inline):"""
 
 
 # ============================================================================
-# STEP 2.2: Streaming API Route
+# STEP 2.5: LLM Generation (Ollama → OpenAI fallback, fully async)
 # ============================================================================
 
-async def stream_chat(
-    query: str,
-    workspace_id: UUID,
-    user: DBUser,
-    db: AsyncSession,
-    history: Optional[List[ChatMessage]] = None,
-    top_k: int = 6,
-    threshold: float = 0.3,
-) -> AsyncGenerator[str, None]:
+async def _generate_with_ollama(messages: List[dict]) -> str:
     """
-    Stream RAG chat response with source citations.
-    Uses Ollama as primary, falls back to OpenAI on failure.
-    
-    Yields:
-        JSON-encoded chunks with type='sources', type='token', or [DONE]
+    Attempt generation via Ollama using the proper chat payload.
+    Runs the blocking HTTP call in a thread executor.
+    Raises RuntimeError if Ollama is unavailable or the call fails.
     """
-    # Verify workspace access
-    result = await db.execute(select(Workspace).where(Workspace.id == workspace_id))
-    workspace = result.scalar_one_or_none()
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    
-    membership = await db.execute(
-        select(WorkspaceMember).where(
-            WorkspaceMember.workspace_id == workspace_id,
-            WorkspaceMember.user_id == user.id,
-        )
+    from app.services.llm_service import OllamaClient
+
+    ollama = OllamaClient(
+        base_url=settings.OLLAMA_BASE_URL,
+        model=settings.OLLAMA_MODEL,
+        timeout=settings.OLLAMA_TIMEOUT,
     )
-    if not membership.scalar_one_or_none() and workspace.owner_id != user.id:
-        raise HTTPException(status_code=403, detail="No access to workspace")
-    
-    # Retrieve context (sources)
-    sources = await retrieve_context(
-        query=query,
-        workspace_id=workspace_id,
-        db=db,
-        k=top_k,
-        threshold=threshold,
+    if not ollama.is_available():
+        raise RuntimeError("Ollama not available")
+
+    loop = asyncio.get_event_loop()
+    # Pass the structured messages list rather than a flat concatenated string.
+    response_text, _ = await loop.run_in_executor(
+        None,
+        lambda: ollama.chat(  # use chat() not generate() for role-aware inference
+            messages=messages,
+            temperature=0.3,
+            num_predict=1000,
+        ),
     )
-    
-    # Determine confidence before generation
-    if not sources:
-        confidence = "not_found"
-    elif sources[0].similarity > 0.75:
-        confidence = "high"
-    elif sources[0].similarity > 0.5:
-        confidence = "medium"
-    else:
-        confidence = "low"
-    
-    # Build system prompt
-    system_prompt = build_rag_system_prompt(query, sources)
-    
-    # Prepare messages with conversation history
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ]
-    
-    # Add last 4 exchanges (8 messages) for context
-    if history:
-        history_messages = [
-            {"role": msg.role, "content": msg.content}
-            for msg in history[-8:]
-        ]
-        messages.extend(history_messages)
-    
-    # Add current query
-    messages.append({"role": "user", "content": query})
-    
-    # Send sources first
-    yield json.dumps({"type": "sources", "sources": [s.model_dump() for s in sources]})
-    yield "\n"
-    
-    # Try Ollama first, fall back to OpenAI
-    full_response = ""
+    return response_text
+
+
+async def _stream_with_ollama(messages: List[dict]) -> AsyncGenerator[str, None]:
+    """Stream chat chunks directly from Ollama for faster first-token latency."""
+    payload = {
+        "model": settings.OLLAMA_MODEL,
+        "messages": messages,
+        "stream": True,
+        "keep_alive": "10m",
+        "options": {
+            "temperature": 0.3,
+            "num_predict": min(getattr(settings, "LLM_MAX_TOKENS", 1000), 1000),
+        },
+    }
+
+    async with _OLLAMA_STREAM_SEMAPHORE:
+        async with httpx.AsyncClient(timeout=float(settings.OLLAMA_TIMEOUT)) as client:
+            async with client.stream("POST", f"{settings.OLLAMA_BASE_URL}/api/chat", json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    content = ((data.get("message") or {}).get("content") or "")
+                    if content:
+                        yield content
+                    if data.get("done"):
+                        break
+
+
+async def _generate_with_openai(messages: List[dict]) -> str:
+    """
+    Fallback generation via OpenAI (async, non-blocking).
+    Raises on any API error.
+    """
+    from openai import AsyncOpenAI  # async client — no run_in_executor needed
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, timeout=30.0)
+    response = await client.chat.completions.create(
+        model=settings.OPENAI_MODEL,
+        messages=messages,
+        temperature=0.3,
+        max_tokens=1000,
+    )
+    return response.choices[0].message.content or ""
+
+
+async def generate_answer(messages: List[dict]) -> str:
+    """
+    Generate an answer using Ollama, falling back to OpenAI on any failure.
+    Both backends run asynchronously without blocking the event loop.
+    """
     try:
-        # Try streaming with Ollama
-        from app.services.llm_service import OllamaClient
-        
-        ollama = OllamaClient(
-            base_url=settings.OLLAMA_BASE_URL,
-            model=settings.OLLAMA_MODEL,
-            timeout=settings.OLLAMA_TIMEOUT
-        )
-        
-        if ollama.is_available():
-            logger.info("Using Ollama for chat streaming")
-            
-            # Format messages for Ollama (simple prompt construction)
-            prompt = "\n".join([
-                f"{msg['role'].upper()}: {msg['content']}" 
-                for msg in messages
-            ])
-            
-            # Generate with Ollama (returns full text, not streaming)
-            response_text, _ = ollama.generate(
-                prompt=prompt,
-                temperature=0.3,
-                num_predict=1000,
-            )
-            
-            # Chunk the response into smaller tokens for streaming effect
-            full_response = response_text
-            words = response_text.split()
-            for word in words:
-                word_chunk = word + " "
-                yield json.dumps({"type": "token", "text": word_chunk})
-                yield "\n"
-            
-        else:
-            raise RuntimeError("Ollama not available")
-            
-    except Exception as ollama_error:
-        logger.warning(f"Ollama failed, falling back to OpenAI: {ollama_error}")
-        
-        # Fall back to OpenAI
-        try:
-            from openai import OpenAI
-            
-            client = OpenAI(api_key=settings.OPENAI_API_KEY)
-            
-            # Stream tokens from OpenAI
-            with client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=1000,
-                stream=True,
-            ) as stream:
-                for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        token = chunk.choices[0].delta.content
-                        full_response += token
-                        yield json.dumps({"type": "token", "text": token})
-                        yield "\n"
-        except Exception as openai_error:
-            logger.error(f"Both Ollama and OpenAI failed: {openai_error}")
-            yield json.dumps({"type": "error", "message": f"LLM generation failed: {openai_error}"})
-            yield "\n"
-            return
-    
-    # Extract follow-up questions from response
-    follow_up_questions = extract_follow_up_questions(full_response)
-    
-    yield json.dumps({"type": "done", "followUpQuestions": follow_up_questions})
-    yield "\n"
+        logger.info("Attempting LLM generation with Ollama")
+        return await _generate_with_ollama(messages)
+    except Exception as exc:
+        logger.warning("Ollama failed (%s), falling back to OpenAI", exc)
+
+    try:
+        return await _generate_with_openai(messages)
+    except Exception as exc:
+        logger.error("OpenAI fallback also failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"All LLM backends failed: {exc}",
+        ) from exc
+
+
+def _chunk_text_for_stream(text: str, chunk_size: int = 48) -> List[str]:
+    """Split non-streaming fallback text into UI-friendly chunks."""
+    return [text[i:i + chunk_size] for i in range(0, len(text or ""), chunk_size)]
+
+
+# ============================================================================
+# STEP 2.6: Follow-up Question Extraction
+# ============================================================================
+
+_FOLLOW_UP_PATTERNS = [
+    re.compile(r"follow.up questions?:?\s*([\s\S]+?)$", re.IGNORECASE | re.DOTALL),
+    re.compile(r"you might also want to explore:?\s*([\s\S]+?)$", re.IGNORECASE | re.DOTALL),
+    re.compile(r"some questions you could ask:?\s*([\s\S]+?)$", re.IGNORECASE | re.DOTALL),
+]
+
+_BULLET_PREFIX = re.compile(r"^[\d\-.*]+\s*")
 
 
 def extract_follow_up_questions(response: str, max_questions: int = 3) -> List[str]:
     """
-    Extract follow-up questions from LLM response.
-    
-    Looks for common patterns like:
-    - "Follow-up questions:"
-    - "You might also want to explore:"
-    - "Some questions you could ask:"
+    Extract follow-up questions from the tail of an LLM response.
+    Patterns are pre-compiled at module load time.
     """
-    import re
-    
-    # Common patterns for follow-up questions
-    patterns = [
-        r"follow.up questions?:?\s*([\s\S]*?)$",
-        r"you might also want to explore:?\s*([\s\S]*?)$",
-        r"some questions you could ask:?\s*([\s\S]*?)$",
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, response, re.IGNORECASE)
+    for pattern in _FOLLOW_UP_PATTERNS:
+        match = pattern.search(response)
         if match:
-            text = match.group(1)
-            # Split by newlines and clean up
-            lines = [
-                re.sub(r'^[\d\-.*]+\s*', '', line).strip()
-                for line in text.split("\n")
+            questions = [
+                _BULLET_PREFIX.sub("", line).strip()
+                for line in match.group(1).splitlines()
             ]
-            # Filter: must have meaningful content
-            questions = [l for l in lines if len(l) > 10]
-            return questions[:max_questions]
-    
+            return [q for q in questions if len(q) > 10][:max_questions]
     return []
 
+
+# ============================================================================
+# STEP 2.7: Streaming Generator
+# ============================================================================
+
+async def _rag_stream(
+    query: str,
+    workspace_id: UUID,
+    user: DBUser,
+    db: AsyncSession,
+    history: Optional[List[ChatMessage]],
+    top_k: int,
+    threshold: float,
+) -> AsyncGenerator[str, None]:
+    """
+    Core streaming generator.
+
+    Workspace auth is verified by the route handler *before* this is called,
+    so HTTPException cannot fire mid-stream and corrupt the SSE contract.
+
+    Yields newline-delimited JSON chunks:
+      {type: "sources", sources: [...]}
+      {type: "token",   text: "..."}       ← one per word from Ollama / per chunk from OpenAI
+      {type: "done",    followUpQuestions: [...]}
+      {type: "error",   message: "..."}    ← only on unrecoverable failure
+    """
+    # --- Retrieve context --------------------------------------------------
+    sources = await retrieve_context(query, workspace_id, db, k=top_k, threshold=threshold)
+    yield json.dumps({"type": "sources", "sources": [s.model_dump() for s in sources]}) + "\n"
+
+    # --- Build prompt & messages -------------------------------------------
+    system_prompt = build_rag_system_prompt(query, sources)
+    messages = _build_messages(system_prompt, query, history)
+
+    # --- Generate answer ---------------------------------------------------
+    full_response_parts: List[str] = []
+    try:
+        try:
+            async for token in _stream_with_ollama(messages):
+                full_response_parts.append(token)
+                yield json.dumps({"type": "token", "text": token}) + "\n"
+        except Exception as ollama_exc:
+            logger.warning(
+                "Streaming Ollama chat failed (%s), falling back to buffered generation",
+                ollama_exc,
+            )
+            full_response = await generate_answer(messages)
+            for chunk in _chunk_text_for_stream(full_response):
+                full_response_parts.append(chunk)
+                yield json.dumps({"type": "token", "text": chunk}) + "\n"
+    except HTTPException as exc:
+        yield json.dumps({"type": "error", "message": exc.detail}) + "\n"
+        return
+
+    # --- Done --------------------------------------------------------------
+    full_response = "".join(full_response_parts)
+    yield json.dumps({
+        "type": "done",
+        "followUpQuestions": extract_follow_up_questions(full_response),
+    }) + "\n"
+
+
+# ============================================================================
+# STEP 2.8: Route Handlers
+# ============================================================================
 
 @router.post("/ask")
 async def ask_past_self(
     request: AskPastSelfRequest,
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
-):
+) -> StreamingResponse:
     """
-    POST /chat/ask - Stream RAG chat with knowledge base.
-    
-    Streams JSON-encoded responses:
-    - First: {type: "sources", sources: [...]}
-    - Then: {type: "token", text: "..."}
-    - Finally: {type: "done", followUpQuestions: [...]}
-    
-    Client reconstructs answer from tokens and displays sources.
+    POST /chat/ask — Stream RAG chat with the user's knowledge base.
+
+    Auth is validated **before** the StreamingResponse is opened so that
+    4xx errors are returned as proper HTTP responses, not buried in the stream.
+
+    Event stream format:
+      data: {type: "sources",  sources: [...]}
+      data: {type: "token",    text: "..."}
+      data: {type: "done",     followUpQuestions: [...]}
     """
-    from fastapi.responses import StreamingResponse
-    
-    async def response_generator():
-        async for chunk in stream_chat(
+    # Auth check outside the generator — HTTPException propagates cleanly here.
+    await _verify_workspace_access(request.workspace_id, current_user, db)
+
+    async def _event_stream() -> AsyncGenerator[str, None]:
+        async for chunk in _rag_stream(
             query=request.query,
             workspace_id=request.workspace_id,
             user=current_user,
@@ -425,15 +475,12 @@ async def ask_past_self(
             top_k=request.top_k,
             threshold=request.similarity_threshold,
         ):
-            yield f"data: {chunk}\n\n"
-    
+            yield f"data: {chunk}\n"
+
     return StreamingResponse(
-        response_generator(),
+        _event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
 
@@ -444,27 +491,11 @@ async def ask_past_self_sync(
     db: AsyncSession = Depends(get_db),
 ) -> AskPastSelfResponse:
     """
-    POST /chat/ask/sync - Non-streaming variant for simple use cases.
-    Uses Ollama as primary, falls back to OpenAI.
-    
-    Returns complete response with answer, sources, confidence, and follow-up questions.
+    POST /chat/ask/sync — Non-streaming variant.
+    Returns the complete response in a single JSON payload.
     """
-    # Verify workspace access
-    result = await db.execute(select(Workspace).where(Workspace.id == request.workspace_id))
-    workspace = result.scalar_one_or_none()
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    
-    membership = await db.execute(
-        select(WorkspaceMember).where(
-            WorkspaceMember.workspace_id == request.workspace_id,
-            WorkspaceMember.user_id == current_user.id,
-        )
-    )
-    if not membership.scalar_one_or_none() and workspace.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="No access to workspace")
-    
-    # Retrieve context
+    await _verify_workspace_access(request.workspace_id, current_user, db)
+
     sources = await retrieve_context(
         query=request.query,
         workspace_id=request.workspace_id,
@@ -472,87 +503,25 @@ async def ask_past_self_sync(
         k=request.top_k,
         threshold=request.similarity_threshold,
     )
-    
-    # Determine confidence
-    if not sources:
-        confidence = "not_found"
-        answer = "I couldn't find any notes in your knowledge base relevant to that question."
-        follow_up_questions = []
-    else:
-        if sources[0].similarity > 0.75:
-            confidence = "high"
-        elif sources[0].similarity > 0.5:
-            confidence = "medium"
-        else:
-            confidence = "low"
-        
-        # Build prompt
-        system_prompt = build_rag_system_prompt(request.query, sources)
-        
-        # Prepare messages
-        messages = [{"role": "system", "content": system_prompt}]
-        if request.history:
-            messages.extend([
-                {"role": msg.role, "content": msg.content}
-                for msg in request.history[-8:]
-            ])
-        messages.append({"role": "user", "content": request.query})
-        
-        # Try Ollama first, fall back to OpenAI
-        answer = None
-        try:
-            from app.services.llm_service import OllamaClient
-            
-            ollama = OllamaClient(
-                base_url=settings.OLLAMA_BASE_URL,
-                model=settings.OLLAMA_MODEL,
-                timeout=settings.OLLAMA_TIMEOUT
-            )
-            
-            if ollama.is_available():
-                logger.info("Using Ollama for chat generation")
-                
-                # Format messages for Ollama
-                prompt = "\n".join([
-                    f"{msg['role'].upper()}: {msg['content']}" 
-                    for msg in messages
-                ])
-                
-                answer, _ = ollama.generate(
-                    prompt=prompt,
-                    temperature=0.3,
-                    num_predict=1000,
-                )
-            else:
-                raise RuntimeError("Ollama not available")
-                
-        except Exception as ollama_error:
-            logger.warning(f"Ollama failed, falling back to OpenAI: {ollama_error}")
-            
-            # Fall back to OpenAI
-            try:
-                from openai import OpenAI
-                
-                client = OpenAI(api_key=settings.OPENAI_API_KEY)
-                response = client.chat.completions.create(
-                    model=settings.OPENAI_MODEL,
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=1000,
-                )
-                answer = response.choices[0].message.content or ""
-            except Exception as openai_error:
-                logger.error(f"Both Ollama and OpenAI failed: {openai_error}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to generate answer: {openai_error}"
-                ) from openai_error
-        
-        follow_up_questions = extract_follow_up_questions(answer) if answer else []
-    
+
+    confidence = _determine_confidence(sources)
+
+    if confidence == "not_found":
+        return AskPastSelfResponse(
+            answer="I couldn't find any notes in your knowledge base relevant to that question.",
+            sources=[],
+            confidence="not_found",
+            followUpQuestions=[],
+        )
+
+    system_prompt = build_rag_system_prompt(request.query, sources)
+    messages = _build_messages(system_prompt, request.query, request.history)
+
+    answer = await generate_answer(messages)  # raises HTTP 502 on total failure
+
     return AskPastSelfResponse(
-        answer=answer or "Failed to generate answer",
+        answer=answer,
         sources=sources,
         confidence=confidence,
-        followUpQuestions=follow_up_questions,
+        followUpQuestions=extract_follow_up_questions(answer),
     )

@@ -128,6 +128,7 @@ class Source(BaseModel):
 
 class QueryResponse(BaseModel):
     query_id: str
+    answer_id: str
     answer: str
     confidence: float
     confidence_factors: Dict[str, float]
@@ -241,7 +242,8 @@ async def query(
     try:
         vec_start = time.time()
         retriever = get_rag_retriever(similarity_threshold=0.5, top_k=query_request.top_k)
-        rag_result = retriever.retrieve(
+        rag_result = await asyncio.to_thread(
+            retriever.retrieve,
             query=query_request.query,
             workspace_id=str(query_request.workspace_id),
             top_k=query_request.top_k,
@@ -259,17 +261,18 @@ async def query(
         MIN_CONFIDENCE_THRESHOLD = 0.35  # 35% minimum to trust retrieval
         retrieval_is_reliable = bool(rag_result.chunks) and confidence >= MIN_CONFIDENCE_THRESHOLD and llm_chunks
         if retrieval_is_reliable:
-            llm_service = get_llm_service()
+            llm_service = get_llm_service(
+                model=query_request.model,
+                primary_provider="ollama",
+            )
             llm_start = time.time()
             try:
                 llm_response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        llm_service.generate_answer,
-                        query_request.query,
-                        llm_chunks[:4],
-                        settings.LLM_TEMPERATURE,
-                        min(settings.LLM_MAX_TOKENS, 700),
-                        True,
+                    llm_service.async_generate_answer(
+                        query=query_request.query,
+                        context_chunks=llm_chunks[:4],
+                        temperature=settings.LLM_TEMPERATURE,
+                        max_tokens=min(settings.LLM_MAX_TOKENS, 700),
                     ),
                     timeout=float(getattr(settings, "OLLAMA_TIMEOUT", 180) or 180),
                 )
@@ -346,10 +349,11 @@ async def query(
         response_time_ms = int((time.time() - start_time) * 1000)
         return QueryResponse(
             query_id=str(query_record.id),
+            answer_id=str(answer.id),
             answer=answer_text,
             confidence=round(confidence, 3),
             confidence_factors=factors,
-            sources=sources if query_request.include_sources else [],
+            sources=final_sources if query_request.include_sources else [],
             model_used=model_used,
             tokens_used=tokens_used,
             response_time_ms=response_time_ms,

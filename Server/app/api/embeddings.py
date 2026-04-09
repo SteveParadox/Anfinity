@@ -1,372 +1,498 @@
-"""Embedding service for generating and managing embeddings."""
-import os
+"""Embedding generation API endpoints."""
+from typing import Optional, List, Dict, Any
+import uuid
 import logging
-from threading import RLock
-from typing import List, Optional
 
-import requests
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from app.database.models import Document, DocumentStatus, User as DBUser, Workspace, Chunk, Embedding
+from app.database.session import get_db
+from app.core.auth import get_current_user
+from app.ingestion.embedder import Embedder
+from app.ingestion.embedding_batch_processor import BatchEmbeddingProcessor
+from app.services.vector_db import get_vector_db_client
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except ImportError:
-    HAS_OPENAI = False
-
-try:
-    import cohere
-    HAS_COHERE = True
-except ImportError:
-    HAS_COHERE = False
+router = APIRouter(prefix="/embeddings", tags=["embeddings"])
 
 
-# STEP 3: nomic-embed-text produces 768-dim vectors, not 1536.
-OLLAMA_MODEL = "nomic-embed-text"
-OLLAMA_DIMENSION = 768
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_EMBED_BATCH_SIZE = int(os.getenv("OLLAMA_EMBED_BATCH_SIZE", "48"))
-OLLAMA_EMBED_TIMEOUT = int(os.getenv("OLLAMA_EMBED_TIMEOUT", "60"))
+class EmbeddingBatchRequest(BaseModel):
+    """Request to generate embeddings for document chunks."""
+    document_id: str
+    batch_size: Optional[int] = settings.EMBEDDING_BATCH_SIZE
 
 
-class EmbeddingService:
-    """Service for generating text embeddings.
-
-    Provider priority:
-        1. openai  — text-embedding-3-small  (1536-dim)
-        2. cohere  — embed-english-v3.0      (1024-dim)
-        3. ollama  — nomic-embed-text        (768-dim)   ← real local fallback
-
-    Mock / all-same-value vectors are never produced.  If every provider
-    fails a RuntimeError is raised so callers know the truth instead of
-    silently getting useless embeddings.
-    """
-
-    def __init__(self, provider: str = "openai"):
-        """Initialize embedding service.
-
-        Args:
-            provider: "openai", "cohere", or "ollama"
-        """
-        self.provider = provider
-        self.model = None
-        self.dimension = OLLAMA_DIMENSION  # safe default
-        self._http: Optional[requests.Session] = None
-        self._cache = None
-        self._cache_lock = RLock()
-
-        if provider == "openai" and HAS_OPENAI:
-            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            self.model = "text-embedding-3-small"
-            self.dimension = 1536  # FIXED: text-embedding-3-small is 1536D, not 768D
-
-        elif provider == "cohere" and HAS_COHERE:
-            self.client = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
-            self.model = "embed-english-v3.0"
-            self.dimension = 1024
-
-        elif provider == "ollama":
-            # Ollama is handled via HTTP in embed_with_ollama(); no SDK client.
-            self.client = None
-            self.dimension = OLLAMA_DIMENSION
-
-        else:
-            # No recognised provider — do NOT silently fall back to mock data.
-            # STEP 1: surface the problem immediately at construction time.
-            raise ValueError(
-                f"Embedding provider '{provider}' is not available.  "
-                "Install 'openai', 'cohere', or run Ollama locally and set "
-                "provider='ollama'."
-            )
-
-    def _get_cache(self):
-        """Lazily create the shared embeddings cache."""
-        if self._cache is not None:
-            return self._cache
-
-        with self._cache_lock:
-            if self._cache is None:
-                try:
-                    from app.services.hybrid_embeddings_cache import HybridEmbeddingsCache
-
-                    self._cache = HybridEmbeddingsCache(enable_l2=True)
-                except Exception as exc:
-                    logger.warning("Embeddings cache unavailable: %s", exc)
-                    self._cache = False
-        return self._cache if self._cache is not False else None
-
-    # ------------------------------------------------------------------
-    # STEP 2: real Ollama integration
-    # ------------------------------------------------------------------
-
-    def _get_http(self) -> requests.Session:
-        """Create a reusable HTTP session for embedding calls."""
-        if self._http is None:
-            session = requests.Session()
-            session.headers.update({"Content-Type": "application/json"})
-            self._http = session
-        return self._http
-
-    def _validate_ollama_embeddings_response(
-        self,
-        data: dict,
-        expected_count: int,
-    ) -> List[List[float]]:
-        """Normalise Ollama responses across endpoint variants."""
-        embeddings = data.get("embeddings")
-        if embeddings is None and "embedding" in data:
-            embeddings = [data["embedding"]]
-        if not isinstance(embeddings, list):
-            raise RuntimeError(f"Ollama response missing embeddings payload: {data}")
-        if len(embeddings) != expected_count:
-            raise RuntimeError(
-                f"Ollama returned {len(embeddings)} embeddings for {expected_count} inputs"
-            )
-        return embeddings
-
-    def embed_with_ollama(self, texts: List[str]) -> List[List[float]]:
-        """Call a local Ollama instance to generate embeddings in batches.
-
-        Uses /api/embed with a list input so we avoid one-request-per-text
-        overhead. Falls back to the legacy /api/embeddings endpoint only when
-        the server does not support batch embedding.
-        """
-        if not texts:
-            return []
-
-        session = self._get_http()
-        embeddings: List[List[float]] = []
-
-        for start in range(0, len(texts), OLLAMA_EMBED_BATCH_SIZE):
-            batch = texts[start : start + OLLAMA_EMBED_BATCH_SIZE]
-            try:
-                response = session.post(
-                    f"{OLLAMA_BASE_URL}/api/embed",
-                    json={"model": OLLAMA_MODEL, "input": batch},
-                    timeout=OLLAMA_EMBED_TIMEOUT,
-                )
-                if response.status_code == 404:
-                    raise requests.HTTPError("/api/embed unsupported", response=response)
-                response.raise_for_status()
-                embeddings.extend(
-                    self._validate_ollama_embeddings_response(
-                        response.json(),
-                        expected_count=len(batch),
-                    )
-                )
-                continue
-            except Exception as batch_err:
-                logger.warning(
-                    "Batch Ollama embedding failed for %d texts, falling back to legacy mode: %s",
-                    len(batch),
-                    batch_err,
-                )
-
-            for text in batch:
-                response = session.post(
-                    f"{OLLAMA_BASE_URL}/api/embeddings",
-                    json={"model": OLLAMA_MODEL, "prompt": text},
-                    timeout=OLLAMA_EMBED_TIMEOUT,
-                )
-                if response.status_code != 200:
-                    raise RuntimeError(
-                        f"Ollama embedding failed (HTTP {response.status_code}): "
-                        f"{response.text[:200]}"
-                    )
-                embeddings.extend(
-                    self._validate_ollama_embeddings_response(
-                        response.json(),
-                        expected_count=1,
-                    )
-                )
-
-        return embeddings
+class EmbeddingBatchResponse(BaseModel):
+    """Response from embedding generation."""
+    success: bool
+    total_chunks: int
+    processed_chunks: int
+    failed_chunks: int
+    vector_ids: List[str]
+    duration_ms: float
+    errors: List[str]
 
 
-    # ------------------------------------------------------------------
-    # BONUS: safety / sanity check
-    # ------------------------------------------------------------------
-
-    EXPECTED_DIMS = {768, 1024, 1536}
-
-    def is_valid_embedding(self, vec):
-        if not isinstance(vec, list):
-            return False
-
-        if len(vec) not in self.EXPECTED_DIMS:
-            return False
-
-        if len(set(vec)) <= 2:
-            return False
-
-        return True
-
-    def embed_text(self, text: str) -> List[float]:
-        """Embed a single text string.
-
-        Args:
-            text: Text to embed.
-
-        Returns:
-            Embedding vector.
-
-        Raises:
-            RuntimeError: If embedding fails.
-        """
-        cleaned = (text or "").strip()
-        if not cleaned:
-            return []
-
-        cache = self._get_cache()
-        cache_model = self.get_model_name()
-        if cache is not None:
-            cached = cache.get(cleaned, cache_model)
-            if cached is not None:
-                return cached
-
-        result = self.embed_batch([cleaned])
-        embedding = result[0] if result else []
-        if embedding and cache is not None:
-            cache.set(cleaned, self.get_model_name(), embedding)
-        return embedding
-
-    def embed_query(self, text: str) -> List[float]:
-        """Embed a query string with caching enabled."""
-        return self.embed_text(text)
-
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Embed multiple texts.
-
-        Args:
-            texts: Texts to embed.
-
-        Returns:
-            List of validated embedding vectors.
-
-        Raises:
-            RuntimeError: If every provider fails or a vector fails
-                          the sanity check.
-        """
-        if not texts:
-            return []
-
-        # Sanitise inputs
-        texts = [t.strip() for t in texts if t and t.strip()]
-        if not texts:
-            return []
-
-        embeddings: List[List[float]] = []
-
-        try:
-            if self.provider == "openai" and self.client:
-                response = self.client.embeddings.create(
-                    model=self.model,
-                    input=texts,
-                )
-                # Maintain original order
-                sorted_data = sorted(response.data, key=lambda x: x.index)
-                embeddings = [e.embedding for e in sorted_data]
-
-            elif self.provider == "cohere" and self.client:
-                response = self.client.embed(
-                    texts=texts,
-                    model=self.model,
-                    input_type="search_document",
-                )
-                embeddings = response.embeddings
-
-            elif self.provider == "ollama":
-                embeddings = self.embed_with_ollama(texts)
-
-            else:
-                # STEP 1: no silent mock fallback — fail loudly.
-                raise RuntimeError("Embedding generation failed: no provider configured.")
-
-        except Exception as primary_err:
-            # Primary provider failed — attempt Ollama as emergency fallback
-            # only when the primary was NOT already Ollama.
-            if self.provider != "ollama":
-                # FIX: Check if Ollama has the same dimension as primary provider
-                # to prevent silent dimension mismatches during fallback
-                ollama_dimension = OLLAMA_DIMENSION
-                if ollama_dimension != self.dimension:
-                    logger.error(
-                        "Cannot fall back to Ollama: dimension mismatch. "
-                        "Primary provider '%s' uses %dD, but Ollama uses %dD. "
-                        "This would corrupt query embeddings. "
-                        "Ensure consistent EMBEDDING_PROVIDER across ingestion and query.",
-                        self.provider,
-                        self.dimension,
-                        ollama_dimension,
-                    )
-                    raise RuntimeError(
-                        f"Primary embedding provider '{self.provider}' failed and "
-                        f"fallback provider (Ollama) has incompatible dimensions "
-                        f"({self.dimension}D vs {ollama_dimension}D). "
-                        f"Cannot safely fall back. Original error: {primary_err}"
-                    ) from primary_err
-                
-                logger.warning(
-                    "Primary embedding provider '%s' failed (%s). "
-                    "Falling back to Ollama (dimension-compatible).",
-                    self.provider,
-                    primary_err,
-                )
-                try:
-                    embeddings = self.embed_with_ollama(texts)
-                except Exception as ollama_err:
-                    logger.error("Ollama fallback also failed: %s", ollama_err)
-                    # STEP 1: raise — never return fake vectors.
-                    raise RuntimeError(
-                        f"All embedding providers failed. "
-                        f"Primary error: {primary_err}. "
-                        f"Ollama error: {ollama_err}"
-                    ) from ollama_err
-            else:
-                raise RuntimeError(
-                    f"Embedding generation failed: {primary_err}"
-                ) from primary_err
-
-        # BONUS: validate every vector before returning
-        for i, vec in enumerate(embeddings):
-            if not self.is_valid_embedding(vec):
-                raise RuntimeError(
-                    f"Embedding at index {i} failed sanity check "
-                    f"(length={len(vec)}, distinct_values={len(set(vec))}).  "
-                    "This looks like a constant/mock vector — refusing to return it."
-                )
-
-        return embeddings
-
-    def get_dimension(self) -> int:
-        """Return the embedding dimension for the active provider."""
-        return self.dimension
-
-    def get_model_name(self) -> str:
-        """Return the model name for the active provider."""
-        return self.model or OLLAMA_MODEL
+class EmbeddingStatusResponse(BaseModel):
+    """Status of embeddings for a document."""
+    document_id: str
+    title: str
+    total_chunks: int
+    embedded_chunks: int
+    embedding_percentage: float
+    model_used: str
+    model_dimension: int
+    created_at: str
 
 
-# ---------------------------------------------------------------------------
-# Singleton
-# ---------------------------------------------------------------------------
+class WorkspaceEmbeddingStats(BaseModel):
+    """Embedding statistics for workspace."""
+    workspace_id: str
+    total_documents: int
+    indexed_documents: int
+    total_chunks: int
+    embedded_chunks: int
+    embedding_percentage: float
+    model_info: Dict[str, Any]
 
-_embedding_service: "EmbeddingService | None" = None
 
-
-def get_embedding_service(provider: str = None) -> EmbeddingService:
-    """Get or create the global EmbeddingService singleton.
-
+@router.post("/generate/document/{document_id}", response_model=EmbeddingBatchResponse)
+async def generate_document_embeddings(
+    document_id: str,
+    batch_request: Optional[EmbeddingBatchRequest] = None,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+    background_tasks: BackgroundTasks = None
+):
+    """Generate embeddings for all chunks of a document.
+    
+    This endpoint:
+    - Retrieves all pending chunks for the document
+    - Generates embeddings using configured provider (OpenAI/Cohere/BGE)
+    - Batches embeddings for efficiency (50-100 chunks per batch)
+    - Stores embeddings in vector DB (Qdrant) with metadata payload
+    - Tracks model version and reproducibility info
+    
     Args:
-        provider: Override the EMBEDDING_PROVIDER env-var.
-
+        document_id: ID of document to embed
+        batch_request: Optional batch configuration
+        db: Database session
+        current_user: Current authenticated user
+        background_tasks: Background task executor
+        
     Returns:
-        EmbeddingService instance.
+        EmbeddingBatchResponse with generation results
     """
-    global _embedding_service
+    try:
+        # Convert string ID to UUID
+        try:
+            doc_uuid = uuid.UUID(document_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid document ID format"
+            )
+        
+        # Get document
+        document = db.query(Document).filter(
+            Document.id == doc_uuid
+        ).first()
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+        
+        # Check user has access to workspace
+        workspace = db.query(Workspace).filter(
+            Workspace.id == document.workspace_id
+        ).first()
+        
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workspace not found"
+            )
+        
+        # Verify workspace membership
+        from sqlalchemy import and_
+        from app.database.models import WorkspaceMember
+        
+        member = db.query(WorkspaceMember).filter(
+            and_(
+                WorkspaceMember.workspace_id == workspace.id,
+                WorkspaceMember.user_id == current_user.id
+            )
+        ).first()
+        
+        if not member and workspace.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No access to this workspace"
+            )
+        
+        # Update document status to PROCESSING
+        document.status = DocumentStatus.PROCESSING
+        db.commit()
+        
+        # Initialize embedding processor
+        embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+        vector_db = get_vector_db_client(embedding_dim=embedder.dimension)
+        
+        batch_size = batch_request.batch_size if batch_request else settings.EMBEDDING_BATCH_SIZE
+        processor = BatchEmbeddingProcessor(
+            db=db,
+            embedding_provider=embedder._provider,
+            vector_db=vector_db,
+            batch_size=batch_size
+        )
+        
+        # Run embedding generation (can be async in background)
+        if background_tasks:
+            background_tasks.add_task(
+                processor.process_document_chunks,
+                document.id,
+                workspace.id
+            )
+            
+            return EmbeddingBatchResponse(
+                success=True,
+                total_chunks=0,  # Unknown yet
+                processed_chunks=0,
+                failed_chunks=0,
+                vector_ids=[],
+                duration_ms=0,
+                errors=["Processing started in background"]
+            )
+        else:
+            # Synchronous processing
+            import asyncio
+            result = asyncio.run(
+                processor.process_document_chunks(
+                    document.id,
+                    workspace.id
+                )
+            )
+            
+            return EmbeddingBatchResponse(
+                success=result["success"],
+                total_chunks=result["total_chunks"],
+                processed_chunks=result["processed_chunks"],
+                failed_chunks=result["failed_chunks"],
+                vector_ids=result["vector_ids"],
+                duration_ms=result["duration_ms"],
+                errors=result["errors"]
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating embeddings: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate embeddings: {str(e)}"
+        )
 
-    if _embedding_service is None:
-        provider = provider or os.getenv("EMBEDDING_PROVIDER", "ollama")
-        _embedding_service = EmbeddingService(provider)
 
-    return _embedding_service
+@router.post("/generate/workspace/{workspace_id}/batch")
+async def batch_generate_workspace_embeddings(
+    workspace_id: str,
+    limit: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user),
+    background_tasks: BackgroundTasks = None
+):
+    """Generate embeddings for all pending documents in a workspace.
+    
+    This bulk operation:
+    - Finds all documents with status=PROCESSING
+    - Processes each document in sequence
+    - Batches chunks efficiently
+    - Tracks overall progress and errors
+    
+    Args:
+        workspace_id: ID of workspace
+        limit: Max documents to process
+        db: Database session
+        current_user: Current user
+        background_tasks: Background executor
+        
+    Returns:
+        Job status with total processing info
+    """
+    try:
+        workspace_uuid = uuid.UUID(workspace_id)
+        
+        # Verify access
+        workspace = db.query(Workspace).filter(
+            Workspace.id == workspace_uuid
+        ).first()
+        
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workspace not found"
+            )
+        
+        # Check authorization
+        from app.database.models import WorkspaceMember
+        from sqlalchemy import and_
+        
+        member = db.query(WorkspaceMember).filter(
+            and_(
+                WorkspaceMember.workspace_id == workspace.id,
+                WorkspaceMember.user_id == current_user.id
+            )
+        ).first()
+        
+        if not member and workspace.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No access to this workspace"
+            )
+        
+        # Initialize processor
+        embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+        vector_db = get_vector_db_client(embedding_dim=embedder.dimension)
+        processor = BatchEmbeddingProcessor(
+            db=db,
+            embedding_provider=embedder._provider,
+            vector_db=vector_db,
+            batch_size=settings.EMBEDDING_BATCH_SIZE
+        )
+        
+        if background_tasks:
+            background_tasks.add_task(
+                processor.process_pending_chunks,
+                workspace.id,
+                limit
+            )
+            
+            return {
+                "status": "processing",
+                "message": "Batch embedding generation started in background"
+            }
+        else:
+            import asyncio
+            result = asyncio.run(
+                processor.process_pending_chunks(workspace.id, limit)
+            )
+            return result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in batch embedding: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.get("/status/document/{document_id}", response_model=EmbeddingStatusResponse)
+async def get_document_embedding_status(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user)
+):
+    """Get embedding status for a specific document.
+    
+    Shows:
+    - Total chunks
+    - Embedded chunks count
+    - Embedding percentage
+    - Model used and dimension
+    
+    Args:
+        document_id: Document ID
+        db: Database session
+        current_user: Current user
+        
+    Returns:
+        EmbeddingStatusResponse with embedding info
+    """
+    try:
+        doc_uuid = uuid.UUID(document_id)
+        
+        # Get document
+        document = db.query(Document).filter(
+            Document.id == doc_uuid
+        ).first()
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found"
+            )
+        
+        # Verify access
+        workspace = db.query(Workspace).filter(
+            Workspace.id == document.workspace_id
+        ).first()
+        
+        if not workspace:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        
+        from app.database.models import WorkspaceMember
+        from sqlalchemy import and_
+        
+        member = db.query(WorkspaceMember).filter(
+            and_(
+                WorkspaceMember.workspace_id == workspace.id,
+                WorkspaceMember.user_id == current_user.id
+            )
+        ).first()
+        
+        if not member and workspace.owner_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+        
+        # Get chunk and embedding counts
+        chunks = db.query(Chunk).filter(
+            Chunk.document_id == doc_uuid
+        ).all()
+        
+        total_chunks = len(chunks)
+        
+        embedded_chunks = 0
+        model_info = {"model_name": "unknown", "dimension": 1536}
+        
+        if chunks:
+            embeddings = db.query(Embedding).filter(
+                Embedding.chunk_id.in_([c.id for c in chunks])
+            ).all()
+            
+            embedded_chunks = len(embeddings)
+            
+            if embeddings:
+                first_embedding = embeddings[0]
+                model_info = {
+                    "model_name": first_embedding.model_used,
+                    "dimension": first_embedding.embedding_dimension
+                }
+        
+        percentage = (embedded_chunks / total_chunks * 100) if total_chunks > 0 else 0
+        
+        return EmbeddingStatusResponse(
+            document_id=str(document.id),
+            title=document.title,
+            total_chunks=total_chunks,
+            embedded_chunks=embedded_chunks,
+            embedding_percentage=percentage,
+            model_used=model_info["model_name"],
+            model_dimension=model_info["dimension"],
+            created_at=document.created_at.isoformat()
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting embedding status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.get("/stats/workspace/{workspace_id}", response_model=WorkspaceEmbeddingStats)
+async def get_workspace_embedding_stats(
+    workspace_id: str,
+    db: Session = Depends(get_db),
+    current_user: DBUser = Depends(get_current_user)
+):
+    """Get workspace-wide embedding statistics.
+    
+    Shows:
+    - Total documents and indexed documents
+    - Total chunks and embedded chunks
+    - Overall embedding percentage
+    - Model information used
+    
+    Args:
+        workspace_id: Workspace ID
+        db: Database session
+        current_user: Current user
+        
+    Returns:
+        WorkspaceEmbeddingStats with aggregate stats
+    """
+    try:
+        ws_uuid = uuid.UUID(workspace_id)
+        
+        # Verify access
+        workspace = db.query(Workspace).filter(
+            Workspace.id == ws_uuid
+        ).first()
+        
+        if not workspace:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        
+        from app.database.models import WorkspaceMember
+        from sqlalchemy import and_
+        
+        member = db.query(WorkspaceMember).filter(
+            and_(
+                WorkspaceMember.workspace_id == workspace.id,
+                WorkspaceMember.user_id == current_user.id
+            )
+        ).first()
+        
+        if not member and workspace.owner_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+        
+        # Get document stats
+        documents = db.query(Document).filter(
+            Document.workspace_id == ws_uuid
+        ).all()
+        
+        total_documents = len(documents)
+        indexed_documents = len([d for d in documents if d.status == DocumentStatus.INDEXED])
+        
+        # Get chunk and embedding stats
+        all_chunks = db.query(Chunk).filter(
+            Chunk.document_id.in_([d.id for d in documents])
+        ).all()
+        
+        total_chunks = len(all_chunks)
+        
+        embedded_chunks = 0
+        model_info = embedder.model_info if settings.EMBEDDING_PROVIDER else {}
+        
+        if all_chunks:
+            embeddings = db.query(Embedding).filter(
+                Embedding.chunk_id.in_([c.id for c in all_chunks])
+            ).all()
+            embedded_chunks = len(embeddings)
+            
+            if embeddings:
+                first_embedding = embeddings[0]
+                model_info = {
+                    "model_name": first_embedding.model_used,
+                    "dimension": first_embedding.embedding_dimension,
+                    "provider": "configured"
+                }
+        
+        embedding_percentage = (embedded_chunks / total_chunks * 100) if total_chunks > 0 else 0
+        
+        return WorkspaceEmbeddingStats(
+            workspace_id=str(workspace.id),
+            total_documents=total_documents,
+            indexed_documents=indexed_documents,
+            total_chunks=total_chunks,
+            embedded_chunks=embedded_chunks,
+            embedding_percentage=embedding_percentage,
+            model_info=model_info
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting embedding stats: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
