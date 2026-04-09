@@ -1,8 +1,10 @@
 """Embedding service for generating and managing embeddings."""
 import os
-import requests
-from typing import List
 import logging
+from threading import RLock
+from typing import List, Optional
+
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,8 @@ except ImportError:
 OLLAMA_MODEL = "nomic-embed-text"
 OLLAMA_DIMENSION = 768
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_EMBED_BATCH_SIZE = int(os.getenv("OLLAMA_EMBED_BATCH_SIZE", "48"))
+OLLAMA_EMBED_TIMEOUT = int(os.getenv("OLLAMA_EMBED_TIMEOUT", "60"))
 
 
 class EmbeddingService:
@@ -47,6 +51,9 @@ class EmbeddingService:
         self.provider = provider
         self.model = None
         self.dimension = OLLAMA_DIMENSION  # safe default
+        self._http: Optional[requests.Session] = None
+        self._cache = None
+        self._cache_lock = RLock()
 
         if provider == "openai" and HAS_OPENAI:
             self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -72,48 +79,109 @@ class EmbeddingService:
                 "provider='ollama'."
             )
 
+    def _get_cache(self):
+        """Lazily create the shared embeddings cache."""
+        if self._cache is not None:
+            return self._cache
+
+        with self._cache_lock:
+            if self._cache is None:
+                try:
+                    from app.services.hybrid_embeddings_cache import HybridEmbeddingsCache
+
+                    self._cache = HybridEmbeddingsCache(enable_l2=True)
+                except Exception as exc:
+                    logger.warning("Embeddings cache unavailable: %s", exc)
+                    self._cache = False
+        return self._cache if self._cache is not False else None
+
     # ------------------------------------------------------------------
     # STEP 2: real Ollama integration
     # ------------------------------------------------------------------
 
+    def _get_http(self) -> requests.Session:
+        """Create a reusable HTTP session for embedding calls."""
+        if self._http is None:
+            session = requests.Session()
+            session.headers.update({"Content-Type": "application/json"})
+            self._http = session
+        return self._http
+
+    def _validate_ollama_embeddings_response(
+        self,
+        data: dict,
+        expected_count: int,
+    ) -> List[List[float]]:
+        """Normalise Ollama responses across endpoint variants."""
+        embeddings = data.get("embeddings")
+        if embeddings is None and "embedding" in data:
+            embeddings = [data["embedding"]]
+        if not isinstance(embeddings, list):
+            raise RuntimeError(f"Ollama response missing embeddings payload: {data}")
+        if len(embeddings) != expected_count:
+            raise RuntimeError(
+                f"Ollama returned {len(embeddings)} embeddings for {expected_count} inputs"
+            )
+        return embeddings
+
     def embed_with_ollama(self, texts: List[str]) -> List[List[float]]:
-        """Call a local Ollama instance to generate embeddings.
+        """Call a local Ollama instance to generate embeddings in batches.
 
-        Args:
-            texts: Texts to embed.
-
-        Returns:
-            List of embedding vectors.
-
-        Raises:
-            RuntimeError: If the Ollama API returns a non-200 status or the
-                          response is malformed.
+        Uses /api/embed with a list input so we avoid one-request-per-text
+        overhead. Falls back to the legacy /api/embeddings endpoint only when
+        the server does not support batch embedding.
         """
+        if not texts:
+            return []
+
+        session = self._get_http()
         embeddings: List[List[float]] = []
 
-        for text in texts:
-            response = requests.post(
-                f"{OLLAMA_BASE_URL}/api/embeddings",
-                json={"model": OLLAMA_MODEL, "prompt": text},
-                timeout=30,
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Ollama embedding failed (HTTP {response.status_code}): "
-                    f"{response.text[:200]}"
+        for start in range(0, len(texts), OLLAMA_EMBED_BATCH_SIZE):
+            batch = texts[start : start + OLLAMA_EMBED_BATCH_SIZE]
+            try:
+                response = session.post(
+                    f"{OLLAMA_BASE_URL}/api/embed",
+                    json={"model": OLLAMA_MODEL, "input": batch},
+                    timeout=OLLAMA_EMBED_TIMEOUT,
+                )
+                if response.status_code == 404:
+                    raise requests.HTTPError("/api/embed unsupported", response=response)
+                response.raise_for_status()
+                embeddings.extend(
+                    self._validate_ollama_embeddings_response(
+                        response.json(),
+                        expected_count=len(batch),
+                    )
+                )
+                continue
+            except Exception as batch_err:
+                logger.warning(
+                    "Batch Ollama embedding failed for %d texts, falling back to legacy mode: %s",
+                    len(batch),
+                    batch_err,
                 )
 
-            data = response.json()
-
-            if "embedding" not in data:
-                raise RuntimeError(
-                    f"Ollama response missing 'embedding' key: {data}"
+            for text in batch:
+                response = session.post(
+                    f"{OLLAMA_BASE_URL}/api/embeddings",
+                    json={"model": OLLAMA_MODEL, "prompt": text},
+                    timeout=OLLAMA_EMBED_TIMEOUT,
                 )
-
-            embeddings.append(data["embedding"])
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Ollama embedding failed (HTTP {response.status_code}): "
+                        f"{response.text[:200]}"
+                    )
+                embeddings.extend(
+                    self._validate_ollama_embeddings_response(
+                        response.json(),
+                        expected_count=1,
+                    )
+                )
 
         return embeddings
+
 
     # ------------------------------------------------------------------
     # BONUS: safety / sanity check
@@ -125,33 +193,52 @@ class EmbeddingService:
         if not isinstance(vec, list):
             return False
 
-        if len(vec) not in EXPECTED_DIMS:
+        if len(vec) not in self.EXPECTED_DIMS:
             return False
 
         if len(set(vec)) <= 2:
             return False
 
         return True
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def embed_text(self, text: str) -> List[float]:
-        """Embed a single text.
+        """Embed a single text string.
 
         Args:
             text: Text to embed.
 
         Returns:
             Embedding vector.
+
+        Raises:
+            RuntimeError: If embedding fails.
         """
-        return self.embed_batch([text])[0]
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return []
+
+        cache = self._get_cache()
+        cache_model = self.get_model_name()
+        if cache is not None:
+            cached = cache.get(cleaned, cache_model)
+            if cached is not None:
+                return cached
+
+        result = self.embed_batch([cleaned])
+        embedding = result[0] if result else []
+        if embedding and cache is not None:
+            cache.set(cleaned, self.get_model_name(), embedding)
+        return embedding
+
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a query string with caching enabled."""
+        return self.embed_text(text)
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Embed multiple texts in batch.
+        """Embed multiple texts.
 
         Args:
-            texts: List of texts to embed.
+            texts: Texts to embed.
 
         Returns:
             List of validated embedding vectors.
@@ -199,9 +286,29 @@ class EmbeddingService:
             # Primary provider failed — attempt Ollama as emergency fallback
             # only when the primary was NOT already Ollama.
             if self.provider != "ollama":
+                # FIX: Check if Ollama has the same dimension as primary provider
+                # to prevent silent dimension mismatches during fallback
+                ollama_dimension = OLLAMA_DIMENSION
+                if ollama_dimension != self.dimension:
+                    logger.error(
+                        "Cannot fall back to Ollama: dimension mismatch. "
+                        "Primary provider '%s' uses %dD, but Ollama uses %dD. "
+                        "This would corrupt query embeddings. "
+                        "Ensure consistent EMBEDDING_PROVIDER across ingestion and query.",
+                        self.provider,
+                        self.dimension,
+                        ollama_dimension,
+                    )
+                    raise RuntimeError(
+                        f"Primary embedding provider '{self.provider}' failed and "
+                        f"fallback provider (Ollama) has incompatible dimensions "
+                        f"({self.dimension}D vs {ollama_dimension}D). "
+                        f"Cannot safely fall back. Original error: {primary_err}"
+                    ) from primary_err
+                
                 logger.warning(
                     "Primary embedding provider '%s' failed (%s). "
-                    "Falling back to Ollama.",
+                    "Falling back to Ollama (dimension-compatible).",
                     self.provider,
                     primary_err,
                 )
@@ -259,7 +366,7 @@ def get_embedding_service(provider: str = None) -> EmbeddingService:
     global _embedding_service
 
     if _embedding_service is None:
-        provider = provider or os.getenv("EMBEDDING_PROVIDER", "openai")
+        provider = provider or os.getenv("EMBEDDING_PROVIDER", "ollama")
         _embedding_service = EmbeddingService(provider)
 
     return _embedding_service

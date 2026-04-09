@@ -418,13 +418,14 @@ class VectorDBClient:
                     ]
                 )
 
-            results = self.client.search(
+            results = self.client.query_points(
                 collection_name=collection_name,
-                query_vector=query_vector,
+                query=query_vector,
                 query_filter=query_filter,
                 limit=limit,
                 score_threshold=score_threshold,
-            )
+                with_payload=True,
+            ).points
             return [
                 {
                     "id": str(r.id),

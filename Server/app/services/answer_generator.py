@@ -1,18 +1,24 @@
-"""Answer generation service with LLM integration for STEP 4."""
+from __future__ import annotations
+
+"""Answer generation service with robust fallback behavior for STEP 4.
+
+Key improvements:
+- Do not fail the whole pipeline when cross-check filtering removes all chunks.
+- Be gentler with short queries and semantic-only matches.
+- Preserve strong high-similarity chunks even when lexical/domain heuristics are weak.
+- Return a clean no-answer object only when there is truly no usable evidence.
+"""
 
 import logging
+import re
 import time
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-import openai
+import httpx
 
 from app.config import settings
-from app.services.retrieval_cross_checker import (
-    RetrievalCrossChecker,
-    RetrievalValidation
-)
+from app.services.retrieval_cross_checker import RetrievalCrossChecker, RetrievalValidation
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +26,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RetrievedChunk:
     """Retrieved chunk from STEP 3 retrieval."""
+
     chunk_id: str
     document_id: str
     similarity: float
@@ -36,6 +43,7 @@ class RetrievedChunk:
 @dataclass
 class Citation:
     """Citation reference in generated answer."""
+
     chunk_id: str
     document_id: str
     document_title: str
@@ -45,11 +53,12 @@ class Citation:
 
 
 @dataclass
-class ChunkQualityInssue:
+class ChunkQualityIssue:
     """Quality issue detected in retrieved chunk."""
+
     chunk_id: str
-    issue_type: str  # "low_similarity", "conflict", "duplication"
-    severity: str    # "low", "medium", "high"
+    issue_type: str
+    severity: str
     message: str
     affected_document: str
 
@@ -57,203 +66,169 @@ class ChunkQualityInssue:
 @dataclass
 class RetrievalCrossCheck:
     """Cross-check results for retrieved chunks."""
-    filtered_chunks: List[RetrievedChunk]  # Chunks after filtering
-    quality_issues: List[ChunkQualityInssue]
-    diversity_score: float                  # 0-1, based on unique documents
-    has_conflicts: bool                     # Any contradictions detected
-    conflict_details: List[Dict[str, Any]]  # Details of conflicts
-    high_quality_chunks: int                # Chunks above threshold
-    low_quality_chunks: int                 # Chunks below threshold
+
+    filtered_chunks: List[RetrievedChunk]
+    quality_issues: List[ChunkQualityIssue]
+    diversity_score: float
+    has_conflicts: bool
+    conflict_details: List[Dict[str, Any]]
+    high_quality_chunks: int
+    low_quality_chunks: int
+    fallback_used: bool = False
+    fallback_reason: Optional[str] = None
 
 
 @dataclass
 class GeneratedAnswer:
     """Generated answer with citations and metadata."""
+
     answer_text: str
     citations: List[Citation]
-    confidence_score: float  # 0-100% percentage
+    confidence_score: float
     model_used: str
     tokens_used: int
     generation_time_ms: float
     average_similarity: float
     unique_documents: int
     metadata: Dict[str, Any]
-    validation: Optional['RetrievalValidation'] = None  # Cross-check results
-    quality_check: Optional['RetrievalCrossCheck'] = None
-    cross_doc_agreement_score: float = 0.0  # 0-1 fraction of non-contradictory chunks
-    top_k: int = 10  # Top-K value used for retrieval
+    validation: Optional[RetrievalValidation] = None
+    quality_check: Optional[RetrievalCrossCheck] = None
+    cross_doc_agreement_score: float = 0.0
+    top_k: int = 10
 
 
 class AnswerGenerator:
-    """
-    Generates answers from retrieved chunks using LLM integration.
-    
-    Pipeline:
-    1. Accept retrieved chunks from STEP 3 (TopKRetriever)
-    2. Build prompt with context and instructions
-    3. Call LLM (OpenAI GPT-4)
-    4. Extract citations from answer
-    5. Calculate confidence score
-    6. Return structured answer
-    """
-    
+    """Generate answers from retrieved chunks using Ollama only."""
+
+    TECHNICAL_TERMS = {
+        "ai", "llm", "embedding", "embeddings", "model", "models", "semantic",
+        "search", "timeout", "latency", "retrieval", "qdrant", "ollama", "phi",
+        "token", "tokens", "sql", "python", "database", "postgres", "pgvector",
+        "api", "apis", "chunk", "chunks", "workspace", "index", "indexing",
+    }
+
     def __init__(
         self,
-        model: str = "gpt-4o-mini",
-        temperature: float = 0.3,
-        max_tokens: int = 1500,
+        model: Optional[str] = None,
+        openai_model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
         openai_api_key: Optional[str] = None,
+        ollama_base_url: Optional[str] = None,
         similarity_threshold: float = 0.5,
         min_unique_documents: int = 1,
-        detect_conflicts: bool = True
+        detect_conflicts: bool = True,
+        ollama_timeout: Optional[int] = None,
     ):
-        """
-        Initialize answer generator.
-        
-        Args:
-            model: LLM model name (e.g., "gpt-4o-mini", "gpt-4")
-            temperature: LLM temperature (0.0-1.0, lower = more deterministic)
-            max_tokens: Maximum tokens in response
-            openai_api_key: OpenAI API key (uses settings if not provided)
-            similarity_threshold: Minimum similarity score to use chunk (0-1)
-            min_unique_documents: Minimum unique documents for confidence
-            detect_conflicts: Whether to detect conflicting chunks
-        """
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.api_key = openai_api_key or settings.OPENAI_API_KEY
+        self.model = model or settings.OLLAMA_MODEL
+        self.openai_model = openai_model or settings.OPENAI_MODEL
+        self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
+        self.max_tokens = max_tokens or settings.LLM_MAX_TOKENS
+        self.ollama_base_url = (ollama_base_url or settings.OLLAMA_BASE_URL).rstrip("/")
         self.similarity_threshold = similarity_threshold
         self.min_unique_documents = min_unique_documents
         self.detect_conflicts = detect_conflicts
-        
-        if not self.api_key:
-            raise ValueError("OpenAI API key not configured")
-        
-        self.client = openai.OpenAI(api_key=self.api_key)
-        
-        # Initialize cross-checker for quality validation
+        self.ollama_timeout = ollama_timeout or settings.OLLAMA_TIMEOUT
+        self.max_context_chunks = min(4, max(2, getattr(settings, "RAG_MAX_CONTEXT_CHUNKS", 4)))
+        self.max_chunk_chars = max(600, getattr(settings, "RAG_MAX_CHUNK_CHARS", 1200))
+        self.min_answer_confidence = float(getattr(settings, "RAG_MIN_ANSWER_CONFIDENCE", 45.0))
+
         self.cross_checker = RetrievalCrossChecker(
             similarity_threshold=similarity_threshold,
             min_diversity_documents=min_unique_documents,
-            conflict_detection_enabled=detect_conflicts
+            conflict_detection_enabled=detect_conflicts,
         )
-    
-    def generate(
+
+        logger.info(
+            "AnswerGenerator initialized: model=%s url=%s timeout=%ss threshold=%.2f",
+            self.model,
+            self.ollama_base_url,
+            self.ollama_timeout,
+            self.similarity_threshold,
+        )
+
+    async def generate(
         self,
         query: str,
         chunks: List[RetrievedChunk],
         include_citations: bool = True,
         citation_style: str = "inline",
-        top_k: int = 10
+        top_k: int = 10,
     ) -> GeneratedAnswer:
-        """
-        Generate answer from query and retrieved chunks.
-        
-        STEP 5 Confidence Scoring Formula:
-        confidence = (
-            average_similarity * 0.6 +           # mean cosine similarity
-            min(1.0, source_count / K) * 0.3 +   # unique docs normalized by top-k
-            cross_doc_agreement_score * 0.1      # fraction of non-contradictory chunks
-        )
-        Result is scaled to 0-100%.
-        
-        Includes cross-checking:
-        - Filters chunks by similarity threshold
-        - Analyzes diversity (unique documents)
-        - Detects conflicting information
-        - Adjusts confidence based on quality checks
-        
-        Args:
-            query: User query
-            chunks: Retrieved chunks from STEP 3
-            include_citations: Whether to include citations
-            citation_style: "inline" or "footnote"
-            top_k: Top-K value used for retrieval (default 10)
-            
-        Returns:
-            GeneratedAnswer with answer text, citations, and metadata
-            
-        Raises:
-            ValueError: If no chunks provided
-            openai.APIError: If LLM call fails
-        """
+        """Generate answer from query and retrieved chunks."""
         if not chunks:
-            raise ValueError("No chunks provided for answer generation")
-        
+            return self._build_no_answer(
+                reason="no_chunks_provided",
+                query=query,
+                generation_time_ms=0.0,
+                quality_check=None,
+            )
+
         start_time = time.time()
-        
-        # STEP 1: Cross-check retrieved chunks
-        quality_check = self._perform_cross_check(chunks)
-        
-        # Use filtered chunks for answer generation
-        filtered_chunks = quality_check.filtered_chunks
-        
+
+        quality_check = self._perform_cross_check(query, chunks)
+        filtered_chunks = list(quality_check.filtered_chunks)
+
         if not filtered_chunks:
-            logger.warning(f"All chunks filtered out for query '{query[:50]}...' due to low similarity")
-            raise ValueError(f"No chunks passed quality threshold ({self.similarity_threshold})")
-        
-        # Build context from filtered chunks
+            logger.warning("All chunks filtered out, applying fallback strategy")
+            fallback_chunks = self._fallback_chunks(query, chunks)
+            if fallback_chunks:
+                filtered_chunks = fallback_chunks
+                quality_check.filtered_chunks = fallback_chunks
+                quality_check.high_quality_chunks = len(fallback_chunks)
+                quality_check.low_quality_chunks = max(0, len(chunks) - len(fallback_chunks))
+                quality_check.fallback_used = True
+                quality_check.fallback_reason = "cross_check_filtered_everything"
+            else:
+                generation_time_ms = (time.time() - start_time) * 1000
+                return self._build_no_answer(
+                    reason="all_chunks_filtered_out",
+                    query=query,
+                    generation_time_ms=generation_time_ms,
+                    quality_check=quality_check,
+                )
+
+        filtered_chunks = self._trim_chunks_for_context(filtered_chunks)
+
+        if not filtered_chunks:
+            generation_time_ms = (time.time() - start_time) * 1000
+            return self._build_no_answer(
+                reason="no_chunks_after_context_trim",
+                query=query,
+                generation_time_ms=generation_time_ms,
+                quality_check=quality_check,
+            )
+
         context = self._build_context(filtered_chunks, include_citations)
-        
-        # Build prompts
         system_prompt = self._build_system_prompt(citation_style)
         user_prompt = self._build_user_prompt(query, context, filtered_chunks)
-        
-        # Call LLM
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens
-            )
-            
-            answer_text = response.choices[0].message.content
-            tokens_used = response.usage.total_tokens
-            
-            logger.info(f"Generated answer for query '{query[:50]}...' ({tokens_used} tokens)")
-            
-        except openai.APIError as e:
-            logger.error(f"LLM API error: {str(e)}")
-            raise
-        
-        # Extract citations
+
+        answer_text, tokens_used, model_used = await self._call_llm(system_prompt, user_prompt)
+
         citations = self._extract_citations(filtered_chunks, answer_text) if include_citations else []
-        
-        # Calculate cross-document agreement score
         cross_doc_agreement_score = self._calculate_cross_doc_agreement(filtered_chunks, quality_check)
-        
-        # Calculate STEP 5 confidence score (0-100%)
         confidence = self._calculate_confidence_step5(
             filtered_chunks,
             quality_check,
             top_k,
-            cross_doc_agreement_score
+            cross_doc_agreement_score,
         )
-        
-        # Calculate generation time
+
         generation_time_ms = (time.time() - start_time) * 1000
-        
-        # Calculate statistics
-        average_similarity = sum(c.similarity for c in filtered_chunks) / len(filtered_chunks) if filtered_chunks else 0.0
+        average_similarity = sum(c.similarity for c in filtered_chunks) / len(filtered_chunks)
         unique_documents = len(set(c.document_id for c in filtered_chunks))
-        
-        # Build metadata
+
         metadata = {
             "query_length": len(query),
             "chunks_used": len(filtered_chunks),
-            "chunks_filtered": len(chunks) - len(filtered_chunks),
+            "chunks_filtered": max(0, len(chunks) - len(filtered_chunks)),
             "unique_documents": unique_documents,
             "average_similarity": round(average_similarity, 3),
-            "max_similarity": max(c.similarity for c in filtered_chunks) if filtered_chunks else 0.0,
-            "min_similarity": min(c.similarity for c in filtered_chunks) if filtered_chunks else 0.0,
+            "max_similarity": max(c.similarity for c in filtered_chunks),
+            "min_similarity": min(c.similarity for c in filtered_chunks),
             "response_length": len(answer_text),
             "citations_count": len(citations),
-            "model": self.model,
+            "model": model_used,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "quality_issues_found": len(quality_check.quality_issues),
@@ -262,90 +237,151 @@ class AnswerGenerator:
             "high_quality_chunks": quality_check.high_quality_chunks,
             "low_quality_chunks": quality_check.low_quality_chunks,
             "cross_doc_agreement_score": round(cross_doc_agreement_score, 3),
-            "top_k_used": top_k
+            "top_k_used": top_k,
+            "fallback_used": quality_check.fallback_used,
+            "fallback_reason": quality_check.fallback_reason,
         }
-        
+
         return GeneratedAnswer(
             answer_text=answer_text,
             citations=citations,
             confidence_score=confidence,
-            model_used=self.model,
+            model_used=model_used,
             tokens_used=tokens_used,
-            generation_time_ms=generation_time_ms,
+            generation_time_ms=round(generation_time_ms, 2),
             average_similarity=round(average_similarity, 3),
             unique_documents=unique_documents,
             metadata=metadata,
             quality_check=quality_check,
             cross_doc_agreement_score=round(cross_doc_agreement_score, 3),
-            top_k=top_k
+            top_k=top_k,
         )
-    
-    
-    def _perform_cross_check(self, chunks: List[RetrievedChunk]) -> RetrievalCrossCheck:
-        """
-        Perform comprehensive quality checks on retrieved chunks.
-        
-        Checks:
-        1. Similarity threshold filtering
-        2. Document diversity analysis
-        3. Conflict detection
-        4. Quality scoring
-        
-        Returns:
-            RetrievalCrossCheck with results and filtered chunks
-        """
-        quality_issues: List[ChunkQualityInssue] = []
+
+    async def _call_llm(self, system_prompt: str, user_prompt: str) -> Tuple[str, int, str]:
+        logger.info(
+            "Calling Ollama model=%s url=%s timeout=%ss",
+            self.model,
+            self.ollama_base_url,
+            self.ollama_timeout,
+        )
+        try:
+            answer_text = await self._ollama_generate(system_prompt, user_prompt)
+            return answer_text, 0, self.model
+        except Exception as exc:
+            logger.error("Ollama inference failed: %s", exc, exc_info=True)
+            raise RuntimeError(
+                f"Ollama inference failed (exclusive mode, no fallback). Error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    async def _ollama_generate(self, system_prompt: str, user_prompt: str) -> str:
+        url = f"{self.ollama_base_url}/api/chat"
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "keep_alive": "10m",
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens,
+                "num_ctx": max(2048, self.max_context_chunks * 1024),
+            },
+        }
+
+        async with httpx.AsyncClient(timeout=float(self.ollama_timeout)) as client:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+
+        data = response.json()
+        return data["message"]["content"]
+
+    def _perform_cross_check(self, query: str, chunks: List[RetrievedChunk]) -> RetrievalCrossCheck:
+        quality_issues: List[ChunkQualityIssue] = []
         filtered_chunks: List[RetrievedChunk] = []
-        
-        # STEP 1: Filter by similarity threshold
+
+        query_terms = set(self._query_terms(query))
+        is_short_query = len(query.split()) <= 2
+        technical_query = len(query_terms & self.TECHNICAL_TERMS) >= 2
+
         for chunk in chunks:
+            chunk_terms = set(self._query_terms(chunk.text)) if chunk.text else set()
+            lexical_overlap = len(query_terms & chunk_terms) / max(len(query_terms), 1) if query_terms else 0.0
+            metadata = dict(chunk.metadata or {})
+            metadata["generator_lexical_overlap"] = round(lexical_overlap, 4)
+            chunk.metadata = metadata
+
+            narrative_mismatch = (
+                technical_query
+                and self._looks_like_wrong_domain(query, [chunk])
+                and lexical_overlap < (0.10 if is_short_query else 0.15)
+            )
+
             if chunk.similarity < self.similarity_threshold:
                 quality_issues.append(
-                    ChunkQualityInssue(
+                    ChunkQualityIssue(
                         chunk_id=chunk.chunk_id,
                         issue_type="low_similarity",
                         severity="medium",
                         message=f"Chunk similarity {chunk.similarity:.3f} below threshold {self.similarity_threshold}",
-                        affected_document=chunk.document_title
+                        affected_document=chunk.document_title,
                     )
                 )
-            else:
-                filtered_chunks.append(chunk)
-        
+                continue
+
+            if (not is_short_query) and lexical_overlap < 0.05 and chunk.similarity < (self.similarity_threshold + 0.06):
+                quality_issues.append(
+                    ChunkQualityIssue(
+                        chunk_id=chunk.chunk_id,
+                        issue_type="low_lexical_support",
+                        severity="high",
+                        message="Chunk passed vector search but has almost no lexical support for the query",
+                        affected_document=chunk.document_title,
+                    )
+                )
+                continue
+
+            if narrative_mismatch and chunk.similarity < 0.70:
+                quality_issues.append(
+                    ChunkQualityIssue(
+                        chunk_id=chunk.chunk_id,
+                        issue_type="domain_mismatch",
+                        severity="high",
+                        message="Chunk looks narrative/literary while the query is technical",
+                        affected_document=chunk.document_title,
+                    )
+                )
+                continue
+
+            filtered_chunks.append(chunk)
+
+        if not filtered_chunks and chunks:
+            best = max(chunks, key=lambda c: c.similarity)
+            logger.warning("Forcing best chunk to survive filtering: %s", best.chunk_id)
+            filtered_chunks = [best]
+
         high_quality_chunks = len(filtered_chunks)
-        low_quality_chunks = len(chunks) - high_quality_chunks
-        
-        # STEP 2: Analyze diversity
+        low_quality_chunks = max(0, len(chunks) - high_quality_chunks)
         unique_doc_ids = set(c.document_id for c in filtered_chunks)
-        diversity_score = min(len(unique_doc_ids) / 3.0, 1.0)  # Max at 3 documents
-        
-        # STEP 3: Detect conflicts
+        diversity_score = min(len(unique_doc_ids) / 3.0, 1.0)
+
         conflicts: List[Dict[str, Any]] = []
         has_conflicts = False
-        
         if self.detect_conflicts and len(filtered_chunks) > 1:
             conflicts, has_conflicts = self._detect_conflicts(filtered_chunks)
-            
             if has_conflicts:
-                logger.warning(f"Detected {len(conflicts)} conflicting chunks")
                 for conflict in conflicts:
                     quality_issues.append(
-                        ChunkQualityInssue(
+                        ChunkQualityIssue(
                             chunk_id=conflict["chunk_ids"][0],
                             issue_type="conflict",
                             severity="high",
                             message=conflict["description"],
-                            affected_document=conflict["documents"]
+                            affected_document=conflict["documents"],
                         )
                     )
-        
-        logger.info(
-            f"Cross-check complete: {high_quality_chunks} high-quality, "
-            f"{low_quality_chunks} filtered, "
-            f"{len(unique_doc_ids)} unique documents, "
-            f"conflicts: {has_conflicts}"
-        )
-        
+
         return RetrievalCrossCheck(
             filtered_chunks=filtered_chunks,
             quality_issues=quality_issues,
@@ -353,94 +389,237 @@ class AnswerGenerator:
             has_conflicts=has_conflicts,
             conflict_details=conflicts,
             high_quality_chunks=high_quality_chunks,
-            low_quality_chunks=low_quality_chunks
+            low_quality_chunks=low_quality_chunks,
         )
-    
-    def _filter_by_similarity_threshold(
+
+    def _fallback_chunks(self, query: str, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        if not chunks:
+            return []
+
+        query_terms = set(self._query_terms(query))
+        is_short_query = len(query.split()) <= 2
+        scored: List[Tuple[float, RetrievedChunk]] = []
+
+        for chunk in chunks:
+            text = chunk.text or ""
+            chunk_terms = set(self._query_terms(text))
+            lexical_overlap = len(query_terms & chunk_terms) / max(len(query_terms), 1) if query_terms else 0.0
+            substring_hit = 0.0
+            lowered_query = query.strip().lower()
+            lowered_text = text.lower()
+            if lowered_query and (lowered_query in lowered_text or any(term in lowered_text for term in query_terms if len(term) >= 3)):
+                substring_hit = 0.08
+
+            score = chunk.similarity * 0.85 + lexical_overlap * 0.15 + substring_hit
+            if is_short_query:
+                score = chunk.similarity * 0.92 + lexical_overlap * 0.08 + substring_hit
+            scored.append((score, chunk))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        rescued = [chunk for score, chunk in scored[:3] if chunk.similarity >= max(0.40, self.similarity_threshold - 0.08)]
+        return rescued
+
+    def _trim_chunks_for_context(self, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        trimmed: List[RetrievedChunk] = []
+        for chunk in chunks[: self.max_context_chunks]:
+            text = (chunk.text or "").strip()
+            if len(text) > self.max_chunk_chars:
+                text = text[: self.max_chunk_chars].rstrip() + " ..."
+            trimmed.append(
+                RetrievedChunk(
+                    chunk_id=chunk.chunk_id,
+                    document_id=chunk.document_id,
+                    similarity=chunk.similarity,
+                    text=text,
+                    source_type=chunk.source_type,
+                    chunk_index=chunk.chunk_index,
+                    document_title=chunk.document_title,
+                    token_count=chunk.token_count,
+                    context_before=chunk.context_before[:250] if chunk.context_before else None,
+                    context_after=chunk.context_after[:250] if chunk.context_after else None,
+                    metadata=dict(chunk.metadata or {}),
+                )
+            )
+        return trimmed
+
+    def _build_context(self, chunks: List[RetrievedChunk], include_citations: bool) -> str:
+        context_parts: List[str] = []
+        for i, chunk in enumerate(chunks, 1):
+            doc_ref = f"[Document {i}: {chunk.document_title}]"
+            metadata_str = f" (Relevance: {chunk.similarity:.1%})" if include_citations else ""
+            chunk_text = chunk.text
+            if chunk.context_before:
+                chunk_text = f"...{chunk.context_before}\n\n{chunk_text}"
+            if chunk.context_after:
+                chunk_text = f"{chunk_text}\n\n{chunk.context_after}..."
+            context_parts.append(f"{doc_ref}{metadata_str}\n{chunk_text}\n")
+        return "\n".join(context_parts)
+
+    def _build_system_prompt(self, citation_style: str) -> str:
+        return (
+            "You are an enterprise knowledge assistant. Your role is to provide accurate, well-sourced answers using ONLY the provided documents.\n\n"
+            "Keep the answer lean. Prefer 2 to 5 sentences unless the context truly requires more.\n\n"
+            "CRITICAL RULES:\n"
+            "1. Answer ONLY using information explicitly present in the provided context\n"
+            "2. Do NOT invent page numbers, sections, or document structure\n"
+            "3. If asked about something not in the context, say: 'I cannot find this information in the provided documents'\n"
+            "4. Never speculate or use outside knowledge\n"
+            "5. Reference sources by document title only"
+        )
+
+    def _build_user_prompt(self, query: str, context: str, chunks: List[RetrievedChunk]) -> str:
+        return f"""QUESTION: {query}
+
+AVAILABLE SOURCE DOCUMENTS:
+{self._build_source_list(chunks)}
+
+CONTEXT (use ONLY this to answer):
+{context}
+
+INSTRUCTIONS:
+1. Answer ONLY using the context above
+2. Reference source document titles naturally when relevant
+3. If the context does not contain enough information, say: \"I cannot find this information in the provided documents\"
+4. Keep the answer concise and factual
+
+ANSWER:"""
+
+    def _build_source_list(self, chunks: List[RetrievedChunk]) -> str:
+        sources: List[str] = []
+        seen_docs: set[str] = set()
+        for chunk in chunks:
+            if chunk.document_id in seen_docs:
+                continue
+            seen_docs.add(chunk.document_id)
+            sources.append(f"- {chunk.document_title}")
+        return "\n".join(sources)
+
+    def _extract_citations(self, chunks: List[RetrievedChunk], answer_text: str) -> List[Citation]:
+        citations: List[Citation] = []
+        cited_docs: set[str] = set()
+
+        for chunk in chunks:
+            if chunk.document_title and chunk.document_title.lower() in answer_text.lower():
+                cited_docs.add(chunk.document_id)
+
+        for chunk in chunks:
+            if chunk.document_id in cited_docs:
+                citations.append(
+                    Citation(
+                        chunk_id=chunk.chunk_id,
+                        document_id=chunk.document_id,
+                        document_title=chunk.document_title,
+                        chunk_index=chunk.chunk_index,
+                        similarity=chunk.similarity,
+                        text_snippet=chunk.text[:200],
+                    )
+                )
+
+        if not citations:
+            for chunk in chunks[:3]:
+                citations.append(
+                    Citation(
+                        chunk_id=chunk.chunk_id,
+                        document_id=chunk.document_id,
+                        document_title=chunk.document_title,
+                        chunk_index=chunk.chunk_index,
+                        similarity=chunk.similarity,
+                        text_snippet=chunk.text[:200],
+                    )
+                )
+        return citations
+
+    def _calculate_cross_doc_agreement(
         self,
         chunks: List[RetrievedChunk],
-        threshold: Optional[float] = None
-    ) -> tuple[List[RetrievedChunk], List[RetrievedChunk]]:
-        """
-        Filter chunks by similarity threshold.
-        
-        Args:
-            chunks: Chunks to filter
-            threshold: Similarity threshold (uses self.similarity_threshold if None)
-            
-        Returns:
-            Tuple of (passing_chunks, filtered_chunks)
-        """
-        threshold = threshold or self.similarity_threshold
-        
-        passing = [c for c in chunks if c.similarity >= threshold]
-        filtered = [c for c in chunks if c.similarity < threshold]
-        
-        return passing, filtered
-    
-    def _analyze_diversity(self, chunks: List[RetrievedChunk]) -> Dict[str, Any]:
-        """
-        Analyze source diversity of chunks.
-        
-        Returns:
-            Diversity metrics
-        """
-        if not chunks:
-            return {
-                "unique_documents": 0,
-                "diversity_score": 0.0,
-                "document_distribution": {},
-                "meets_minimum": False
-            }
-        
-        unique_doc_ids = set(c.document_id for c in chunks)
-        doc_distribution = {}
-        
-        for chunk in chunks:
-            doc_id = chunk.document_id
-            if doc_id not in doc_distribution:
-                doc_distribution[doc_id] = {
-                    "title": chunk.document_title,
-                    "count": 0,
-                    "avg_similarity": 0.0,
-                    "similarities": []
-                }
-            doc_distribution[doc_id]["count"] += 1
-            doc_distribution[doc_id]["similarities"].append(chunk.similarity)
-        
-        # Calculate average similarity per document
-        for doc_id, info in doc_distribution.items():
-            info["avg_similarity"] = sum(info["similarities"]) / len(info["similarities"])
-        
-        # Diversity score (normalized to 3 documents)
-        diversity_score = min(len(unique_doc_ids) / 3.0, 1.0)
-        meets_minimum = len(unique_doc_ids) >= self.min_unique_documents
-        
-        return {
-            "unique_documents": len(unique_doc_ids),
-            "diversity_score": round(diversity_score, 3),
-            "document_distribution": doc_distribution,
-            "meets_minimum": meets_minimum
-        }
-    
-    def _detect_conflicts(
+        quality_check: Optional[RetrievalCrossCheck] = None,
+    ) -> float:
+        if not chunks or len(chunks) < 2:
+            return 1.0
+        if not quality_check or not quality_check.has_conflicts:
+            return 1.0
+
+        n = len(chunks)
+        max_possible = n * (n - 1) / 2
+        if max_possible == 0:
+            return 1.0
+        conflict_count = len(quality_check.conflict_details)
+        return max(0.0, min(1.0, 1.0 - conflict_count / max_possible))
+
+    def _calculate_confidence_step5(
         self,
-        chunks: List[RetrievedChunk]
-    ) -> tuple[List[Dict[str, Any]], bool]:
-        """
-        Detect conflicting or contradictory information in chunks.
-        
-        Simple conflict detection based on:
-        - Opposite terms (not, no vs yes)
-        - Numerical contradictions
-        - Topic/source mismatch
-        
-        Returns:
-            Tuple of (conflict_list, has_conflicts)
-        """
+        chunks: List[RetrievedChunk],
+        quality_check: Optional[RetrievalCrossCheck],
+        top_k: int = 10,
+        cross_doc_agreement_score: float = 1.0,
+    ) -> float:
+        if not chunks:
+            return 0.0
+
+        average_similarity = sum(c.similarity for c in chunks) / len(chunks)
+        unique_docs = len(set(c.document_id for c in chunks))
+        source_diversity = min(1.0, unique_docs / max(min(top_k, 5), 1))
+
+        confidence = (
+            average_similarity * 0.65
+            + source_diversity * 0.20
+            + cross_doc_agreement_score * 0.15
+        ) * 100
+
+        if quality_check and quality_check.fallback_used:
+            confidence *= 0.88
+
+        confidence = max(0.0, min(100.0, confidence))
+        return round(confidence, 1)
+
+    def _build_no_answer(
+        self,
+        reason: str,
+        query: str,
+        generation_time_ms: float,
+        quality_check: Optional[RetrievalCrossCheck],
+    ) -> GeneratedAnswer:
+        metadata = {
+            "reason": reason,
+            "query_length": len(query),
+            "chunks_used": 0,
+            "fallback_used": bool(quality_check.fallback_used) if quality_check else False,
+            "fallback_reason": quality_check.fallback_reason if quality_check else None,
+        }
+        return GeneratedAnswer(
+            answer_text="I couldn't find enough reliable information in your documents to answer this question.",
+            citations=[],
+            confidence_score=0.0,
+            model_used="none",
+            tokens_used=0,
+            generation_time_ms=round(generation_time_ms, 2),
+            average_similarity=0.0,
+            unique_documents=0,
+            metadata=metadata,
+            quality_check=quality_check,
+            cross_doc_agreement_score=0.0,
+            top_k=0,
+        )
+
+    def _query_terms(self, text: str) -> List[str]:
+        return [
+            token for token in re.findall(r"[a-zA-Z0-9_:-]+", (text or "").lower())
+            if len(token) > 2
+        ]
+
+    def _looks_like_wrong_domain(self, query: str, chunks: List[RetrievedChunk]) -> bool:
+        joined = " ".join((c.text or "") for c in chunks).lower()
+        dialogue_markers = joined.count('"') + joined.count("“") + joined.count("”")
+        prose_hits = sum(
+            1 for term in (" he ", " she ", " looked ", " walked ", " lunch ", " said ")
+            if term in f" {joined} "
+        )
+        query_terms = set(self._query_terms(query))
+        technical_query = len(query_terms & self.TECHNICAL_TERMS) >= 2
+        return technical_query and (dialogue_markers >= 2 or prose_hits >= 2)
+
+    def _detect_conflicts(self, chunks: List[RetrievedChunk]) -> Tuple[List[Dict[str, Any]], bool]:
         conflicts: List[Dict[str, Any]] = []
-        
-        # Common contradiction keywords
         contradiction_pairs = [
             ("not", "is"),
             ("cannot", "can"),
@@ -448,472 +627,65 @@ class AnswerGenerator:
             ("false", "true"),
             ("no", "yes"),
             ("disabled", "enabled"),
-            ("off", "on")
+            ("off", "on"),
         ]
-        
-        # Check each pair of chunks for contradictions
+
         for i, chunk1 in enumerate(chunks):
-            for chunk2 in chunks[i+1:]:
-                # Skip if from same document (likely complementary)
+            for chunk2 in chunks[i + 1:]:
                 if chunk1.document_id == chunk2.document_id:
                     continue
-                
-                text1_lower = chunk1.text.lower()
-                text2_lower = chunk2.text.lower()
-                
-                # Simple contradiction detection
+                text1_lower = (chunk1.text or "").lower()
+                text2_lower = (chunk2.text or "").lower()
                 for neg_term, pos_term in contradiction_pairs:
-                    has_neg_in_1 = neg_term in text1_lower
-                    has_pos_in_1 = pos_term in text1_lower
-                    has_neg_in_2 = neg_term in text2_lower
-                    has_pos_in_2 = pos_term in text2_lower
-                    
-                    # Detect patterns like "not ... is" vs "is ..."
-                    if (has_neg_in_1 and not has_neg_in_2) and \
-                       (has_pos_in_2 and not has_pos_in_1):
-                        
-                        # Extract relevant text chunks
-                        doc1_title = chunk1.document_title
-                        doc2_title = chunk2.document_title
-                        
+                    if (neg_term in text1_lower and pos_term not in text1_lower) and (
+                        pos_term in text2_lower and neg_term not in text2_lower
+                    ):
                         conflict = {
                             "chunk_ids": [chunk1.chunk_id, chunk2.chunk_id],
                             "document_ids": [chunk1.document_id, chunk2.document_id],
-                            "documents": f"{doc1_title} vs {doc2_title}",
+                            "documents": f"{chunk1.document_title} vs {chunk2.document_title}",
                             "type": "contradiction",
-                            "description": f"Potential contradiction: '{doc1_title}' contains '{neg_term}' while '{doc2_title}' contains '{pos_term}'",
+                            "description": (
+                                f"Potential contradiction: '{chunk1.document_title}' contains '{neg_term}' "
+                                f"while '{chunk2.document_title}' contains '{pos_term}'"
+                            ),
                             "severity": "high",
-                            "chunk1_snippet": chunk1.text[:100],
-                            "chunk2_snippet": chunk2.text[:100]
+                            "chunk1_snippet": (chunk1.text or "")[:100],
+                            "chunk2_snippet": (chunk2.text or "")[:100],
                         }
-                        
-                        # Avoid duplicates
                         if conflict not in conflicts:
                             conflicts.append(conflict)
-        
-        has_conflicts = len(conflicts) > 0
-        
-        if has_conflicts:
-            logger.warning(f"Detected {len(conflicts)} potential conflicts in retrieved chunks")
-        
-        return conflicts, has_conflicts
-    
-
-    def _build_context(
-        self,
-        chunks: List[RetrievedChunk],
-        include_citations: bool
-    ) -> str:
-        """Build context string from chunks."""
-        context_parts = []
-        
-        for i, chunk in enumerate(chunks, 1):
-            # Build document reference
-            doc_ref = f"[Document {i}: {chunk.document_title}]"
-            
-            # Add metadata if requested
-            if include_citations:
-                metadata_str = f" (Relevance: {chunk.similarity:.1%})"
-            else:
-                metadata_str = ""
-            
-            # Add chunk text with optional context
-            chunk_text = chunk.text
-            if chunk.context_before and len(chunk.context_before) > 0:
-                chunk_text = f"...{chunk.context_before}\n\n{chunk_text}"
-            if chunk.context_after and len(chunk.context_after) > 0:
-                chunk_text = f"{chunk_text}\n\n{chunk.context_after}..."
-            
-            # Combine
-            context_parts.append(
-                f"{doc_ref}{metadata_str}\n{chunk_text}\n"
-            )
-        
-        return "\n".join(context_parts)
-    
-    def _build_system_prompt(self, citation_style: str) -> str:
-        """
-        Build system prompt for LLM (STEP 6).
-        
-        Enterprise knowledge assistant prompt that emphasizes source attribution
-        and accurate knowledge transfer from provided documents.
-        """
-        return """You are an enterprise knowledge assistant. Your role is to provide accurate, well-sourced answers to questions using provided documents.
-
-CORE PRINCIPLES:
-1. Use ONLY information from provided source materials
-2. Provide source attribution for every claim
-3. If information is insufficient, explicitly state limitations
-4. Maintain accuracy and avoid speculation
-5. Present information clearly and concisely
-6. Highlight multiple sources when available
-
-RESPONSE FORMAT:
-- Start with a direct answer to the question
-- Include source references throughout (e.g., "DocA section 3.2", "Meeting transcript 12/01")
-- For complex topics, organize by source to show multiple perspectives
-- End with a summary of key sources
-
-CITATION EXAMPLES:
-✓ "According to the API documentation (section 3.2), rate limits are enforced per API key."
-✓ "The meeting transcript from 12/01 indicates the team completed Phase 2."
-✓ "Multiple sources agree on this point: Design doc (p.5) and meeting notes (12/01)."
-
-SOURCE FORMAT: Use document titles and sections/line numbers when available."""
-    
-    def _build_user_prompt(
-        self,
-        query: str,
-        context: str,
-        chunks: List[RetrievedChunk]
-    ) -> str:
-        """
-        Build user prompt for LLM (STEP 6).
-        
-        Includes:
-        - Source list with document_id + chunk_index + context info
-        - User query
-        - Retrieved context
-        - Instructions for source attribution
-        """
-        # Build source list with metadata
-        source_list = self._build_source_list(chunks)
-        
-        return f"""You are answering the following question based on the source materials listed below.
-
-QUESTION: {query}
-
-SOURCE MATERIALS:
-{source_list}
-
-RETRIEVED CONTEXT:
-{context}
-
-INSTRUCTIONS:
-1. Use the source materials above to construct your answer
-2. Reference sources by title and section information (e.g., "DocA (section 3.2)", "Meeting transcript 12/01")
-3. If the answer spans multiple sources, attribute each claim
-4. If the sources don't contain sufficient information, state this clearly
-5. Organize your answer logically, grouping related information
-
-ANSWER:"""
-    
-    def _build_source_list(self, chunks: List[RetrievedChunk]) -> str:
-        """
-        Build formatted source list for user prompt (STEP 6).
-        
-        Format:
-        - DocA (section 3.2) [chunk_index: 5]
-        - DocB (line 44) [chunk_index: 12]
-        - Meeting transcript 12/01 [chunk_index: 3]
-        
-        Returns:
-            Formatted source list string
-        """
-        sources = []
-        seen_docs = set()
-        
-        for chunk in chunks:
-            doc_key = f"{chunk.document_id}_{chunk.chunk_index}"
-            if doc_key in seen_docs:
-                continue
-            seen_docs.add(doc_key)
-            
-            # Get source type indicator
-            section_info = ""
-            if chunk.source_type == "slack":
-                section_info = f"(message, {chunk.chunk_index})"
-            elif chunk.source_type == "email":
-                section_info = f"(email, line {chunk.chunk_index * 10})"
-            elif chunk.source_type == "github":
-                section_info = f"(code, line {chunk.chunk_index * 50})"
-            else:
-                # Default: assume section numbering
-                section_num = chunk.chunk_index // 2 + 1
-                line_num = chunk.chunk_index * 10 + 5
-                section_info = f"(section {section_num}, line {line_num})"
-            
-            source_entry = f"- {chunk.document_title} {section_info} [document_id: {chunk.document_id}, chunk_index: {chunk.chunk_index}]"
-            sources.append(source_entry)
-        
-        return "\n".join(sources)
-
-    
-    def _extract_citations(
-        self,
-        chunks: List[RetrievedChunk],
-        answer_text: str
-    ) -> List[Citation]:
-        """Extract citations from answer text and retrieved chunks.
-        
-        Creates citations for chunks that are referenced in the answer
-        based on document titles and indices.
-        """
-        citations = []
-        
-        # Build citation mapping
-        cited_docs = set()
-        for chunk in chunks:
-            # Check if document title appears in answer (simple heuristic)
-            if chunk.document_title.lower() in answer_text.lower():
-                cited_docs.add(chunk.document_id)
-        
-        # Create citations
-        for chunk in chunks:
-            if chunk.document_id in cited_docs:
-                citation = Citation(
-                    chunk_id=chunk.chunk_id,
-                    document_id=chunk.document_id,
-                    document_title=chunk.document_title,
-                    chunk_index=chunk.chunk_index,
-                    similarity=chunk.similarity,
-                    text_snippet=chunk.text[:200]
-                )
-                citations.append(citation)
-        
-        # If no citations found by heuristic, include top chunks
-        if not citations and chunks:
-            for chunk in chunks[:3]:  # Top 3 chunks
-                citation = Citation(
-                    chunk_id=chunk.chunk_id,
-                    document_id=chunk.document_id,
-                    document_title=chunk.document_title,
-                    chunk_index=chunk.chunk_index,
-                    similarity=chunk.similarity,
-                    text_snippet=chunk.text[:200]
-                )
-                citations.append(citation)
-        
-        return citations
-    
-    def _calculate_cross_doc_agreement(
-        self,
-        chunks: List[RetrievedChunk],
-        quality_check: Optional[RetrievalCrossCheck] = None
-    ) -> float:
-        """
-        Calculate cross-document agreement score.
-        
-        This is the fraction of chunks that do NOT contradict each other.
-        
-        Formula:
-            If no conflicts: score = 1.0
-            If conflicts: score = 1.0 - (conflict_count / max_possible_conflicts)
-        
-        where max_possible_conflicts = N * (N-1) / 2 for N chunks
-        
-        Args:
-            chunks: Chunks to analyze
-            quality_check: Quality check results with conflicts
-            
-        Returns:
-            Agreement score 0-1
-        """
-        if not chunks or len(chunks) < 2:
-            return 1.0  # Single chunk = perfect agreement
-        
-        if not quality_check or not quality_check.has_conflicts:
-            return 1.0  # No conflicts = perfect agreement
-        
-        # Calculate maximum possible conflicts (all pairs)
-        n = len(chunks)
-        max_possible_conflicts = n * (n - 1) / 2
-        
-        # Get actual conflict count
-        conflict_count = len(quality_check.conflict_details)
-        
-        # Calculate agreement score
-        if max_possible_conflicts == 0:
-            return 1.0
-        
-        agreement_score = 1.0 - (conflict_count / max_possible_conflicts)
-        
-        # Ensure within valid range
-        agreement_score = max(0.0, min(1.0, agreement_score))
-        
-        logger.debug(
-            f"Cross-doc agreement: {len(chunks)} chunks, {conflict_count} conflicts, "
-            f"score: {round(agreement_score, 3)}"
-        )
-        
-        return agreement_score
-    
-    def _calculate_confidence_step5(
-        self,
-        chunks: List[RetrievedChunk],
-        quality_check: Optional[RetrievalCrossCheck],
-        top_k: int = 10,
-        cross_doc_agreement_score: float = 1.0
-    ) -> float:
-        """
-        Calculate confidence score using STEP 5 formula (0-100%).
-        
-        Formula:
-            confidence = (
-                average_similarity * 0.6 +           # mean cosine similarity (60%)
-                min(1.0, source_count / K) * 0.3 +   # unique docs normalized by K (30%)
-                cross_doc_agreement_score * 0.1      # fraction of non-contradictory chunks (10%)
-            )
-        
-        Result is scaled to 0-100%.
-        
-        Args:
-            chunks: Filtered chunks used for answer (after similarity threshold filter)
-            quality_check: Quality check results
-            top_k: Top-K value used for retrieval (e.g., 10, 20)
-            cross_doc_agreement_score: Agreement score 0-1
-            
-        Returns:
-            Confidence percentage 0-100
-        """
-        if not chunks:
-            return 0.0
-        
-        # Factor 1: Average similarity (60% weight)
-        similarities = [c.similarity for c in chunks]
-        average_similarity = sum(similarities) / len(similarities)
-        
-        # Factor 2: Source count normalized by K (30% weight)
-        unique_docs = len(set(c.document_id for c in chunks))
-        source_diversity = min(1.0, unique_docs / top_k)
-        
-        # Factor 3: Cross-document agreement (10% weight)
-        # cross_doc_agreement_score already 0-1
-        
-        # Calculate confidence (0-1 scale)
-        confidence_0_to_1 = (
-            average_similarity * 0.6 +
-            source_diversity * 0.3 +
-            cross_doc_agreement_score * 0.1
-        )
-        
-        # Scale to 0-100
-        confidence_percentage = confidence_0_to_1 * 100
-        
-        # Ensure within valid range
-        confidence_percentage = max(0.0, min(100.0, confidence_percentage))
-        
-        logger.info(
-            f"STEP 5 Confidence: {round(confidence_percentage, 1)}% "
-            f"(avg_sim={round(average_similarity, 3)}, "
-            f"source_div={round(source_diversity, 3)}, "
-            f"agreement={round(cross_doc_agreement_score, 3)})"
-        )
-        
-        return round(confidence_percentage, 1)
-    
-
-        """
-        Calculate confidence score (0-1) for generated answer.
-        
-        Base Factors (100%):
-        - Average similarity score (50% weight)
-        - Number of unique documents (25% weight)
-        - Maximum similarity (25% weight)
-        
-        Adjustments:
-        - Conflict penalty (-30% if conflicts detected)
-        - Low diversity penalty (-10% if single source)
-        - Low quality chunk penalty (-5% per filtered chunk, max -20%)
-        
-        Args:
-            chunks: Chunks used for answer (after filtering)
-            quality_check: Quality check results (optional)
-            
-        Returns:
-            Confidence score 0-1
-        """
-        if not chunks:
-            return 0.0
-        
-        similarities = [c.similarity for c in chunks]
-        unique_docs = len(set(c.document_id for c in chunks))
-        
-        # Base confidence (original formula)
-        avg_similarity = sum(similarities) / len(similarities)
-        doc_diversity = min(unique_docs / 3.0, 1.0)
-        max_similarity = max(similarities)
-        
-        confidence = (
-            avg_similarity * 0.5 +
-            doc_diversity * 0.25 +
-            max_similarity * 0.25
-        )
-        
-        # Adjustments based on quality checks
-        if quality_check:
-            # ADJUSTMENT 1: Conflict penalty
-            if quality_check.has_conflicts:
-                conflict_penalty = 0.30 * len(quality_check.conflict_details)
-                confidence -= min(conflict_penalty, 0.30)  # Max -30% penalty
-                logger.warning(
-                    f"Reducing confidence by {round(min(conflict_penalty, 0.30), 3)} "
-                    f"due to {len(quality_check.conflict_details)} conflicts"
-                )
-            
-            # ADJUSTMENT 2: Diversity penalty
-            if quality_check.diversity_score < 0.5:
-                diversity_penalty = 0.10 * (1 - quality_check.diversity_score)
-                confidence -= diversity_penalty
-                logger.warning(
-                    f"Reducing confidence by {round(diversity_penalty, 3)} "
-                    f"due to low diversity (single source)"
-                )
-            
-            # ADJUSTMENT 3: Low quality chunks penalty
-            if quality_check.low_quality_chunks > 0:
-                # Penalize per filtered chunk, max 20%
-                filtered_penalty = min(quality_check.low_quality_chunks * 0.05, 0.20)
-                confidence -= filtered_penalty
-                logger.info(
-                    f"Reducing confidence by {round(filtered_penalty, 3)} "
-                    f"due to {quality_check.low_quality_chunks} filtered chunks"
-                )
-        
-        # Ensure result is in valid range
-        confidence = max(0.0, min(1.0, confidence))
-        
-        return round(confidence, 3)
+        return conflicts, bool(conflicts)
 
 
-# Singleton instance
 _generator: Optional[AnswerGenerator] = None
 
 
 def get_answer_generator(
-    model: str = "gpt-4o-mini",
+    model: Optional[str] = None,
+    openai_model: Optional[str] = None,
     openai_api_key: Optional[str] = None,
+    ollama_base_url: Optional[str] = None,
     similarity_threshold: float = 0.5,
     min_unique_documents: int = 1,
-    detect_conflicts: bool = True
+    detect_conflicts: bool = True,
+    ollama_timeout: Optional[int] = None,
 ) -> AnswerGenerator:
-    """Get or create answer generator instance.
-    
-    Args:
-        model: LLM model name
-        openai_api_key: OpenAI API key
-        similarity_threshold: Minimum similarity for chunks
-        min_unique_documents: Minimum unique documents required
-        detect_conflicts: Whether to detect conflicting chunks
-        
-    Returns:
-        AnswerGenerator instance
-    """
     global _generator
-    
     if _generator is None:
         _generator = AnswerGenerator(
             model=model,
+            openai_model=openai_model,
             openai_api_key=openai_api_key,
+            ollama_base_url=ollama_base_url,
             similarity_threshold=similarity_threshold,
             min_unique_documents=min_unique_documents,
-            detect_conflicts=detect_conflicts
+            detect_conflicts=detect_conflicts,
+            ollama_timeout=ollama_timeout,
         )
-    
     return _generator
 
 
-def reset_answer_generator():
-    """Reset singleton generator (for testing)."""
+def reset_answer_generator() -> None:
     global _generator
     _generator = None

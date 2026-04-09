@@ -12,6 +12,8 @@ import httpx
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+_OLLAMA_MAX_CONCURRENT_REQUESTS = max(1, int(getattr(settings, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2))
+_OLLAMA_ASYNC_SEMAPHORE = asyncio.Semaphore(_OLLAMA_MAX_CONCURRENT_REQUESTS)
 
 
 # ============================================================================
@@ -302,11 +304,12 @@ class LLMService:
         """Run blocking Ollama call in a thread executor."""
         if not self.ollama_client.is_available():
             raise RuntimeError("Ollama not available")
-        loop = asyncio.get_event_loop()
-        text, tokens = await loop.run_in_executor(
-            None,
-            lambda: self.ollama_client.chat(messages, temperature=temperature, num_predict=max_tokens),
-        )
+        async with _OLLAMA_ASYNC_SEMAPHORE:
+            loop = asyncio.get_running_loop()
+            text, tokens = await loop.run_in_executor(
+                None,
+                lambda: self.ollama_client.chat(messages, temperature=temperature, num_predict=max_tokens),
+            )
         return LLMResponse(answer=text, tokens_used=tokens, model=self.ollama_client.model, provider=LLMProvider.OLLAMA)
 
     async def _async_openai(self, messages: List[dict], temperature: float, max_tokens: int) -> LLMResponse:
@@ -338,9 +341,9 @@ class LLMService:
     # Provider chain (generic, works for sync and async callables)
     # ------------------------------------------------------------------
 
-    def _provider_order(self) -> List[str]:
+    def _provider_order(self, primary_override: Optional[str] = None) -> List[str]:
         """Return [primary, fallback] provider names."""
-        primary = self.primary_provider
+        primary = primary_override or self.primary_provider
         fallback = "openai" if primary == "ollama" else "ollama"
         return [primary] if not self.use_fallback else [primary, fallback]
 
@@ -363,26 +366,14 @@ class LLMService:
         """
         Generate an answer synchronously.
         Tries providers in configured order; raises RuntimeError if all fail.
-        
-        Args:
-            query: The query string
-            context_chunks: Context chunks for generation
-            temperature: Model temperature (optional)
-            max_tokens: Max tokens in response (optional)
-            force_ollama: If True, skip directly to Ollama provider
         """
         temperature = temperature or settings.LLM_TEMPERATURE
         max_tokens = max_tokens or settings.LLM_MAX_TOKENS
         messages = _build_messages(query, context_chunks)
         last_exc: Optional[Exception] = None
+        primary_override = "ollama" if force_ollama else None
 
-        # Determine provider order: if force_ollama, prioritize Ollama
-        if force_ollama:
-            providers_to_try = ["ollama", "openai"]
-        else:
-            providers_to_try = list(self._provider_order())
-
-        for provider_name in providers_to_try:
+        for provider_name in self._provider_order(primary_override=primary_override):
             fn = self._sync_providers.get(provider_name)
             if fn is None:
                 continue
@@ -414,26 +405,14 @@ class LLMService:
         """
         Generate an answer asynchronously.
         Tries providers in configured order without blocking the event loop.
-        
-        Args:
-            query: The query string
-            context_chunks: Context chunks for generation
-            temperature: Model temperature (optional)
-            max_tokens: Max tokens in response (optional)
-            force_ollama: If True, skip directly to Ollama provider
         """
         temperature = temperature or settings.LLM_TEMPERATURE
         max_tokens = max_tokens or settings.LLM_MAX_TOKENS
         messages = _build_messages(query, context_chunks)
         last_exc: Optional[Exception] = None
+        primary_override = "ollama" if force_ollama else None
 
-        # Determine provider order: if force_ollama, prioritize Ollama
-        if force_ollama:
-            providers_to_try = ["ollama", "openai"]
-        else:
-            providers_to_try = list(self._provider_order())
-
-        for provider_name in providers_to_try:
+        for provider_name in self._provider_order(primary_override=primary_override):
             fn = self._async_providers.get(provider_name)
             if fn is None:
                 continue
@@ -476,14 +455,47 @@ class LLMService:
 _llm_service: Optional[LLMService] = None
 
 
-def get_llm_service() -> LLMService:
+def get_llm_service(
+    model: Optional[str] = None,
+    *,
+    openai_model: Optional[str] = None,
+    primary_provider: Optional[str] = None,
+    use_fallback: Optional[bool] = None,
+) -> LLMService:
     """
     Return the application-wide LLMService singleton.
 
     Configuration is sourced entirely from `settings` so there is no
     ambiguity about which values take effect — callers cannot accidentally
     override the singleton with a different config mid-process.
+    Override arguments create a transient service instead of mutating the
+    shared singleton.
     """
+    has_overrides = any(
+        value is not None
+        for value in (model, openai_model, primary_provider, use_fallback)
+    )
+    if has_overrides:
+        resolved_primary = primary_provider or settings.LLM_PROVIDER
+        resolved_fallback = settings.LLM_USE_FALLBACK if use_fallback is None else use_fallback
+        resolved_ollama_model = model or settings.OLLAMA_MODEL
+        resolved_openai_model = openai_model or settings.OPENAI_MODEL
+        logger.debug(
+            "Creating transient LLMService with overrides: primary=%s fallback=%s ollama_model=%s openai_model=%s",
+            resolved_primary,
+            resolved_fallback,
+            resolved_ollama_model,
+            resolved_openai_model,
+        )
+        return LLMService(
+            openai_api_key=settings.OPENAI_API_KEY,
+            openai_model=resolved_openai_model,
+            ollama_base_url=settings.OLLAMA_BASE_URL,
+            ollama_model=resolved_ollama_model,
+            use_fallback=resolved_fallback,
+            primary_provider=resolved_primary,
+        )
+
     global _llm_service
     if _llm_service is None:
         _llm_service = LLMService(

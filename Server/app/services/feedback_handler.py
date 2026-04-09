@@ -313,6 +313,8 @@ class FeedbackHandler:
         if not feedback_records:
             return {
                 "total_feedback": 0,
+                "approved_count": 0,
+                "rejected_count": 0,
                 "approval_rate": 0.0,
                 "rejection_rate": 0.0,
                 "average_rating": 0.0

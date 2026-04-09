@@ -1,6 +1,7 @@
 """Top-K Chunk Retrieval Service for RAG Pipeline - STEP 3"""
 import logging
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -63,6 +64,8 @@ class RetrievalResult:
 
 
 class TopKRetriever:
+    STOPWORDS = {"the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "with", "is", "are", "was", "were", "be", "this", "that", "what", "which", "who", "when", "where", "why", "how"}
+    TECHNICAL_TERMS = {"ai", "llm", "embedding", "embeddings", "model", "models", "semantic", "search", "timeout", "latency", "retrieval", "qdrant", "ollama", "phi", "token", "sql", "python"}
     """Top-K chunk retriever using semantic similarity.
 
     STEP 3 Implementation:
@@ -156,7 +159,7 @@ class TopKRetriever:
                 settings.EMBEDDING_PROVIDER,
                 self.embedding_service.get_dimension(),
             )
-            query_embedding = self.embedding_service.embed_text(query)
+            query_embedding = self.embedding_service.embed_query(query)
             # embed_text raises RuntimeError on failure; no silent empty-vector
             # path exists, so we only need to guard against an unexpected None.
             if not query_embedding:
@@ -179,8 +182,8 @@ class TopKRetriever:
                 collection_name=collection_name,
                 query_vector=query_embedding,
                 workspace_id=workspace_id_str,
-                limit=top_k,
-                score_threshold=threshold
+                limit=max(top_k * 3, 12),
+                score_threshold=max(threshold - 0.15, 0.32)
             )
 
             logger.info(f"Vector DB returned {len(vector_results)} results")
@@ -217,6 +220,8 @@ class TopKRetriever:
                     logger.error(f"Error processing result {i}: {e}")
                     continue
 
+            retrieved_chunks = self._rerank_and_filter(query, retrieved_chunks, top_k, threshold)
+
             avg_similarity = (
                 sum(c.similarity for c in retrieved_chunks) / len(retrieved_chunks)
                 if retrieved_chunks else 0.0
@@ -241,6 +246,51 @@ class TopKRetriever:
         except Exception as e:
             logger.error(f"Error during retrieval: {e}", exc_info=True)
             return self._empty_result(workspace_id_str, start_time)
+
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [
+            token for token in re.findall(r"[a-zA-Z0-9_:-]+", text.lower())
+            if len(token) > 2 and token not in self.STOPWORDS
+        ]
+
+    def _looks_narrative(self, text: str) -> bool:
+        lowered = f" {text.lower()} "
+        return lowered.count('"') >= 2 or any(term in lowered for term in (" kate ", " andy ", " lunch ", " looked at his watch ", " walked away "))
+
+    def _rerank_and_filter(
+        self,
+        query: str,
+        chunks: List[RetrievedChunk],
+        top_k: int,
+        threshold: float,
+    ) -> List[RetrievedChunk]:
+        if not chunks:
+            return []
+        query_terms = set(self._tokenize(query))
+        technical = len(query_terms & self.TECHNICAL_TERMS) >= 2
+        scored: List[Tuple[float, RetrievedChunk]] = []
+        for chunk in chunks:
+            chunk_terms = set(self._tokenize(chunk.text or ""))
+            lexical = len(query_terms & chunk_terms) / max(len(query_terms), 1) if query_terms else 0.0
+            narrative_penalty = 0.35 if technical and self._looks_narrative(chunk.text or "") and lexical < 0.15 else 0.0
+            score = (chunk.similarity * 0.72) + (lexical * 0.28) - narrative_penalty
+            chunk.metadata = dict(chunk.metadata or {})
+            chunk.metadata["lexical_overlap"] = round(lexical, 4)
+            chunk.metadata["rerank_score"] = round(score, 4)
+            scored.append((score, chunk))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        kept: List[RetrievedChunk] = []
+        for score, chunk in scored:
+            lexical = float((chunk.metadata or {}).get("lexical_overlap", 0.0))
+            if chunk.similarity < threshold:
+                continue
+            if lexical < 0.05 and score < (threshold + 0.02):
+                continue
+            kept.append(chunk)
+            if len(kept) >= top_k:
+                break
+        return kept
 
     def _empty_result(self, workspace_id_str: str, start_time: float) -> RetrievalResult:
         """Return a zero-result RetrievalResult."""

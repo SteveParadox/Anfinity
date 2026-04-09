@@ -1,20 +1,16 @@
 """Semantic search service with hybrid scoring (vector + text + recency + usage)."""
+import asyncio
 import logging
-import json
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 import math
 
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
 
-from app.database.models import Chunk, Document, Embedding, SearchQuery, SearchLog
-# FIX B2: import RetrievedChunk so _enrich_results can be properly typed
+from app.database.models import SearchLog
 from app.services.rag_retriever import get_rag_retriever, RAGRetriever, RetrievedChunk
-from app.services.embeddings import get_embedding_service
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -116,10 +112,11 @@ class SemanticSearchService:
             # Step 1: Retrieve top chunks with vector similarity.
             # FIX B1: retrieve() is synchronous — do NOT await it.
             # FIX B1a: pass filters so RAGRetriever can thread them through.
-            rag_result = self.retriever.retrieve(
+            rag_result = await asyncio.to_thread(
+                self.retriever.retrieve,
                 query=query,
                 workspace_id=workspace_id,
-                top_k=min(limit * 3, 100),
+                top_k=min(limit * 2, 60),
                 filters=filters or {},
             )
 
@@ -183,14 +180,22 @@ class SemanticSearchService:
                 # Pull optional fields from the Qdrant payload metadata dict
                 metadata = chunk.metadata or {}
 
+                # FIX: Convert ISO string created_at to datetime if needed
+                created_at = metadata.get("created_at", datetime.utcnow())
+                if isinstance(created_at, str):
+                    try:
+                        created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    except (ValueError, AttributeError):
+                        created_at = datetime.utcnow()
+
                 result_obj = SemanticSearchResult(
                     chunk_id=chunk.chunk_id,
                     document_id=chunk.document_id,
-                    document_title=metadata.get("document_title", ""),
+                    document_title=chunk.document_title or metadata.get("document_title", ""),
                     content=text,
                     source_type=chunk.source_type,
                     chunk_index=chunk.chunk_index,
-                    created_at=metadata.get("created_at", datetime.utcnow()),
+                    created_at=created_at,
                     interaction_count=metadata.get("interaction_count", 0),
                     # FIX minor: use the clamped value, not the raw chunk attribute
                     similarity_score=similarity_score,
@@ -313,6 +318,7 @@ class SemanticSearchService:
                 result_chunk_ids=[str(r.chunk_id) for r in results],
                 result_count=len(results),
                 clicked_count=0,
+                search_duration_ms=None,
                 created_at=datetime.utcnow(),
             )
 
