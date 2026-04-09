@@ -33,7 +33,6 @@ from app.celery_app import celery_app
 from app.database.session import SyncSessionLocal
 from app.database.models import Note
 from app.services.llm_service import get_llm_service
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +141,10 @@ def generate_note_summary(
                 "existing_summary_length": len(note.summary),
             }
 
-        llm_service = get_llm_service()
+        llm_service = get_llm_service(
+            model=model,
+            primary_provider="ollama",
+        )
         prompt = _build_summary_prompt(content_length)
 
         llm_response = llm_service.generate_answer(
