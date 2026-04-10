@@ -568,6 +568,55 @@ class GraphEdge(Base):
     )
 
 
+class GraphCluster(Base):
+    """Persisted semantic graph cluster."""
+
+    __tablename__ = "graph_clusters"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    cluster_key = Column(String(120), nullable=False)
+    label = Column(String(120), nullable=False)
+    description = Column(Text, nullable=False)
+    importance = Column(Float, nullable=False, default=1.0)
+    cluster_metadata = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    memberships = relationship("GraphClusterMembership", back_populates="cluster", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "cluster_key", name="uq_graph_cluster_workspace_key"),
+        Index("idx_graph_cluster_workspace_updated", "workspace_id", "updated_at"),
+    )
+
+
+class GraphClusterMembership(Base):
+    """Maps graph nodes into a persisted semantic cluster."""
+
+    __tablename__ = "graph_cluster_memberships"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    cluster_id = Column(UUID(as_uuid=True), ForeignKey("graph_clusters.id", ondelete="CASCADE"), nullable=False, index=True)
+    node_id = Column(UUID(as_uuid=True), ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    membership_score = Column(Float, nullable=False, default=0.0)
+    cluster_rank = Column(Integer, nullable=False, default=0)
+    membership_metadata = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    cluster = relationship("GraphCluster", back_populates="memberships", lazy="joined")
+    node = relationship("GraphNode", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "node_id", name="uq_graph_cluster_membership_workspace_node"),
+        UniqueConstraint("cluster_id", "node_id", name="uq_graph_cluster_membership_cluster_node"),
+        Index("idx_graph_cluster_membership_cluster_rank", "cluster_id", "cluster_rank"),
+        Index("idx_graph_cluster_membership_workspace_cluster", "workspace_id", "cluster_id"),
+    )
+
+
 class ChunkWeight(Base):
     """STEP 8: Chunk credibility weights for feedback-based learning."""
     __tablename__ = "chunk_weights"
