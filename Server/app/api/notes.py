@@ -3,16 +3,16 @@ from typing import Optional, List
 from datetime import datetime
 from uuid import UUID
 import logging
-
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, func
+from sqlalchemy import select, and_, or_, func, text
 
 from app.database.session import get_db
 from app.database.models import Note, User as DBUser
 from app.core.auth import get_current_user, get_workspace_context
 from app.core.audit import log_audit_event, AuditAction, EntityType
+from app.services.graph_service import get_graph_service
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,41 @@ def calculate_word_count(content: str) -> int:
     return len(content.strip().split())
 
 
+async def sync_note_search_index(db: AsyncSession, note_id: UUID) -> None:
+    """Keep the PostgreSQL full-text search vector aligned with note content."""
+    try:
+        await db.execute(
+            text(
+                """
+                UPDATE notes
+                SET content_tsv = to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(content, ''))
+                WHERE id = :note_id
+                """
+            ),
+            {"note_id": note_id},
+        )
+    except Exception as exc:
+        logger.warning("Skipping content_tsv sync for note %s: %s", note_id, exc)
+
+
+async def sync_note_graph(db: AsyncSession, note: Note) -> None:
+    """Best-effort graph sync that never blocks note persistence."""
+    try:
+        await get_graph_service().sync_note_to_graph(db, note)
+    except Exception as exc:
+        await db.rollback()
+        logger.warning("Skipping graph sync for note %s in workspace %s: %s", note.id, note.workspace_id, exc)
+
+
+async def remove_note_graph(db: AsyncSession, workspace_id: UUID, note_id: UUID) -> None:
+    """Best-effort graph cleanup that never blocks note deletion."""
+    try:
+        await get_graph_service().remove_note_from_graph(db, workspace_id, note_id)
+    except Exception as exc:
+        await db.rollback()
+        logger.warning("Skipping graph cleanup for note %s in workspace %s: %s", note_id, workspace_id, exc)
+
+
 # ==================== Endpoints ====================
 
 @router.post("", response_model=NoteResponse, status_code=status.HTTP_201_CREATED)
@@ -165,6 +200,7 @@ async def create_note(
     
     db.add(new_note)
     await db.flush()
+    await sync_note_search_index(db, new_note.id)
     
     # Log action
     await log_audit_event(
@@ -177,6 +213,7 @@ async def create_note(
     )
     
     await db.commit()
+    await sync_note_graph(db, new_note)
     
     # Queue background tasks for data enrichment
     # Always generate embedding
@@ -404,6 +441,8 @@ async def update_note(
         note.note_type = updates.note_type
     
     note.updated_at = datetime.utcnow()
+    if content_updated or updates.title is not None:
+        await sync_note_search_index(db, note.id)
     
     # Log action
     await log_audit_event(
@@ -416,6 +455,7 @@ async def update_note(
     )
     
     await db.commit()
+    await sync_note_graph(db, note)
     
     # Queue background tasks if content changed
     if content_updated:
@@ -483,8 +523,11 @@ async def delete_note(
         db=db
     )
     
+    workspace_id = note.workspace_id
     await db.delete(note)
     await db.commit()
+    if workspace_id:
+        await remove_note_graph(db, workspace_id, note.id)
 
 
 @router.get("/workspace/{workspace_id}", response_model=NoteListResponse)

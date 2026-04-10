@@ -18,7 +18,7 @@ from app.config import settings
 from app.core.auth import WorkspaceContext, get_current_active_user, get_workspace_context
 from app.database.models import User as DBUser
 from app.database.session import get_db
-from app.services.semantic_search import get_semantic_search_service
+from app.services.semantic_search import SemanticSearchResult, get_semantic_search_service
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,7 @@ class SemanticSearchResponse(BaseModel):
     total: int
     took_ms: int
     cached: bool = False
+    search_log_id: Optional[str] = None
 
 
 class TrendingEntry(BaseModel):
@@ -131,14 +132,25 @@ async def _run_semantic_search(
             raw = await rc.get(cache_key)
             if raw:
                 data = json.loads(raw)
+                service = get_semantic_search_service()
+                cached_results = [SemanticSearchResult.from_dict(item) for item in data.get("results", [])]
+                search_log_id = await service.log_search_execution(
+                    db=db,
+                    user_id=current_user.id,
+                    workspace_id=workspace_ctx.workspace_id,
+                    query=query,
+                    results=cached_results,
+                    search_duration_ms=0,
+                )
                 data["cached"] = True
+                data["search_log_id"] = search_log_id
                 return SemanticSearchResponse(**data)
         except Exception as exc:
             logger.warning("Search cache read error: %s", exc)
 
     try:
         service = get_semantic_search_service()
-        results = await service.search(
+        execution = await service.search(
             workspace_id=workspace_ctx.workspace_id,
             user_id=current_user.id,
             query=query,
@@ -150,18 +162,21 @@ async def _run_semantic_search(
         logger.error("Semantic search failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc
 
-    payloads = [SemanticSearchResultPayload(**result.to_dict()) for result in results]
+    payloads = [SemanticSearchResultPayload(**result.to_dict()) for result in execution.results]
     response_data = {
         "query": query,
         "results": [payload.model_dump() for payload in payloads],
         "total": len(payloads),
         "took_ms": int((time.time() - start_time) * 1000),
         "cached": False,
+        "search_log_id": execution.search_log_id,
     }
 
     if rc is not None:
         try:
-            await rc.setex(cache_key, 900, json.dumps(response_data))
+            cacheable_response = dict(response_data)
+            cacheable_response.pop("search_log_id", None)
+            await rc.setex(cache_key, 900, json.dumps(cacheable_response))
         except Exception as exc:
             logger.warning("Search cache write error: %s", exc)
 
@@ -262,6 +277,38 @@ async def log_search_click(
         if chunk_id_str not in clicked_ids:
             clicked_ids.append(chunk_id_str)
         search_log.clicked_chunk_ids = clicked_ids
+
+        note_exists = await db.execute(
+            text(
+                """
+                SELECT id
+                FROM notes
+                WHERE id = :note_id
+                  AND workspace_id = :workspace_id
+                """
+            ),
+            {
+                "note_id": chunk_id_str,
+                "workspace_id": str(workspace_ctx.workspace_id),
+            },
+        )
+        if note_exists.first() is not None:
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO note_interactions (note_id, user_id, workspace_id, interaction_type, context)
+                    VALUES (:note_id, :user_id, :workspace_id, :interaction_type, CAST(:context AS jsonb))
+                    """
+                ),
+                {
+                    "note_id": chunk_id_str,
+                    "user_id": str(current_user.id),
+                    "workspace_id": str(workspace_ctx.workspace_id),
+                    "interaction_type": "search_click",
+                    "context": json.dumps({"search_log_id": str(search_log.id)}),
+                },
+            )
+
         db.add(search_log)
         await db.commit()
         return ClickLogResponse(status="logged", clicked_count=search_log.clicked_count)
