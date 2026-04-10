@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.3
     LLM_MAX_TOKENS: int = 1000
     LLM_USE_FALLBACK: bool = True  # Enable fallback on provider errors
+    GRAPH_CLUSTER_SYNC_TOKEN: Optional[str] = None
     
     # Embeddings
     # FIX: Changed default from "openai" to "ollama" (more reliable locally, avoids quota conflicts)
