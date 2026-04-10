@@ -301,7 +301,15 @@ export function NotesView({
   onWorkspaceChange = () => {},
 }: NotesViewProps) {
   const authContext = useContext(AuthContext);
-  const { currentWorkspaceId, workspaces: ctxWorkspaces } = authContext || { currentWorkspaceId: null, workspaces: [] };
+  const {
+    currentWorkspaceId,
+    workspaces: ctxWorkspaces,
+    setCurrentWorkspace,
+  } = authContext || {
+    currentWorkspaceId: null,
+    workspaces: [],
+    setCurrentWorkspace: () => {},
+  };
   const [notes, setNotes] = useState<Note[]>(initialNotes);
   const [workspaces, setWorkspaces] = useState<Workspace[]>(propWorkspaces || (ctxWorkspaces as any) || []);
   const [searchQuery, setSearchQuery] = useState('');
@@ -313,15 +321,52 @@ export function NotesView({
   const [newTag, setNewTag] = useState('');
 
   const workspaceId = currentWorkspaceId || initialSelectedWorkspace;
+  const defaultWorkspaceId = workspaceId || workspaces[0]?.id || '';
 
-  const [newNote, setNewNote] = useState({
-    title: '', content: '', tags: [] as string[],
-    workspaceId: workspaceId || '', 
+  const createEmptyNote = (targetWorkspaceId = '') => ({
+    title: '',
+    content: '',
+    tags: [] as string[],
+    workspaceId: targetWorkspaceId,
     noteType: 'note' as 'note' | 'web-clip' | 'document' | 'voice' | 'ai-generated',
   });
+
+  const normalizeNote = (note: any): Note => ({
+    ...note,
+    userId: note.user_id || note.userId,
+    workspaceId: note.workspace_id || note.workspaceId,
+    createdAt: new Date(note.created_at || note.createdAt || Date.now()),
+    updatedAt: new Date(note.updated_at || note.updatedAt || Date.now()),
+    confidence: note.confidence_score || note.confidence,
+    type: note.note_type || note.type || 'note',
+    tags: Array.isArray(note.tags) ? note.tags : [],
+    connections: Array.isArray(note.connections) ? note.connections.map(String) : [],
+  });
+
+  const [newNote, setNewNote] = useState(() => createEmptyNote(defaultWorkspaceId));
   
   const [showConnections, setShowConnections] = useState(false);
   const [connectingNote, setConnectingNote] = useState<Note | null>(null);
+
+  useEffect(() => {
+    const nextWorkspaces = propWorkspaces?.length ? propWorkspaces : ((ctxWorkspaces as any) || []);
+    setWorkspaces(nextWorkspaces);
+  }, [propWorkspaces, ctxWorkspaces]);
+
+  useEffect(() => {
+    if (!defaultWorkspaceId) return;
+
+    setNewNote((prev) => {
+      const hasValidWorkspaceSelection =
+        !!prev.workspaceId && workspaces.some((ws) => ws.id === prev.workspaceId);
+
+      if (hasValidWorkspaceSelection) {
+        return prev;
+      }
+
+      return { ...prev, workspaceId: defaultWorkspaceId };
+    });
+  }, [defaultWorkspaceId, workspaces]);
 
   // Load notes from API
   useEffect(() => {
@@ -331,16 +376,7 @@ export function NotesView({
       try {
         const response: any = await api.listNotes({ workspace_id: workspaceId });
         const items = Array.isArray(response) ? response : response.items || [];
-        const transformedNotes = items.map((note: any) => ({
-          ...note,
-          userId: note.user_id || note.userId,
-          workspaceId: note.workspace_id || note.workspaceId,
-          // FIX: fall back to Date.now() so we never construct an Invalid Date
-          createdAt: new Date(note.created_at || note.createdAt || Date.now()),
-          updatedAt: new Date(note.updated_at || note.updatedAt || Date.now()),
-          confidence: note.confidence_score || note.confidence,
-          type: note.type || 'note',
-        }));
+        const transformedNotes = items.map(normalizeNote);
         setNotes(transformedNotes);
       } catch (err) {
         console.error('Failed to load notes:', err);
@@ -398,28 +434,40 @@ export function NotesView({
   });
 
   const handleCreateNote = async () => {
-    if (!newNote.title.trim() || !workspaceId) return;
+    const targetWorkspaceId = newNote.workspaceId || defaultWorkspaceId;
+    if (!newNote.title.trim() || !targetWorkspaceId) return;
 
     try {
-      const createdNote: any = await api.createNote({
-        workspace_id: workspaceId,
+      const createdNoteResponse: any = await api.createNote({
+        workspace_id: targetWorkspaceId,
         title: newNote.title,
         content: newNote.content,
         tags: newNote.tags,
         note_type: newNote.noteType,
       });
+      const createdNote = normalizeNote(createdNoteResponse);
 
-      setNotes([createdNote, ...notes] as Note[]);
-      setNewNote({ title: '', content: '', tags: [], workspaceId: workspaceId || '', noteType: 'note' });
+      if (targetWorkspaceId === workspaceId) {
+        setNotes((prev) => [createdNote, ...prev]);
+      }
+
+      setNewNote(createEmptyNote(targetWorkspaceId));
+      setNewTag('');
       setIsCreating(false);
+
+      if (targetWorkspaceId !== workspaceId) {
+        setCurrentWorkspace(targetWorkspaceId);
+        onWorkspaceChange?.(targetWorkspaceId);
+      }
+
       onNoteCreate?.({
         title: createdNote.title,
         content: createdNote.content,
         tags: createdNote.tags,
-        userId: createdNote.user_id,
-        workspaceId: createdNote.workspace_id,
+        userId: createdNote.userId,
+        workspaceId: createdNote.workspaceId,
         connections: createdNote.connections || [],
-        type: createdNote.note_type || 'note',
+        type: createdNote.type,
       });
     } catch (err) {
       console.error('Create note error:', err);
@@ -436,10 +484,11 @@ export function NotesView({
         tags: editingNote.tags,
         note_type: editingNote.type,
       });
+      const normalizedUpdatedNote = normalizeNote(updatedNote);
 
-      setNotes(notes.map(n => n.id === updatedNote.id ? updatedNote : n) as Note[]);
+      setNotes(notes.map(n => n.id === normalizedUpdatedNote.id ? normalizedUpdatedNote : n) as Note[]);
       setEditingNote(null);
-      onNoteUpdate?.(updatedNote.id, updatedNote);
+      onNoteUpdate?.(normalizedUpdatedNote.id, normalizedUpdatedNote);
     } catch (err) {
       console.error('Update note error:', err);
     }
@@ -451,9 +500,10 @@ export function NotesView({
       const updatedNote: any = await api.updateNote(selectedNote.id, {
         connections: selectedNote.connections || [],
       });
+      const normalizedUpdatedNote = normalizeNote(updatedNote);
 
-      setNotes(notes.map(n => n.id === updatedNote.id ? updatedNote : n) as Note[]);
-      setSelectedNote(updatedNote);
+      setNotes(notes.map(n => n.id === normalizedUpdatedNote.id ? normalizedUpdatedNote : n) as Note[]);
+      setSelectedNote(normalizedUpdatedNote);
       setShowConnections(false);
     } catch (err) {
       console.error('Update connections error:', err);
@@ -847,7 +897,7 @@ export function NotesView({
           </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 8 }}>
             <GhostBtn onClick={() => setIsCreating(false)}>Cancel</GhostBtn>
-            <YellowBtn onClick={handleCreateNote} disabled={!newNote.title.trim()}>
+            <YellowBtn onClick={handleCreateNote} disabled={!newNote.title.trim() || !newNote.workspaceId}>
               <Check size={13} /> Create
             </YellowBtn>
           </div>
