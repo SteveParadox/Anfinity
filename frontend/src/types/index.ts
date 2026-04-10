@@ -27,6 +27,27 @@ export interface Note {
   embedding?: string;
 }
 
+export type NoteConnectionSuggestionStatus = 'pending' | 'confirmed' | 'dismissed';
+
+export interface NoteConnectionSuggestion {
+  id: string;
+  workspaceId: string;
+  noteId: string;
+  suggestedNote: {
+    id: string;
+    title: string;
+    contentPreview: string;
+    tags: string[];
+    createdAt: Date;
+  };
+  similarityScore: number;
+  reason: string;
+  status: NoteConnectionSuggestionStatus;
+  metadata: Record<string, unknown>;
+  respondedAt?: Date;
+  createdAt: Date;
+}
+
 export type GraphNodeType = 'workspace' | 'note' | 'entity' | 'tag';
 
 export type GraphEdgeType =

@@ -14,7 +14,7 @@ import {
   transformWorkspacesArray,
   transformQueryResponseFromAPI,
 } from './transformers';
-import type { KnowledgeGraph, KnowledgeGraphFilters } from '@/types';
+import type { KnowledgeGraph, KnowledgeGraphFilters, NoteConnectionSuggestion } from '@/types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 const API_TIMEOUT = parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'); // 30 seconds
@@ -701,6 +701,49 @@ class ApiClient {
       `/notes/workspace/${workspaceId}${queryParams.toString() ? `?${queryParams}` : ''}`
     );
     return transformPaginatedNotes(response);
+  }
+
+  async getNoteConnectionSuggestions(
+    noteId: string,
+    status: 'pending' | 'confirmed' | 'dismissed' = 'pending'
+  ): Promise<NoteConnectionSuggestion[]> {
+    const response = await this.request<any[]>(`/notes/${noteId}/connection-suggestions?status=${encodeURIComponent(status)}`);
+    return (response || []).map((suggestion) => ({
+      id: suggestion.id,
+      workspaceId: suggestion.workspace_id,
+      noteId: suggestion.note_id,
+      suggestedNote: {
+        id: suggestion.suggested_note.id,
+        title: suggestion.suggested_note.title,
+        contentPreview: suggestion.suggested_note.content_preview,
+        tags: suggestion.suggested_note.tags || [],
+        createdAt: suggestion.suggested_note.created_at ? new Date(suggestion.suggested_note.created_at) : new Date(),
+      },
+      similarityScore: suggestion.similarity_score || 0,
+      reason: suggestion.reason || '',
+      status: suggestion.status || 'pending',
+      metadata: suggestion.metadata || {},
+      respondedAt: suggestion.responded_at ? new Date(suggestion.responded_at) : undefined,
+      createdAt: suggestion.created_at ? new Date(suggestion.created_at) : new Date(),
+    }));
+  }
+
+  async confirmNoteConnectionSuggestion(
+    noteId: string,
+    suggestionId: string
+  ): Promise<{ success: boolean; suggestion_id: string; note_id: string; status: string; connections: string[] }> {
+    return this.request(`/notes/${noteId}/connection-suggestions/${suggestionId}/confirm`, {
+      method: 'POST',
+    });
+  }
+
+  async dismissNoteConnectionSuggestion(
+    noteId: string,
+    suggestionId: string
+  ): Promise<{ success: boolean; suggestion_id: string; note_id: string; status: string; connections: string[] }> {
+    return this.request(`/notes/${noteId}/connection-suggestions/${suggestionId}/dismiss`, {
+      method: 'POST',
+    });
   }
 
   // ==================== Workspaces Endpoints ====================

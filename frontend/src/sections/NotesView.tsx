@@ -6,7 +6,7 @@ import {
   Plus, Search, Filter, Edit2, Trash2, Link2,
   Sparkles, Brain, Globe, Mic, FileText, X, Check, Tag, Users,
 } from 'lucide-react';
-import type { Note, Workspace } from '@/types';
+import type { Note, NoteConnectionSuggestion, Workspace } from '@/types';
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
@@ -319,6 +319,8 @@ export function NotesView({
   const [isCreating, setIsCreating] = useState(false);
   const [editingNote, setEditingNote] = useState<Note | null>(null);
   const [newTag, setNewTag] = useState('');
+  const [connectionSuggestions, setConnectionSuggestions] = useState<NoteConnectionSuggestion[]>([]);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false);
 
   const workspaceId = currentWorkspaceId || initialSelectedWorkspace;
   const defaultWorkspaceId = workspaceId || workspaces[0]?.id || '';
@@ -424,6 +426,28 @@ export function NotesView({
     loadWorkspaceForNote();
   }, [selectedNote?.workspaceId, workspaces]);
 
+  useEffect(() => {
+    const loadConnectionSuggestions = async () => {
+      if (!selectedNote?.id) {
+        setConnectionSuggestions([]);
+        return;
+      }
+
+      try {
+        setSuggestionsLoading(true);
+        const suggestions = await api.getNoteConnectionSuggestions(selectedNote.id);
+        setConnectionSuggestions(suggestions);
+      } catch (err) {
+        console.error('Failed to load connection suggestions:', err);
+        setConnectionSuggestions([]);
+      } finally {
+        setSuggestionsLoading(false);
+      }
+    };
+
+    loadConnectionSuggestions();
+  }, [selectedNote?.id]);
+
   const filteredNotes = notes.filter((note) => {
     const q = searchQuery.toLowerCase();
     return (
@@ -507,6 +531,37 @@ export function NotesView({
       setShowConnections(false);
     } catch (err) {
       console.error('Update connections error:', err);
+    }
+  };
+
+  const handleConfirmConnectionSuggestion = async (suggestion: NoteConnectionSuggestion) => {
+    if (!selectedNote) return;
+
+    try {
+      const response = await api.confirmNoteConnectionSuggestion(selectedNote.id, suggestion.id);
+      const nextConnections = response.connections || [];
+
+      const updatedSelectedNote = { ...selectedNote, connections: nextConnections };
+      setSelectedNote(updatedSelectedNote);
+      setNotes((prev) =>
+        prev.map((note) =>
+          note.id === selectedNote.id ? { ...note, connections: nextConnections } : note
+        )
+      );
+      setConnectionSuggestions((prev) => prev.filter((item) => item.id !== suggestion.id));
+    } catch (err) {
+      console.error('Confirm connection suggestion error:', err);
+    }
+  };
+
+  const handleDismissConnectionSuggestion = async (suggestion: NoteConnectionSuggestion) => {
+    if (!selectedNote) return;
+
+    try {
+      await api.dismissNoteConnectionSuggestion(selectedNote.id, suggestion.id);
+      setConnectionSuggestions((prev) => prev.filter((item) => item.id !== suggestion.id));
+    } catch (err) {
+      console.error('Dismiss connection suggestion error:', err);
     }
   };
 
@@ -1074,6 +1129,114 @@ export function NotesView({
             >
               <Link2 size={11} /> {(selectedNote.connections?.length || 0) > 0 ? 'Edit' : 'Add'} Connections
             </button>
+
+            <div style={{ background: 'rgba(245,230,66,0.04)', border: '1px solid rgba(245,230,66,0.15)', borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '12px 14px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                <Sparkles size={11} color={TT.yolk} />
+                <span style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.yolk }}>
+                  Connection Suggestions
+                </span>
+              </div>
+
+              {suggestionsLoading ? (
+                <p style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.inkMuted, letterSpacing: '0.02em' }}>
+                  Finding related notes...
+                </p>
+              ) : connectionSuggestions.length > 0 ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {connectionSuggestions.map((suggestion) => (
+                    <div
+                      key={suggestion.id}
+                      style={{
+                        background: TT.inkRaised,
+                        border: `1px solid ${TT.inkBorder}`,
+                        borderRadius: 3,
+                        padding: '10px 12px',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 6 }}>
+                        <div style={{ flex: 1 }}>
+                          <p style={{ fontFamily: TT.fontMono, fontSize: 11.5, color: TT.snow, marginBottom: 4, letterSpacing: '0.02em' }}>
+                            {suggestion.suggestedNote.title}
+                          </p>
+                          <p style={{ fontFamily: TT.fontBody, fontSize: 11, color: TT.inkMuted, lineHeight: 1.55 }}>
+                            {suggestion.reason}
+                          </p>
+                        </div>
+                        <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.yolk, whiteSpace: 'nowrap' }}>
+                          {Math.round(suggestion.similarityScore * 100)}% match
+                        </span>
+                      </div>
+
+                      {suggestion.suggestedNote.contentPreview && (
+                        <p style={{ fontFamily: TT.fontBody, fontSize: 10.5, color: TT.inkDim, lineHeight: 1.45, marginBottom: 8 }}>
+                          {suggestion.suggestedNote.contentPreview}
+                        </p>
+                      )}
+
+                      {(suggestion.suggestedNote.tags || []).length > 0 && (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 8 }}>
+                          {suggestion.suggestedNote.tags.slice(0, 3).map((tag) => (
+                            <TagChip key={`${suggestion.id}-${tag}`} label={tag} />
+                          ))}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button
+                          onClick={() => handleConfirmConnectionSuggestion(suggestion)}
+                          style={{
+                            flex: 1,
+                            height: 32,
+                            background: '#60A5FA',
+                            border: 'none',
+                            borderRadius: 3,
+                            color: 'white',
+                            fontFamily: TT.fontMono,
+                            fontSize: 10,
+                            letterSpacing: '0.05em',
+                            textTransform: 'uppercase',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: 5,
+                          }}
+                        >
+                          <Check size={11} /> Confirm
+                        </button>
+                        <button
+                          onClick={() => handleDismissConnectionSuggestion(suggestion)}
+                          style={{
+                            flex: 1,
+                            height: 32,
+                            background: 'transparent',
+                            border: `1px solid ${TT.inkBorder}`,
+                            borderRadius: 3,
+                            color: TT.inkMuted,
+                            fontFamily: TT.fontMono,
+                            fontSize: 10,
+                            letterSpacing: '0.05em',
+                            textTransform: 'uppercase',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: 5,
+                          }}
+                        >
+                          <X size={11} /> Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.inkMuted, letterSpacing: '0.02em' }}>
+                  No pending connection suggestions for this note right now.
+                </p>
+              )}
+            </div>
 
             {selectedNoteWorkspace && (
               <div style={{ background: 'rgba(96,165,250,0.05)', border: '1px solid rgba(96,165,250,0.15)', borderLeft: '3px solid #60A5FA', borderRadius: 3, padding: '12px 14px' }}>
