@@ -1,4 +1,4 @@
-"""URL content parser using Jina Reader and OpenAI."""
+"""URL content parser using Jina Reader and LLM extraction."""
 import asyncio
 import logging
 import json
@@ -8,19 +8,11 @@ from typing import Optional, Dict, Any, Callable, TypeVar
 from urllib.parse import urlparse, ParseResult
 
 import aiohttp
-import openai
 
 from app.ingestion.parsers.base import DocumentParser, ParsedDocument
-from app.config import settings
+from app.services.llm_service import get_llm_service
 
 logger = logging.getLogger(__name__)
-
-# Initialize OpenAI client
-client = openai.OpenAI(
-    api_key=settings.OPENAI_API_KEY,
-    timeout=30.0,
-    max_retries=0,  # Handled manually below
-)
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -28,45 +20,42 @@ F = TypeVar("F", bound=Callable[..., Any])
 _ALLOWED_SCHEMES: frozenset = frozenset({"http", "https"})
 
 # ---------------------------------------------------------------------------
-# Retry decorator
+# Retry decorator for general async operations
 # ---------------------------------------------------------------------------
 
 def _with_retries(
     max_attempts: int = 3,
     backoff_base: float = 1.5,
-    retryable: tuple = (openai.RateLimitError, openai.APITimeoutError, openai.InternalServerError),
-) -> Callable[[F], F]:
-    """Exponential-backoff retry decorator for OpenAI calls."""
-    def decorator(fn: F) -> F:
+) -> Callable[[Any], Any]:
+    """Exponential-backoff retry decorator for transient failures."""
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             last_exc: Exception | None = None
             for attempt in range(1, max_attempts + 1):
                 try:
                     return fn(*args, **kwargs)
-                except retryable as exc:
+                except Exception as exc:
                     last_exc = exc
                     if attempt == max_attempts:
                         break
                     wait = backoff_base ** attempt
                     logger.warning(
-                        "OpenAI call failed (attempt %d/%d): %s — retrying in %.1fs",
+                        "LLM extraction failed (attempt %d/%d): %s — retrying in %.1fs",
                         attempt, max_attempts, exc, wait,
                     )
                     time.sleep(wait)
-                except Exception:
-                    raise
             raise last_exc  # type: ignore[misc]
         return wrapper  # type: ignore[return-value]
     return decorator
 
 
 class URLParser(DocumentParser):
-    """Parser for web URLs using the Jina Reader API + OpenAI extraction.
+    """Parser for web URLs using the Jina Reader API + LLM extraction.
 
     Fetches the human-readable content of a URL via Jina Reader, then uses
-    OpenAI to clean, structure, and extract metadata, producing a
-    ``ParsedDocument`` ready for knowledge-base indexing.
+    LLM (Ollama primary, OpenAI fallback) to clean, structure, and extract metadata, 
+    producing a ``ParsedDocument`` ready for knowledge-base indexing.
     """
 
     JINA_READER_BASE: str = "https://r.jina.ai"
@@ -255,7 +244,9 @@ class URLParser(DocumentParser):
         parsed_url: ParseResult,
         raw_content: str,
     ) -> Dict[str, Any]:
-        """Extract structured metadata and cleaned body from raw page content.
+        """Extract structured metadata and cleaned body from raw page content using LLM.
+
+        Uses Ollama as primary LLM provider to avoid OpenAI quota errors.
 
         Args:
             url: Original URL (used for attribution and fallback).
@@ -323,24 +314,26 @@ URL: {url}
 Raw page content:
 {content_preview}"""
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=2_500,
-            temperature=0,
+        # Use LLMService with Ollama as primary (OpenAI as fallback if configured)
+        llm_service = get_llm_service(primary_provider="ollama")
+        llm_response = llm_service.generate_answer(
+            query=user_prompt,
+            context_chunks=[content_preview],
+            temperature=0.0,
+            max_tokens=2_000,
         )
 
-        raw = response.choices[0].message.content or "{}"
+        raw = llm_response.answer or "{}"
         try:
             result: Dict[str, Any] = json.loads(raw)
         except json.JSONDecodeError as exc:
             logger.warning("JSON decode failed; attempting strip: %s", exc)
-            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            result = json.loads(cleaned)
+            try:
+                cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                result = json.loads(cleaned)
+            except json.JSONDecodeError:
+                logger.error("Failed to parse LLM response as JSON after cleanup: %s", exc)
+                result = {}
 
         self._validate_extraction(result, parsed_url, raw_content)
         logger.debug("URL extraction title: %r", result.get("title"))
