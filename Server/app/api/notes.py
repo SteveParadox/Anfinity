@@ -1,5 +1,5 @@
 """Notes API routes for user note management."""
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 from datetime import datetime
 from uuid import UUID
 import logging
@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, text
 
 from app.database.session import get_db
-from app.database.models import Note, User as DBUser
+from app.database.models import Note, NoteConnectionSuggestion, User as DBUser
 from app.core.auth import get_current_user, get_workspace_context
 from app.core.audit import log_audit_event, AuditAction, EntityType
 from app.services.graph_service import get_graph_service
@@ -36,6 +36,15 @@ def queue_note_summary(note_id: str) -> None:
     except Exception as e:
         # Log but don't fail if task queueing fails
         print(f"Warning: Failed to queue summary task: {e}")
+
+
+def queue_note_connection_suggestions(note_id: str) -> None:
+    """Queue async note-connection suggestions (lazy import to avoid startup hangs)."""
+    try:
+        from app.tasks.connection_suggestions import generate_connection_suggestions
+        generate_connection_suggestions.delay(str(note_id))
+    except Exception as e:
+        print(f"Warning: Failed to queue connection suggestion task: {e}")
 
 
 # ==================== Schemas ====================
@@ -89,6 +98,35 @@ class NoteListResponse(BaseModel):
     page_size: int
 
 
+class SuggestedNoteSnippet(BaseModel):
+    id: str
+    title: str
+    content_preview: str
+    tags: List[str] = Field(default_factory=list)
+    created_at: str
+
+
+class ConnectionSuggestionResponse(BaseModel):
+    id: str
+    workspace_id: str
+    note_id: str
+    suggested_note: SuggestedNoteSnippet
+    similarity_score: float
+    reason: str
+    status: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    responded_at: Optional[str] = None
+    created_at: str
+
+
+class ConnectionSuggestionActionResponse(BaseModel):
+    success: bool
+    suggestion_id: str
+    note_id: str
+    status: str
+    connections: List[str] = Field(default_factory=list)
+
+
 # ==================== Routes ====================
 
 # ==================== Utility Functions ====================
@@ -140,6 +178,34 @@ async def remove_note_graph(db: AsyncSession, workspace_id: UUID, note_id: UUID)
     except Exception as exc:
         await db.rollback()
         logger.warning("Skipping graph cleanup for note %s in workspace %s: %s", note_id, workspace_id, exc)
+
+
+def serialize_connection_suggestion(suggestion: NoteConnectionSuggestion) -> ConnectionSuggestionResponse:
+    suggested_note = suggestion.suggested_note
+    preview = ""
+    if suggested_note and suggested_note.content:
+        preview = suggested_note.content[:160]
+        if len(suggested_note.content) > 160:
+            preview += "..."
+
+    return ConnectionSuggestionResponse(
+        id=str(suggestion.id),
+        workspace_id=str(suggestion.workspace_id),
+        note_id=str(suggestion.source_note_id),
+        suggested_note=SuggestedNoteSnippet(
+            id=str(suggested_note.id) if suggested_note else "",
+            title=suggested_note.title if suggested_note else "Deleted note",
+            content_preview=preview,
+            tags=list(suggested_note.tags or []) if suggested_note else [],
+            created_at=suggested_note.created_at.isoformat() if suggested_note and suggested_note.created_at else datetime.utcnow().isoformat(),
+        ),
+        similarity_score=float(suggestion.similarity_score or 0.0),
+        reason=suggestion.reason,
+        status=suggestion.status,
+        metadata=dict(suggestion.suggestion_metadata or {}),
+        responded_at=suggestion.responded_at.isoformat() if suggestion.responded_at else None,
+        created_at=suggestion.created_at.isoformat() if suggestion.created_at else datetime.utcnow().isoformat(),
+    )
 
 
 # ==================== Endpoints ====================
@@ -218,6 +284,7 @@ async def create_note(
     # Queue background tasks for data enrichment
     # Always generate embedding
     queue_note_embedding(str(new_note.id))
+    queue_note_connection_suggestions(str(new_note.id))
     
     # Generate summary for longer notes
     if len(note_data.content.split()) > 20:  # >20 words is substantive
@@ -426,22 +493,24 @@ async def update_note(
         )
     
     # Update fields
-    content_updated = False
+    semantic_fields_updated = False
     if updates.title is not None:
         note.title = updates.title
+        semantic_fields_updated = True
     if updates.content is not None:
         note.content = updates.content
         note.word_count = calculate_word_count(updates.content)
-        content_updated = True
+        semantic_fields_updated = True
     if updates.tags is not None:
         note.tags = updates.tags
+        semantic_fields_updated = True
     if updates.connections is not None:
         note.connections = updates.connections
     if updates.note_type is not None:
         note.note_type = updates.note_type
     
     note.updated_at = datetime.utcnow()
-    if content_updated or updates.title is not None:
+    if semantic_fields_updated:
         await sync_note_search_index(db, note.id)
     
     # Log action
@@ -458,7 +527,8 @@ async def update_note(
     await sync_note_graph(db, note)
     
     # Queue background tasks if content changed
-    if content_updated:
+    queue_note_connection_suggestions(str(note.id))
+    if semantic_fields_updated:
         # Re-generate embedding for updated content
         queue_note_embedding(str(note.id))
         # Re-generate summary if content is substantive
@@ -528,6 +598,163 @@ async def delete_note(
     await db.commit()
     if workspace_id:
         await remove_note_graph(db, workspace_id, note.id)
+
+
+@router.get("/{note_id}/connection-suggestions", response_model=List[ConnectionSuggestionResponse])
+async def list_connection_suggestions(
+    note_id: str,
+    status_filter: str = Query("pending", alias="status"),
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List persisted connection suggestions for a note."""
+    try:
+        note_uuid = UUID(note_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note ID format")
+    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
+    note = note_result.scalar_one_or_none()
+
+    if not note:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+    if note.workspace_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Note has no workspace")
+
+    await get_workspace_context(note.workspace_id, current_user, db)
+
+    query = select(NoteConnectionSuggestion).where(NoteConnectionSuggestion.source_note_id == note.id)
+    if status_filter:
+        query = query.where(NoteConnectionSuggestion.status == status_filter)
+    query = query.order_by(NoteConnectionSuggestion.similarity_score.desc(), NoteConnectionSuggestion.created_at.desc())
+
+    result = await db.execute(query)
+    suggestions = result.scalars().all()
+    return [serialize_connection_suggestion(suggestion) for suggestion in suggestions]
+
+
+@router.post("/{note_id}/connection-suggestions/{suggestion_id}/confirm", response_model=ConnectionSuggestionActionResponse)
+async def confirm_connection_suggestion(
+    note_id: str,
+    suggestion_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Confirm a suggested connection and persist the user signal."""
+    try:
+        note_uuid = UUID(note_id)
+        suggestion_uuid = UUID(suggestion_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note or suggestion ID format")
+
+    result = await db.execute(
+        select(NoteConnectionSuggestion).where(
+            NoteConnectionSuggestion.id == suggestion_uuid,
+            NoteConnectionSuggestion.source_note_id == note_uuid,
+        )
+    )
+    suggestion = result.scalar_one_or_none()
+    if not suggestion:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection suggestion not found")
+
+    source_note_result = await db.execute(select(Note).where(Note.id == suggestion.source_note_id))
+    source_note = source_note_result.scalar_one_or_none()
+    target_note_result = await db.execute(select(Note).where(Note.id == suggestion.suggested_note_id))
+    target_note = target_note_result.scalar_one_or_none()
+
+    if not source_note or not target_note:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connected note no longer exists")
+    if source_note.workspace_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source note has no workspace")
+
+    await get_workspace_context(source_note.workspace_id, current_user, db)
+
+    source_connections = [str(connection_id) for connection_id in (source_note.connections or [])]
+    target_connections = [str(connection_id) for connection_id in (target_note.connections or [])]
+
+    if str(target_note.id) not in source_connections:
+        source_connections.append(str(target_note.id))
+    if str(source_note.id) not in target_connections:
+        target_connections.append(str(source_note.id))
+
+    source_note.connections = source_connections
+    target_note.connections = target_connections
+
+    suggestion.status = "confirmed"
+    suggestion.responded_by = current_user.id
+    suggestion.responded_at = datetime.utcnow()
+
+    reverse_result = await db.execute(
+        select(NoteConnectionSuggestion).where(
+            NoteConnectionSuggestion.source_note_id == target_note.id,
+            NoteConnectionSuggestion.suggested_note_id == source_note.id,
+        )
+    )
+    reverse_suggestion = reverse_result.scalar_one_or_none()
+    if reverse_suggestion and reverse_suggestion.status == "pending":
+        reverse_suggestion.status = "confirmed"
+        reverse_suggestion.responded_by = current_user.id
+        reverse_suggestion.responded_at = datetime.utcnow()
+
+    await db.commit()
+    await sync_note_graph(db, source_note)
+    await sync_note_graph(db, target_note)
+    queue_note_connection_suggestions(str(source_note.id))
+    queue_note_connection_suggestions(str(target_note.id))
+
+    return ConnectionSuggestionActionResponse(
+        success=True,
+        suggestion_id=str(suggestion.id),
+        note_id=str(source_note.id),
+        status=suggestion.status,
+        connections=[str(connection_id) for connection_id in (source_note.connections or [])],
+    )
+
+
+@router.post("/{note_id}/connection-suggestions/{suggestion_id}/dismiss", response_model=ConnectionSuggestionActionResponse)
+async def dismiss_connection_suggestion(
+    note_id: str,
+    suggestion_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Dismiss a suggested connection and preserve that user signal."""
+    try:
+        note_uuid = UUID(note_id)
+        suggestion_uuid = UUID(suggestion_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note or suggestion ID format")
+
+    result = await db.execute(
+        select(NoteConnectionSuggestion).where(
+            NoteConnectionSuggestion.id == suggestion_uuid,
+            NoteConnectionSuggestion.source_note_id == note_uuid,
+        )
+    )
+    suggestion = result.scalar_one_or_none()
+    if not suggestion:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection suggestion not found")
+
+    source_note_result = await db.execute(select(Note).where(Note.id == suggestion.source_note_id))
+    source_note = source_note_result.scalar_one_or_none()
+    if not source_note:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source note not found")
+    if source_note.workspace_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source note has no workspace")
+
+    await get_workspace_context(source_note.workspace_id, current_user, db)
+
+    suggestion.status = "dismissed"
+    suggestion.responded_by = current_user.id
+    suggestion.responded_at = datetime.utcnow()
+    await db.commit()
+
+    return ConnectionSuggestionActionResponse(
+        success=True,
+        suggestion_id=str(suggestion.id),
+        note_id=str(source_note.id),
+        status=suggestion.status,
+        connections=[str(connection_id) for connection_id in (source_note.connections or [])],
+    )
 
 
 @router.get("/workspace/{workspace_id}", response_model=NoteListResponse)
