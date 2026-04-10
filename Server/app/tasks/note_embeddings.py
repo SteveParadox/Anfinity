@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.celery_app import celery_app
 from app.database.session import SyncSessionLocal
@@ -45,6 +45,15 @@ def _parse_uuid(value: str, field: str) -> UUID | None:
     except (ValueError, AttributeError):
         logger.error("Invalid %s UUID: %r", field, value)
         return None
+
+
+def _queue_connection_suggestions(note_id: str) -> None:
+    """Queue note-connection suggestion refresh without failing the embedding task."""
+    try:
+        from app.tasks.connection_suggestions import generate_connection_suggestions
+        generate_connection_suggestions.delay(note_id)
+    except Exception as exc:
+        logger.warning("Failed to queue connection suggestions for note %s: %s", note_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +121,32 @@ def generate_note_embedding(
         if not embedding_vector:
             raise ValueError("Embedding service returned an empty vector")
 
-        # Store on the model.  If Note.embedding is a pgvector column the ORM
-        # accepts a plain list; if it's a TEXT column swap to json.dumps here.
         note.embedding = json.dumps(embedding_vector)
         note.updated_at = datetime.now(timezone.utc)
+        try:
+            db.execute(
+                text(
+                    f"""
+                    UPDATE notes
+                    SET embedding_vector = CAST(:embedding AS vector({len(embedding_vector)}))
+                    WHERE id = :note_id
+                    """
+                ),
+                {
+                    "embedding": f"[{','.join(map(str, embedding_vector))}]",
+                    "note_id": note.id,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping embedding_vector sync for note %s (dim=%d): %s",
+                note_id,
+                len(embedding_vector),
+                exc,
+            )
 
         db.commit()
+        _queue_connection_suggestions(note_id)
 
         logger.info(
             "Embedding stored for note %s (dim=%d, model=%s, task=%s)",
