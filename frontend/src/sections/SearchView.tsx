@@ -46,6 +46,11 @@ interface SemanticResult {
   final_score: number;
 }
 
+interface SemanticSearchResponsePayload {
+  results: SemanticResult[];
+  search_log_id?: string | null;
+}
+
 const TT = {
   inkBlack:  '#0A0A0A',
   inkDeep:   '#111111',
@@ -69,6 +74,7 @@ export function SearchView() {
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [activeFilters, setActiveFilters] = useState<string[]>([]);
   const [semanticResults, setSemanticResults] = useState<SemanticResult[]>([]);
+  const [searchLogId, setSearchLogId] = useState<string | null>(null);
   const [queryResults, setQueryResults] = useState<QueryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
@@ -304,6 +310,7 @@ export function SearchView() {
     setError(null);
     setSelectedNote(null);
     setSemanticResults([]);
+    setSearchLogId(null);
     setQueryResults(null);
     setAnswerFeedbackStatus(null);
     setFeedbackMessage(null);
@@ -320,7 +327,9 @@ export function SearchView() {
       const partialErrors: string[] = [];
 
       if (searchResult.status === 'fulfilled') {
-        setSemanticResults(searchResult.value.results as SemanticResult[]);
+        const semanticPayload = searchResult.value as SemanticSearchResponsePayload;
+        setSemanticResults(semanticPayload.results);
+        setSearchLogId(semanticPayload.search_log_id ?? null);
       } else {
         partialErrors.push('Semantic search is unavailable right now.');
       }
@@ -375,9 +384,24 @@ export function SearchView() {
 
       setError(errorMsg);
       setSemanticResults([]);
+      setSearchLogId(null);
       setQueryResults(null);
     } finally {
       setIsSearching(false);
+    }
+  };
+
+  const handleOpenSearchResult = async (result: (typeof filteredResults)[number]) => {
+    setSelectedNote(result.note);
+
+    if (!workspaceId || !searchLogId) {
+      return;
+    }
+
+    try {
+      await api.logSearchClick(workspaceId, searchLogId, result.note.id);
+    } catch (err) {
+      console.error('Failed to log semantic search click:', err);
     }
   };
 
@@ -752,7 +776,7 @@ export function SearchView() {
                     transition={{ delay: index * 0.04 }}
                   >
                     <div
-                      onClick={() => setSelectedNote(result.note)}
+                      onClick={() => handleOpenSearchResult(result)}
                       style={{
                         background: TT.inkDeep,
                         border: `1px solid ${TT.inkBorder}`,

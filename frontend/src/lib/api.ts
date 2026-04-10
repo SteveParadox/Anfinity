@@ -133,6 +133,8 @@ export interface SearchResponse {
   results: SearchResult[];
   total: number;
   took_ms: number;
+  cached?: boolean;
+  search_log_id?: string | null;
 }
 
 export interface TokenResponse {
@@ -777,6 +779,22 @@ class ApiClient {
     }
 
     return this.request(`/search/semantic?${queryParams.toString()}`);
+  }
+
+  async logSearchClick(
+    workspaceId: string,
+    searchLogId: string,
+    chunkId: string
+  ): Promise<{ status: string; clicked_count: number }> {
+    const queryParams = new URLSearchParams({
+      workspace_id: workspaceId,
+      search_log_id: searchLogId,
+      chunk_id: chunkId,
+    });
+
+    return this.request(`/search/log-click?${queryParams.toString()}`, {
+      method: 'POST',
+    });
   }
 
   // ==================== Audit Endpoints ====================

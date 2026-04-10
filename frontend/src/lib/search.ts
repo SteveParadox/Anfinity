@@ -32,6 +32,7 @@ export interface SemanticSearchResponse {
   total: number;
   took_ms: number;
   cached: boolean;
+  search_log_id?: string | null;
 }
 
 export interface TrendingSearch {
