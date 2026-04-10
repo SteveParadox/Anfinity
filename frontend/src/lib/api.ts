@@ -14,6 +14,7 @@ import {
   transformWorkspacesArray,
   transformQueryResponseFromAPI,
 } from './transformers';
+import type { KnowledgeGraph, KnowledgeGraphFilters } from '@/types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 const API_TIMEOUT = parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'); // 30 seconds
@@ -819,12 +820,30 @@ class ApiClient {
 
   // ==================== Knowledge Graph Endpoints ====================
 
-  async getKnowledgeGraph(workspaceId: string): Promise<{
-    nodes: Array<{ id: string; type: string; label: string; value: number; metadata: any }>;
-    edges: Array<{ source: string; target: string; type: string; weight: number }>;
-    stats: Record<string, number>;
-  }> {
-    return this.request(`/knowledge-graph/${workspaceId}`);
+  async getKnowledgeGraph(
+    workspaceId: string,
+    filters?: Partial<KnowledgeGraphFilters>
+  ): Promise<KnowledgeGraph> {
+    const queryParams = new URLSearchParams();
+    for (const nodeType of filters?.nodeTypes || []) {
+      queryParams.append('node_types', nodeType);
+    }
+    for (const edgeType of filters?.edgeTypes || []) {
+      queryParams.append('edge_types', edgeType);
+    }
+    if (filters?.search) {
+      queryParams.append('search', filters.search);
+    }
+    if (typeof filters?.minWeight === 'number') {
+      queryParams.append('min_weight', String(filters.minWeight));
+    }
+    if (typeof filters?.includeIsolated === 'boolean') {
+      queryParams.append('include_isolated', String(filters.includeIsolated));
+    }
+
+    return this.request(
+      `/knowledge-graph/${workspaceId}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`
+    );
   }
 
   // ==================== Auth Additional Endpoints ====================

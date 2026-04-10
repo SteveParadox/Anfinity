@@ -1,4 +1,12 @@
-import type { User, Note, AIInsight, Workspace, KnowledgeNode, KnowledgeLink } from '@/types';
+import type {
+  User,
+  Note,
+  AIInsight,
+  Workspace,
+  KnowledgeGraphNode,
+  KnowledgeGraphEdge,
+  KnowledgeGraph,
+} from '@/types';
 
 export const mockUser: User = {
   id: 'user-1',
@@ -193,9 +201,9 @@ export const mockWorkspaces: Workspace[] = [
   },
 ];
 
-export const generateKnowledgeGraph = (notes: Note[]): { nodes: KnowledgeNode[]; links: KnowledgeLink[] } => {
-  const nodes: KnowledgeNode[] = [];
-  const links: KnowledgeLink[] = [];
+export const generateKnowledgeGraph = (notes: Note[]): KnowledgeGraph => {
+  const nodes: KnowledgeGraphNode[] = [];
+  const edges: KnowledgeGraphEdge[] = [];
   const tagMap = new Map<string, { count: number; noteIds: string[] }>();
 
   // Extract all tags and their frequencies
@@ -231,11 +239,14 @@ export const generateKnowledgeGraph = (notes: Note[]): { nodes: KnowledgeNode[];
   tagMap.forEach((data, tag) => {
     nodes.push({
       id: `tag-${tag}`,
-      name: tag,
-      val: Math.sqrt(data.count) * 5 + 5,
-      color: categoryColors[tag] || '#94a3b8',
-      category: tag,
-      noteIds: data.noteIds,
+      type: 'tag',
+      label: tag,
+      value: Math.sqrt(data.count) * 5 + 5,
+      metadata: {
+        note_ids: data.noteIds,
+        display_color: categoryColors[tag] || '#94a3b8',
+        tag_source: 'mock',
+      },
     });
   });
 
@@ -243,22 +254,29 @@ export const generateKnowledgeGraph = (notes: Note[]): { nodes: KnowledgeNode[];
   notes.forEach(note => {
     nodes.push({
       id: note.id,
-      name: note.title.length > 30 ? note.title.substring(0, 30) + '...' : note.title,
-      val: 8,
-      color: '#e2e8f0',
-      category: 'note',
-      noteIds: [note.id],
+      type: 'note',
+      label: note.title.length > 30 ? note.title.substring(0, 30) + '...' : note.title,
+      value: 8,
+      metadata: {
+        note_id: note.id,
+        note_ids: [note.id],
+        note_type: note.type,
+        tags: note.tags,
+        display_color: '#e2e8f0',
+      },
     });
   });
 
   // Create links between notes and their tags
   notes.forEach(note => {
     note.tags.forEach(tag => {
-      links.push({
+      edges.push({
+        id: `edge-${note.id}-tag-${tag}`,
         source: note.id,
         target: `tag-${tag}`,
-        value: 1,
-        type: 'related',
+        weight: 1,
+        type: 'note_has_tag',
+        metadata: {},
       });
     });
   });
@@ -278,11 +296,13 @@ export const generateKnowledgeGraph = (notes: Note[]): { nodes: KnowledgeNode[];
   tagPairs.forEach((count, pair) => {
     const [tag1, tag2] = pair.split('-');
     if (count >= 1) {
-      links.push({
+      edges.push({
+        id: `edge-tag-${tag1}-${tag2}`,
         source: `tag-${tag1}`,
         target: `tag-${tag2}`,
-        value: count,
-        type: 'similar',
+        weight: count,
+        type: 'tag_co_occurs_with_tag',
+        metadata: {},
       });
     }
   });
@@ -290,14 +310,32 @@ export const generateKnowledgeGraph = (notes: Note[]): { nodes: KnowledgeNode[];
   // Create links from note connections
   notes.forEach(note => {
     note.connections.forEach(targetId => {
-      links.push({
+      edges.push({
+        id: `edge-${note.id}-${targetId}`,
         source: note.id,
         target: targetId,
-        value: 2,
-        type: 'references',
+        weight: 2,
+        type: 'note_links_note',
+        metadata: {},
       });
     });
   });
 
-  return { nodes, links };
+  return {
+    nodes,
+    edges,
+    stats: {
+      total_nodes: nodes.length,
+      total_edges: edges.length,
+      node_types: {
+        note: nodes.filter((node) => node.type === 'note').length,
+        tag: nodes.filter((node) => node.type === 'tag').length,
+      },
+      edge_types: {
+        note_has_tag: edges.filter((edge) => edge.type === 'note_has_tag').length,
+        note_links_note: edges.filter((edge) => edge.type === 'note_links_note').length,
+        tag_co_occurs_with_tag: edges.filter((edge) => edge.type === 'tag_co_occurs_with_tag').length,
+      },
+    },
+  };
 };

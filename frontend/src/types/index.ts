@@ -27,25 +27,70 @@ export interface Note {
   embedding?: string;
 }
 
-export interface KnowledgeNode {
-  id: string;
-  name: string;
-  val: number;
-  color: string;
-  category: string;
-  noteIds: string[];
+export type GraphNodeType = 'workspace' | 'note' | 'entity' | 'tag';
+
+export type GraphEdgeType =
+  | 'workspace_contains_note'
+  | 'note_mentions_entity'
+  | 'note_has_tag'
+  | 'note_links_note'
+  | 'note_related_note'
+  | 'entity_co_occurs_with_entity'
+  | 'tag_co_occurs_with_tag';
+
+export interface KnowledgeGraphNodeMetadata {
+  workspace_id?: string;
+  note_id?: string;
+  note_ids: string[];
+  note_type?: string;
+  tags?: string[];
+  updated_at?: string | null;
+  entity_type?: string;
+  tag_source?: string;
+  [key: string]: unknown;
 }
 
-export interface KnowledgeLink {
+export interface KnowledgeGraphEdgeMetadata {
+  shared_signals?: number;
+  [key: string]: unknown;
+}
+
+export interface KnowledgeGraphNode {
+  id: string;
+  type: GraphNodeType;
+  label: string;
+  value: number;
+  metadata: KnowledgeGraphNodeMetadata;
+}
+
+export interface KnowledgeGraphEdge {
+  id: string;
   source: string;
   target: string;
-  value: number;
-  type: 'related' | 'similar' | 'references';
+  type: GraphEdgeType;
+  weight: number;
+  metadata: KnowledgeGraphEdgeMetadata;
+}
+
+export interface KnowledgeGraphStats {
+  total_nodes: number;
+  total_edges: number;
+  node_types: Partial<Record<GraphNodeType, number>>;
+  edge_types: Partial<Record<GraphEdgeType, number>>;
+}
+
+export interface KnowledgeGraphFilters {
+  nodeTypes: GraphNodeType[];
+  edgeTypes: GraphEdgeType[];
+  search: string;
+  minWeight: number;
+  includeIsolated: boolean;
 }
 
 export interface KnowledgeGraph {
-  nodes: KnowledgeNode[];
-  links: KnowledgeLink[];
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+  stats: KnowledgeGraphStats;
 }
 
 export interface Workspace {
