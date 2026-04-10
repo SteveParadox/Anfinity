@@ -68,6 +68,12 @@ export interface KnowledgeGraphNodeMetadata {
   updated_at?: string | null;
   entity_type?: string;
   tag_source?: string;
+  cluster_id?: string;
+  cluster_key?: string;
+  cluster_label?: string;
+  cluster_description?: string;
+  cluster_score?: number;
+  cluster_rank?: number;
   [key: string]: unknown;
 }
 
@@ -96,6 +102,7 @@ export interface KnowledgeGraphEdge {
 export interface KnowledgeGraphStats {
   total_nodes: number;
   total_edges: number;
+  total_clusters: number;
   node_types: Partial<Record<GraphNodeType, number>>;
   edge_types: Partial<Record<GraphEdgeType, number>>;
 }
@@ -111,7 +118,39 @@ export interface KnowledgeGraphFilters {
 export interface KnowledgeGraph {
   nodes: KnowledgeGraphNode[];
   edges: KnowledgeGraphEdge[];
+  clusters: KnowledgeGraphCluster[];
   stats: KnowledgeGraphStats;
+}
+
+export interface KnowledgeGraphCluster {
+  id: string;
+  key: string;
+  label: string;
+  description: string;
+  importance: number;
+  node_ids: string[];
+  node_count: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface GraphClusterInputNode {
+  id: string;
+  type: GraphNodeType;
+  label: string;
+  value: number;
+  metadata: Record<string, unknown>;
+  embedding: number[];
+}
+
+export interface GraphClusterInput {
+  workspace_id: string;
+  nodes: GraphClusterInputNode[];
+  stats: {
+    total_nodes: number;
+    embeddable_nodes: number;
+    embedding_dimension: number;
+    [key: string]: unknown;
+  };
 }
 
 export interface Workspace {

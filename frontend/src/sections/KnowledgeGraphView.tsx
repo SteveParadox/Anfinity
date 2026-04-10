@@ -3,32 +3,34 @@ import { motion } from 'framer-motion';
 import { ZoomIn, ZoomOut, Maximize2, Search, X } from 'lucide-react';
 import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation } from 'd3-force-3d';
 
-import type { KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphFilters, KnowledgeGraphNode, Note } from '@/types';
+import type { KnowledgeGraph, KnowledgeGraphCluster, KnowledgeGraphEdge, KnowledgeGraphFilters, KnowledgeGraphNode, Note } from '@/types';
 import { generateKnowledgeGraph } from '@/lib/mockData';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
 
 interface KnowledgeGraphViewProps { notes?: Note[]; }
-interface RenderNode extends KnowledgeGraphNode { index?: number; x: number; y: number; vx: number; vy: number; fx?: number | null; fy?: number | null; radius: number; importance: number; clusterKey: KnowledgeGraphNode['type']; }
+interface RenderNode extends KnowledgeGraphNode { index?: number; x: number; y: number; vx: number; vy: number; fx?: number | null; fy?: number | null; radius: number; importance: number; clusterKey: string; }
 interface RenderEdge extends Omit<KnowledgeGraphEdge, 'source' | 'target'> { source: string | RenderNode; target: string | RenderNode; idealDistance: number; pairIndex: number; pairCount: number; }
 
 const TT = { inkBlack: '#0A0A0A', inkDeep: '#111111', inkRaised: '#1A1A1A', inkBorder: '#252525', inkMid: '#3A3A3A', inkMuted: '#5A5A5A', inkSubtle: '#888888', snow: '#F5F5F5', yolk: '#F5E642', error: '#FF4545', fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif", fontMono: "'IBM Plex Mono', monospace" };
-const EMPTY_GRAPH: KnowledgeGraph = { nodes: [], edges: [], stats: { total_nodes: 0, total_edges: 0, node_types: {}, edge_types: {} } };
+const EMPTY_GRAPH: KnowledgeGraph = { nodes: [], edges: [], clusters: [], stats: { total_nodes: 0, total_edges: 0, total_clusters: 0, node_types: {}, edge_types: {} } };
 const NODE_COLORS: Record<KnowledgeGraphNode['type'] | 'default', string> = { workspace: '#60A5FA', note: '#9CA3AF', entity: '#F5E642', tag: '#FB923C', default: '#5A5A5A' };
 const EDGE_COLORS: Record<KnowledgeGraphEdge['type'], string> = { workspace_contains_note: '#60A5FA', note_mentions_entity: '#F5E642', note_has_tag: '#FB923C', note_links_note: '#9CA3AF', note_related_note: '#F472B6', entity_co_occurs_with_entity: '#34D399', tag_co_occurs_with_tag: '#F97316' };
 const EDGE_DISTANCES: Record<KnowledgeGraphEdge['type'], number> = { workspace_contains_note: 180, note_mentions_entity: 120, note_has_tag: 105, note_links_note: 160, note_related_note: 200, entity_co_occurs_with_entity: 135, tag_co_occurs_with_tag: 125 };
 const LABEL_ZOOM_THRESHOLD: Record<KnowledgeGraphNode['type'], number> = { workspace: 0.8, note: 1.45, entity: 1.05, tag: 0.95 };
-const CLUSTER_POSITIONS: Record<KnowledgeGraphNode['type'], { x: number; y: number }> = { workspace: { x: 0.5, y: 0.18 }, note: { x: 0.28, y: 0.62 }, entity: { x: 0.72, y: 0.34 }, tag: { x: 0.72, y: 0.72 } };
+const BASE_CLUSTER_POSITIONS: Record<KnowledgeGraphNode['type'], { x: number; y: number }> = { workspace: { x: 0.5, y: 0.18 }, note: { x: 0.28, y: 0.62 }, entity: { x: 0.72, y: 0.34 }, tag: { x: 0.72, y: 0.72 } };
 
 function IconBtn({ onClick, children, title }: { onClick: () => void; children: ReactNode; title?: string }) {
   return <button onClick={onClick} title={title} style={{ width: 34, height: 34, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: TT.inkMuted, transition: 'all 0.15s' }} onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = TT.yolk; (e.currentTarget as HTMLElement).style.borderColor = 'rgba(245,230,66,0.3)'; }} onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = TT.inkMuted; (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder; }}>{children}</button>;
 }
+function getNodeClusterKey(node: KnowledgeGraphNode): string { return typeof node.metadata?.cluster_id === 'string' ? node.metadata.cluster_id : typeof node.metadata?.cluster_key === 'string' ? node.metadata.cluster_key : node.type; }
 function getNodeNoteIds(node: KnowledgeGraphNode): string[] { return Array.isArray(node.metadata?.note_ids) ? node.metadata.note_ids.filter((noteId): noteId is string => typeof noteId === 'string') : []; }
 function getNodeColor(node: KnowledgeGraphNode): string { const displayColor = typeof node.metadata?.display_color === 'string' ? node.metadata.display_color : null; return displayColor || NODE_COLORS[node.type] || NODE_COLORS.default; }
 function getNodeRadius(node: KnowledgeGraphNode): number { return Math.max(10, Math.min(26, 9 + node.value * 2.2)); }
 function getNodeDescription(node: KnowledgeGraphNode): string { switch (node.type) { case 'workspace': return 'Workspace anchor for the graph cluster.'; case 'note': return `Note node${node.metadata?.note_type ? ` (${node.metadata.note_type})` : ''} grounded in your knowledge base.`; case 'entity': return 'Extracted entity grouped by the notes that mention it.'; case 'tag': return 'Tag node synced from note tags and inline hashtags.'; default: return 'Knowledge graph node.'; } }
 function canonicalPairKey(sourceId: string, targetId: string): string { return sourceId < targetId ? `${sourceId}::${targetId}` : `${targetId}::${sourceId}`; }
-function createClusterForce(clusterCenters: Record<KnowledgeGraphNode['type'], { x: number; y: number }>, strength = 0.1) { let nodes: RenderNode[] = []; const force = (alpha: number) => { for (const node of nodes) { const target = clusterCenters[node.clusterKey] || clusterCenters.note; const nodeStrength = strength * alpha * (node.type === 'workspace' ? 0.45 : 1); node.vx += (target.x - node.x) * nodeStrength; node.vy += (target.y - node.y) * nodeStrength; } }; force.initialize = (initialNodes: RenderNode[]) => { nodes = initialNodes; }; return force; }
+function createClusterForce(clusterCenters: Record<string, { x: number; y: number }>, strength = 0.1) { let nodes: RenderNode[] = []; const centerKeys = Object.keys(clusterCenters); const fallbackTarget = clusterCenters[centerKeys[0] || 'default'] || { x: 0, y: 0 }; const force = (alpha: number) => { for (const node of nodes) { const target = clusterCenters[node.clusterKey] || clusterCenters[node.type] || fallbackTarget; const nodeStrength = strength * alpha * (node.type === 'workspace' ? 0.45 : 1); node.vx += (target.x - node.x) * nodeStrength; node.vy += (target.y - node.y) * nodeStrength; } }; force.initialize = (initialNodes: RenderNode[]) => { nodes = initialNodes; }; return force; }
+function getClusterColor(clusterKey: string, fallbackColor: string): string { let hash = 0; for (let index = 0; index < clusterKey.length; index += 1) hash = ((hash << 5) - hash) + clusterKey.charCodeAt(index); const hue = Math.abs(hash) % 360; return `hsl(${hue} 72% 58%)`; }
 function createConvexHull(points: Array<{ x: number; y: number }>): Array<{ x: number; y: number }> { if (points.length <= 1) return points; const sorted = [...points].sort((left, right) => (left.x === right.x ? left.y - right.y : left.x - right.x)); const cross = (origin: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) => (a.x - origin.x) * (b.y - origin.y) - (a.y - origin.y) * (b.x - origin.x); const lower: Array<{ x: number; y: number }> = []; for (const point of sorted) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) lower.pop(); lower.push(point); } const upper: Array<{ x: number; y: number }> = []; for (const point of [...sorted].reverse()) { while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) upper.pop(); upper.push(point); } lower.pop(); upper.pop(); return [...lower, ...upper]; }
 function buildHullPath(nodes: RenderNode[]): string | null { if (!nodes.length) return null; const expandedPoints = nodes.flatMap((node) => { const samples = 10; const padding = node.type === 'workspace' ? 28 : 18; const radius = node.radius + padding; return Array.from({ length: samples }, (_, index) => { const angle = (Math.PI * 2 * index) / samples; return { x: node.x + Math.cos(angle) * radius, y: node.y + Math.sin(angle) * radius }; }); }); const hull = createConvexHull(expandedPoints); return hull.length < 3 ? null : `M ${hull.map((point) => `${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(' L ')} Z`; }
 function resolveNode(nodeRef: string | RenderNode, nodeLookup: Map<string, RenderNode>): RenderNode | null { return typeof nodeRef === 'string' ? nodeLookup.get(nodeRef) || null : nodeRef; }
@@ -103,6 +105,20 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
     return (graphData.edges || []).filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
   }, [graphData.edges, filteredNodes]);
 
+  const filteredClusters = useMemo(() => {
+    const nodeIds = new Set(filteredNodes.map((node) => node.id));
+    return (graphData.clusters || []).filter((cluster) => cluster.node_ids.some((nodeId) => nodeIds.has(nodeId)));
+  }, [graphData.clusters, filteredNodes]);
+
+  const clusterLookup = useMemo(() => {
+    const lookup = new Map<string, KnowledgeGraphCluster>();
+    for (const cluster of filteredClusters) {
+      lookup.set(cluster.id, cluster);
+      lookup.set(cluster.key, cluster);
+    }
+    return lookup;
+  }, [filteredClusters]);
+
   useEffect(() => {
     const previousPositions = new Map(layoutRef.current.nodes.map((node) => [node.id, { x: node.x, y: node.y }]));
     const width = viewportSize.width;
@@ -121,10 +137,32 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
       return undefined;
     }
 
+    const orderedClusterKeys = filteredClusters.length
+      ? filteredClusters.map((cluster) => cluster.id || cluster.key)
+      : Array.from(new Set(filteredNodes.map((node) => getNodeClusterKey(node))));
+    const clusterCenters = orderedClusterKeys.reduce<Record<string, { x: number; y: number }>>((accumulator, clusterKey, index) => {
+      const cluster = clusterLookup.get(clusterKey);
+      if (cluster) {
+        const angle = (Math.PI * 2 * index) / Math.max(orderedClusterKeys.length, 1);
+        const radiusX = Math.max(120, width * 0.26);
+        const radiusY = Math.max(90, height * 0.22);
+        accumulator[clusterKey] = {
+          x: width / 2 + Math.cos(angle) * radiusX,
+          y: height / 2 + Math.sin(angle) * radiusY,
+        };
+      } else {
+        const nodeTypeKey = clusterKey as KnowledgeGraphNode['type'];
+        const ratio = BASE_CLUSTER_POSITIONS[nodeTypeKey] || BASE_CLUSTER_POSITIONS.note;
+        accumulator[clusterKey] = { x: width * ratio.x, y: height * ratio.y };
+      }
+      return accumulator;
+    }, {});
+
     const renderNodes: RenderNode[] = filteredNodes.map((node, index) => {
-      const clusterAnchor = CLUSTER_POSITIONS[node.type] || CLUSTER_POSITIONS.note;
+      const clusterKey = getNodeClusterKey(node);
+      const clusterAnchor = clusterCenters[clusterKey] || { x: width / 2, y: height / 2 };
       const previous = previousPositions.get(node.id);
-      return { ...node, x: previous?.x ?? width * clusterAnchor.x + ((index % 5) - 2) * 24, y: previous?.y ?? height * clusterAnchor.y + ((index % 7) - 3) * 18, vx: 0, vy: 0, radius: getNodeRadius(node), importance: Math.max(1, node.value), clusterKey: node.type };
+      return { ...node, x: previous?.x ?? clusterAnchor.x + ((index % 5) - 2) * 24, y: previous?.y ?? clusterAnchor.y + ((index % 7) - 3) * 18, vx: 0, vy: 0, radius: getNodeRadius(node), importance: Math.max(1, node.value), clusterKey };
     });
 
     const pairTotals = new Map<string, number>();
@@ -137,7 +175,6 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
       return { ...edge, source: edge.source, target: edge.target, idealDistance: EDGE_DISTANCES[edge.type] || 150, pairIndex: nextPairIndex, pairCount: pairTotals.get(key) || 1 };
     });
 
-    const clusterCenters = Object.fromEntries(Object.entries(CLUSTER_POSITIONS).map(([key, ratio]) => [key, { x: width * ratio.x, y: height * ratio.y }])) as Record<KnowledgeGraphNode['type'], { x: number; y: number }>;
     layoutRef.current = { nodes: renderNodes, edges: renderEdges };
 
     const simulation = forceSimulation(renderNodes, 2)
@@ -172,7 +209,7 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
         animationFrameRef.current = null;
       }
     };
-  }, [filteredNodes, filteredEdges, viewportSize]);
+  }, [clusterLookup, filteredClusters, filteredNodes, filteredEdges, viewportSize]);
 
   useEffect(() => {
     if (!selectedNode) return;
@@ -192,18 +229,24 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
 
   const clusterHulls = useMemo(() => {
     const grouped = renderedNodes.reduce<Record<string, RenderNode[]>>((accumulator, node) => {
-      accumulator[node.type] = accumulator[node.type] || [];
-      accumulator[node.type].push(node);
+      accumulator[node.clusterKey] = accumulator[node.clusterKey] || [];
+      accumulator[node.clusterKey]?.push(node);
       return accumulator;
     }, {});
-    return Object.entries(grouped).map(([type, nodes]) => ({ type: type as KnowledgeGraphNode['type'], color: NODE_COLORS[type as KnowledgeGraphNode['type']] || NODE_COLORS.default, path: buildHullPath(nodes) })).filter((hull) => Boolean(hull.path));
-  }, [renderedNodes]);
+    return Object.entries(grouped).map(([clusterKey, nodes]) => {
+      const cluster = clusterLookup.get(clusterKey);
+      const label = cluster?.label || clusterKey;
+      const color = cluster ? getClusterColor(clusterKey, getNodeColor(nodes[0]!)) : getNodeColor(nodes[0]!);
+      const center = nodes.reduce((accumulator, node) => ({ x: accumulator.x + node.x / nodes.length, y: accumulator.y + node.y / nodes.length }), { x: 0, y: 0 });
+      return { key: clusterKey, label, description: cluster?.description || '', color, path: buildHullPath(nodes), center };
+    }).filter((hull) => Boolean(hull.path));
+  }, [clusterLookup, renderedNodes]);
 
   const stats = [
     { label: 'Nodes', value: graphData.stats.total_nodes || filteredNodes.length },
     { label: 'Connections', value: graphData.stats.total_edges || filteredEdges.length },
+    { label: 'Clusters', value: graphData.stats.total_clusters || filteredClusters.length },
     { label: 'Notes', value: graphData.stats.node_types.note || 0 },
-    { label: 'Tags', value: graphData.stats.node_types.tag || 0 },
   ];
 
   const handleMouseDown = (event: React.MouseEvent<SVGSVGElement>) => {
@@ -245,9 +288,10 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
           <IconBtn onClick={() => setZoom((current) => Math.max(current / 1.2, 0.35))} title="Zoom out"><ZoomOut size={14} /></IconBtn>
           <IconBtn onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }} title="Reset"><Maximize2 size={14} /></IconBtn>
         </div>
-        <div style={{ position: 'absolute', bottom: 12, left: 12, background: 'rgba(10,10,10,0.85)', border: `1px solid ${TT.inkBorder}`, borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '10px 14px', zIndex: 10 }}>
+        <div style={{ position: 'absolute', bottom: 12, left: 12, background: 'rgba(10,10,10,0.85)', border: `1px solid ${TT.inkBorder}`, borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '10px 14px', zIndex: 10, maxWidth: 260 }}>
           <div style={{ fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>Legend</div>
-          {[{ label: 'Workspace Hull', color: NODE_COLORS.workspace }, { label: 'Note Links', color: EDGE_COLORS.note_links_note }, { label: 'Entities', color: NODE_COLORS.entity }, { label: 'Tags', color: NODE_COLORS.tag }].map(({ label, color }) => <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}><div style={{ width: 7, height: 7, borderRadius: '50%', background: color, boxShadow: `0 0 5px ${color}60` }} /><span style={{ fontSize: 9.5, letterSpacing: '0.04em', color: TT.inkMuted }}>{label}</span></div>)}
+          {[{ label: 'Semantic Clusters', color: TT.yolk }, { label: 'Note Links', color: EDGE_COLORS.note_links_note }, { label: 'Entities', color: NODE_COLORS.entity }, { label: 'Tags', color: NODE_COLORS.tag }].map(({ label, color }) => <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}><div style={{ width: 7, height: 7, borderRadius: '50%', background: color, boxShadow: `0 0 5px ${color}60` }} /><span style={{ fontSize: 9.5, letterSpacing: '0.04em', color: TT.inkMuted }}>{label}</span></div>)}
+          {filteredClusters.slice(0, 3).map((cluster) => <div key={cluster.id} style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${TT.inkBorder}` }}><div style={{ fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.snow }}>{cluster.label}</div><div style={{ fontSize: 9, lineHeight: 1.4, color: TT.inkMuted, marginTop: 3 }}>{cluster.description}</div></div>)}
         </div>
         <div style={{ position: 'absolute', top: 12, left: 12, fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.06em', color: TT.inkMid, textTransform: 'uppercase' }}>{Math.round(zoom * 100)}%</div>
         <svg style={{ width: '100%', height: '100%', cursor: isDragging ? 'grabbing' : 'grab' }} viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}>
@@ -259,7 +303,7 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
             {Object.entries(EDGE_COLORS).map(([type, color]) => <marker key={type} id={`arrow-${type}`} markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill={color} /></marker>)}
           </defs>
           <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
-            {clusterHulls.map((hull) => <path key={`hull-${hull.type}`} d={hull.path || ''} fill={hull.color} opacity={0.08} stroke={hull.color} strokeWidth={1.2} strokeOpacity={0.28} />)}
+            {clusterHulls.map((hull) => <g key={`hull-${hull.key}`}><path d={hull.path || ''} fill={hull.color} opacity={0.08} stroke={hull.color} strokeWidth={1.2} strokeOpacity={0.28} />{zoom >= 0.75 && <text x={hull.center.x} y={hull.center.y} textAnchor="middle" fill={hull.color} fontSize={10} fontFamily={TT.fontMono} letterSpacing="0.08em" style={{ pointerEvents: 'none', textTransform: 'uppercase' }}>{hull.label}</text>}</g>)}
             {renderedEdges.map((edge) => {
               const path = buildArcPath(edge, nodeLookup);
               if (!path) return null;
@@ -288,14 +332,16 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
       {selectedNode && (
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} style={{ marginTop: 12, background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '18px 20px' }}>
           <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <div style={{ width: 10, height: 10, borderRadius: '50%', background: getNodeColor(selectedNode), boxShadow: `0 0 8px ${getNodeColor(selectedNode)}80` }} />
-              <span style={{ fontFamily: TT.fontDisplay, fontSize: 22, letterSpacing: '0.06em', color: TT.snow }}>{selectedNode.label.toUpperCase()}</span>
-              <span style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '2px 7px', background: 'rgba(245,230,66,0.08)', color: TT.yolk, border: '1px solid rgba(245,230,66,0.2)', borderRadius: 2 }}>{getNodeNoteIds(selectedNode).length} notes</span>
-            </div>
-            <button onClick={() => setSelectedNode(null)} style={{ background: 'none', border: `1px solid ${TT.inkBorder}`, borderRadius: 2, cursor: 'pointer', padding: '4px 6px', color: TT.inkMuted, transition: 'all 0.15s' }} onMouseEnter={(event) => { (event.currentTarget as HTMLElement).style.color = TT.error; (event.currentTarget as HTMLElement).style.borderColor = 'rgba(255,69,69,0.3)'; }} onMouseLeave={(event) => { (event.currentTarget as HTMLElement).style.color = TT.inkMuted; (event.currentTarget as HTMLElement).style.borderColor = TT.inkBorder; }}><X size={12} /></button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ width: 10, height: 10, borderRadius: '50%', background: getNodeColor(selectedNode), boxShadow: `0 0 8px ${getNodeColor(selectedNode)}80` }} />
+            <span style={{ fontFamily: TT.fontDisplay, fontSize: 22, letterSpacing: '0.06em', color: TT.snow }}>{selectedNode.label.toUpperCase()}</span>
+            <span style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '2px 7px', background: 'rgba(245,230,66,0.08)', color: TT.yolk, border: '1px solid rgba(245,230,66,0.2)', borderRadius: 2 }}>{getNodeNoteIds(selectedNode).length} notes</span>
+            {typeof selectedNode.metadata?.cluster_label === 'string' && <span style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '2px 7px', background: 'rgba(255,255,255,0.05)', color: TT.snow, border: `1px solid ${TT.inkBorder}`, borderRadius: 2 }}>{selectedNode.metadata.cluster_label}</span>}
+          </div>
+          <button onClick={() => setSelectedNode(null)} style={{ background: 'none', border: `1px solid ${TT.inkBorder}`, borderRadius: 2, cursor: 'pointer', padding: '4px 6px', color: TT.inkMuted, transition: 'all 0.15s' }} onMouseEnter={(event) => { (event.currentTarget as HTMLElement).style.color = TT.error; (event.currentTarget as HTMLElement).style.borderColor = 'rgba(255,69,69,0.3)'; }} onMouseLeave={(event) => { (event.currentTarget as HTMLElement).style.color = TT.inkMuted; (event.currentTarget as HTMLElement).style.borderColor = TT.inkBorder; }}><X size={12} /></button>
           </div>
           <p style={{ fontSize: 10.5, letterSpacing: '0.04em', color: TT.inkMuted, marginBottom: 14 }}>{getNodeDescription(selectedNode)}</p>
+          {typeof selectedNode.metadata?.cluster_description === 'string' && <p style={{ fontSize: 10, letterSpacing: '0.04em', color: TT.snow, marginBottom: 14 }}>{selectedNode.metadata.cluster_description}</p>}
           {connectedNotes.length > 0 && <>
             <div style={{ fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>Connected Notes</div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
