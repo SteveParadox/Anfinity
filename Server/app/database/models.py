@@ -50,6 +50,27 @@ class WorkspaceRole(str, PyEnum):
     VIEWER = "viewer"    # Read-only access
 
 
+class GraphNodeType(str, PyEnum):
+    """Knowledge graph node types."""
+
+    WORKSPACE = "workspace"
+    NOTE = "note"
+    ENTITY = "entity"
+    TAG = "tag"
+
+
+class GraphEdgeType(str, PyEnum):
+    """Knowledge graph edge types."""
+
+    WORKSPACE_CONTAINS_NOTE = "workspace_contains_note"
+    NOTE_MENTIONS_ENTITY = "note_mentions_entity"
+    NOTE_HAS_TAG = "note_has_tag"
+    NOTE_LINKS_NOTE = "note_links_note"
+    NOTE_RELATED_NOTE = "note_related_note"
+    ENTITY_CO_OCCURS_WITH_ENTITY = "entity_co_occurs_with_entity"
+    TAG_CO_OCCURS_WITH_TAG = "tag_co_occurs_with_tag"
+
+
 class Workspace(Base):
     """Workspace model for multi-tenancy."""
     __tablename__ = "workspaces"
@@ -460,6 +481,90 @@ class Note(Base):
         Index('idx_note_workspace', 'workspace_id', 'created_at'),
         Index('idx_note_user', 'user_id', 'updated_at'),
         Index('idx_note_type', 'note_type'),
+    )
+
+
+class NoteConnectionSuggestion(Base):
+    """Suggested note-to-note connection derived from similarity."""
+
+    __tablename__ = "note_connection_suggestions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False, index=True)
+    suggested_note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    similarity_score = Column(Float, nullable=False)
+    reason = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)  # pending | confirmed | dismissed
+    suggestion_metadata = Column("metadata", JSONB, default=dict)
+
+    responded_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    responded_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    source_note = relationship("Note", foreign_keys=[source_note_id], lazy="joined")
+    suggested_note = relationship("Note", foreign_keys=[suggested_note_id], lazy="joined")
+    responder = relationship("User", foreign_keys=[responded_by], lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "source_note_id", "suggested_note_id", name="uq_note_connection_suggestion_pair"),
+        Index("idx_note_connection_suggestions_source_status", "source_note_id", "status", "updated_at"),
+        Index("idx_note_connection_suggestions_workspace_status", "workspace_id", "status", "created_at"),
+    )
+
+
+class GraphNode(Base):
+    """Persisted knowledge-graph node."""
+
+    __tablename__ = "graph_nodes"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    node_type = Column(Enum(GraphNodeType), nullable=False, index=True)
+    external_id = Column(String(255), nullable=False)
+    label = Column(String(500), nullable=False)
+    normalized_label = Column(String(500), nullable=False, index=True)
+    weight = Column(Float, nullable=False, default=1.0)
+    node_metadata = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "node_type", "external_id", name="uq_graph_node_workspace_type_external"),
+        Index("idx_graph_node_workspace_type", "workspace_id", "node_type"),
+        Index("idx_graph_node_workspace_label", "workspace_id", "normalized_label"),
+    )
+
+
+class GraphEdge(Base):
+    """Persisted knowledge-graph edge."""
+
+    __tablename__ = "graph_edges"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    edge_type = Column(Enum(GraphEdgeType), nullable=False, index=True)
+    source_node_id = Column(UUID(as_uuid=True), ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    target_node_id = Column(UUID(as_uuid=True), ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    weight = Column(Float, nullable=False, default=1.0)
+    edge_metadata = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "edge_type",
+            "source_node_id",
+            "target_node_id",
+            name="uq_graph_edge_workspace_type_pair",
+        ),
+        Index("idx_graph_edge_workspace_type", "workspace_id", "edge_type"),
+        Index("idx_graph_edge_workspace_source", "workspace_id", "source_node_id"),
+        Index("idx_graph_edge_workspace_target", "workspace_id", "target_node_id"),
     )
 
 
