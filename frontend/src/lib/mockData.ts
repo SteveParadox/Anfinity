@@ -324,9 +324,11 @@ export const generateKnowledgeGraph = (notes: Note[]): KnowledgeGraph => {
   return {
     nodes,
     edges,
+    clusters: [],
     stats: {
       total_nodes: nodes.length,
       total_edges: edges.length,
+      total_clusters: 0,
       node_types: {
         note: nodes.filter((node) => node.type === 'note').length,
         tag: nodes.filter((node) => node.type === 'tag').length,
