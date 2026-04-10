@@ -98,6 +98,7 @@ try:
     from app.tasks import dlq as dlq_tasks
     from app.tasks import note_embeddings as note_embeddings_tasks
     from app.tasks import note_summaries as note_summaries_tasks
+    from app.tasks import connection_suggestions as connection_suggestions_tasks
 except ImportError as e:
     import logging
     logger = logging.getLogger(__name__)
