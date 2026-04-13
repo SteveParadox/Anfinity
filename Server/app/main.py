@@ -4,7 +4,7 @@ from typing import Optional
 import time
 import logging
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -169,6 +169,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         detail="Request validation failed",
         code="VALIDATION_ERROR",
         metadata={"errors": [{"field": str(err["loc"]), "message": err["msg"]} for err in exc.errors()]}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with a consistent JSON envelope."""
+    logger.warning(f"HTTP exception on {request.method} {request.url.path}: {exc.status_code} {exc.detail}")
+    return ErrorResponse(
+        status_code=exc.status_code,
+        detail=str(exc.detail),
+        code="HTTP_ERROR",
+        metadata={"headers": dict(exc.headers or {})} if exc.headers else None,
     )
 
 @app.exception_handler(Exception)
