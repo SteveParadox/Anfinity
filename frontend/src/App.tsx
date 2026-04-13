@@ -19,6 +19,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from './contexts/AuthContext';
 import { Sidebar } from './components/Sidebar';
+import { WorkspaceSwitcher } from './components/WorkspaceSwitcher';
 import { Dashboard } from './sections/Dashboard';
 import { KnowledgeGraphView } from './sections/KnowledgeGraphView';
 import { NotesView } from './sections/NotesView';
@@ -144,6 +145,8 @@ function App() {
     setCurrentView(view as View);
     setMobileSidebarOpen(false);
   }, []);
+
+  const canOpenWorkspaceScopedChat = Boolean(currentWorkspaceId);
 
   // ── View registry (replaces large switch) ──────────────────────────────
   const viewRegistry = useMemo<Partial<Record<View, React.ReactNode>>>(() => {
@@ -288,7 +291,7 @@ function App() {
           }}
         >
           {/* Left — hamburger + breadcrumb */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, minWidth: 0 }}>
             {isMobile && (
               <button
                 onClick={() => setMobileSidebarOpen(true)}
@@ -344,6 +347,10 @@ function App() {
                 {currentView}
               </span>
             </div>
+
+            <div style={{ marginLeft: 6, minWidth: 0 }}>
+              <WorkspaceSwitcher compact={isSmall} />
+            </div>
           </div>
 
           {/* Right — insights toggle + user info */}
@@ -371,25 +378,30 @@ function App() {
 
             {/* Ask Past Self button */}
             <button
-              onClick={() => setChatOpen((o) => !o)}
+              onClick={() => {
+                if (!canOpenWorkspaceScopedChat) return;
+                setChatOpen((o) => !o);
+              }}
               aria-pressed={chatOpen}
               aria-label="Ask Your Past Self"
               title="Ask Your Past Self - Chat with your knowledge base"
+              disabled={!canOpenWorkspaceScopedChat}
               style={{
                 height: 32,
                 padding: '0 12px',
                 background: chatOpen ? 'rgba(139,92,246,0.1)' : 'transparent',
                 border: `1px solid ${chatOpen ? 'rgba(139,92,246,0.3)' : TT.inkBorder}`,
                 borderRadius: 3,
-                cursor: 'pointer',
+                cursor: canOpenWorkspaceScopedChat ? 'pointer' : 'not-allowed',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 7,
                 transition: 'all 0.15s',
                 color: chatOpen ? '#8B5CF6' : TT.inkMuted,
+                opacity: canOpenWorkspaceScopedChat ? 1 : 0.45,
               }}
               onMouseEnter={(e) => {
-                if (!chatOpen) {
+                if (!chatOpen && canOpenWorkspaceScopedChat) {
                   e.currentTarget.style.borderColor = 'rgba(139,92,246,0.25)';
                   e.currentTarget.style.color = '#8B5CF6';
                 }

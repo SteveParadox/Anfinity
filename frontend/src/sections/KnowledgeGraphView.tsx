@@ -71,24 +71,51 @@ export function KnowledgeGraphView({ notes = [] }: KnowledgeGraphViewProps) {
   useEffect(() => {
     if (!workspaceId) {
       setGraphData(generateKnowledgeGraph(notes));
-      return;
+      return undefined;
     }
+
     let isMounted = true;
+    const abortController = new AbortController();
+
     const loadGraph = async () => {
       try {
         setIsLoading(true);
-        const response = await api.getKnowledgeGraph(workspaceId, { nodeTypes: filters.nodeTypes, edgeTypes: filters.edgeTypes, minWeight: filters.minWeight, includeIsolated: filters.includeIsolated });
+        const response = await api.getKnowledgeGraph(
+          workspaceId,
+          {
+            nodeTypes: filters.nodeTypes,
+            edgeTypes: filters.edgeTypes,
+            minWeight: filters.minWeight,
+            includeIsolated: filters.includeIsolated,
+          },
+          {
+            signal: abortController.signal,
+            retries: false,
+          },
+        );
         if (isMounted) setGraphData(response);
       } catch (error) {
+        if (abortController.signal.aborted) return;
         console.error('Failed to load knowledge graph:', error);
-        if (isMounted) setGraphData(generateKnowledgeGraph(notes));
+        if (isMounted) {
+          setGraphData((current) => current.nodes.length ? current : generateKnowledgeGraph(notes));
+        }
       } finally {
-        if (isMounted) setIsLoading(false);
+        if (isMounted && !abortController.signal.aborted) setIsLoading(false);
       }
     };
+
     loadGraph();
-    return () => { isMounted = false; };
-  }, [workspaceId, notes, filters.nodeTypes, filters.edgeTypes, filters.minWeight, filters.includeIsolated]);
+    return () => {
+      isMounted = false;
+      abortController.abort();
+    };
+  }, [workspaceId, filters.nodeTypes, filters.edgeTypes, filters.minWeight, filters.includeIsolated]);
+
+  useEffect(() => {
+    if (workspaceId) return;
+    setGraphData(generateKnowledgeGraph(notes));
+  }, [workspaceId, notes]);
 
   const filteredNodes = useMemo(() => {
     const nodes = graphData.nodes || [];

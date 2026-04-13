@@ -203,12 +203,24 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
   
   const authContext = useContext(AuthContext);
   const currentUser = user || authContext?.user;
+  const authWorkspaces = authContext?.workspaces ?? [];
+  const currentWorkspaceId = authContext?.currentWorkspaceId ?? null;
   const refreshAuthWorkspaces = authContext?.refreshWorkspaces;
   const setCurrentWorkspace = authContext?.setCurrentWorkspace;
 
   useEffect(() => {
+    if (authWorkspaces.length > 0) {
+      setWorkspaces(authWorkspaces.map(transformWorkspace));
+      return;
+    }
     loadWorkspaces();
-  }, []);
+  }, [authWorkspaces]);
+
+  useEffect(() => {
+    if (!selectedWorkspace) return;
+    const updatedSelectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspace.id) || null;
+    setSelectedWorkspace(updatedSelectedWorkspace);
+  }, [selectedWorkspace?.id, workspaces]);
 
   useEffect(() => {
     if (selectedWorkspace) {
@@ -305,13 +317,15 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
         description: newWorkspace.description,
       });
       console.log('✅ [WORKSPACE CREATED] New workspace ID:', created.id);
-      await loadWorkspaces();
       if (refreshAuthWorkspaces) {
         await refreshAuthWorkspaces();
+      } else {
+        await loadWorkspaces();
       }
       if (created.id && setCurrentWorkspace) {
         setCurrentWorkspace(created.id);
       }
+      setSelectedWorkspace(transformWorkspace(created));
       setIsCreating(false);
       setNewWorkspace({ name: '', description: '' });
       setError(null);
@@ -364,13 +378,19 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
     try {
       setIsLoading(true);
       console.debug('📡 [API CALL] Calling api.deleteWorkspace()');
+      const fallbackWorkspaceId = workspaces.find((workspace) => workspace.id !== id)?.id ?? null;
       await api.deleteWorkspace(id);
       console.log('✅ [WORKSPACE DELETED] Workspace deleted from backend');
       setWorkspaces(prev => prev.filter(w => w.id !== id));
       if (refreshAuthWorkspaces) {
         await refreshAuthWorkspaces();
+      } else {
+        await loadWorkspaces();
       }
       if (selectedWorkspace?.id === id) setSelectedWorkspace(null);
+      if (currentWorkspaceId === id && fallbackWorkspaceId && setCurrentWorkspace) {
+        setCurrentWorkspace(fallbackWorkspaceId);
+      }
       setError(null);
       console.log('✅ [DELETE WORKSPACE SUCCESS] State updated and workspace removed from list');
     } catch (err) {
