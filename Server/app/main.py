@@ -132,6 +132,17 @@ app.add_middleware(RateLimitMiddleware)
 from app.middleware.security import SecurityHeadersMiddleware
 app.add_middleware(SecurityHeadersMiddleware)
 
+# Add a final outer CORS layer so even handled error responses from inner
+# middleware/routes retain browser-visible CORS headers during local dev.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=settings.CORS_CREDENTIALS,
+    allow_methods=settings.CORS_METHODS,
+    allow_headers=settings.CORS_HEADERS,
+    max_age=3600,
+)
+
 # Standardized error response models
 class ErrorResponse(JSONResponse):
     """Standard error response."""
@@ -253,7 +264,11 @@ async def llm_status():
     status = llm_service.get_status()
     
     # Determine overall health
-    is_healthy = status["openai_available"] or (status["ollama_available"] and status["fallback_enabled"])
+    primary_provider = status["primary_provider"]
+    fallback_provider = "openai" if primary_provider == "ollama" else "ollama"
+    primary_available = bool(status.get(f"{primary_provider}_available"))
+    fallback_available = bool(status.get(f"{fallback_provider}_available"))
+    is_healthy = primary_available or (status["fallback_enabled"] and fallback_available)
     
     return {
         "status": "healthy" if is_healthy else "degraded",
