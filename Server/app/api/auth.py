@@ -1,4 +1,5 @@
 """Authentication API routes."""
+import logging
 from datetime import timedelta
 from typing import Optional, List
 from uuid import UUID
@@ -19,9 +20,11 @@ from app.core.security import (
 )
 from app.core.auth import get_current_user, get_current_active_user
 from app.core.audit import log_audit_event, AuditAction, EntityType
+from app.ingestion.vector_index import vector_index
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 security = HTTPBearer()
+logger = logging.getLogger(__name__)
 
 
 async def get_user_workspaces(user: DBUser, db: AsyncSession) -> List[dict]:
@@ -34,38 +37,27 @@ async def get_user_workspaces(user: DBUser, db: AsyncSession) -> List[dict]:
     Returns:
         List of workspace info with roles
     """
-    # Get owned workspaces
-    owned_result = await db.execute(
-        select(Workspace).where(Workspace.owner_id == user.id)
+    result = await db.execute(
+        select(WorkspaceMember, Workspace)
+        .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
+        .where(WorkspaceMember.user_id == user.id)
+        .order_by(Workspace.created_at.desc())
     )
-    owned_ws = owned_result.scalars().all()
-    
-    # Get member workspaces
-    member_result = await db.execute(
-        select(WorkspaceMember, Workspace).join(Workspace).where(
-            WorkspaceMember.user_id == user.id
-        )
-    )
-    member_records = member_result.all()
-    
+
     workspaces = []
-    
-    # Add owned workspaces as owner
-    for ws in owned_ws:
+    seen_workspace_ids: set[str] = set()
+
+    for member, ws in result.all():
+        workspace_id = str(ws.id)
+        if workspace_id in seen_workspace_ids:
+            continue
+        seen_workspace_ids.add(workspace_id)
         workspaces.append({
-            "id": str(ws.id),
+            "id": workspace_id,
             "name": ws.name,
-            "role": WorkspaceRole.OWNER.value
+            "role": member.role.value if isinstance(member.role, WorkspaceRole) else member.role,
         })
-    
-    # Add member workspaces
-    for member, ws in member_records:
-        workspaces.append({
-            "id": str(ws.id),
-            "name": ws.name,
-            "role": member.role.value if isinstance(member.role, WorkspaceRole) else member.role
-        })
-    
+
     return workspaces
 
 
@@ -160,18 +152,16 @@ async def register(
     )
     
     db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    
+    await db.flush()
+
     # Create default workspace
     default_workspace = Workspace(
         name=f"{user_data.full_name or user_data.email}'s Workspace",
         owner_id=user.id
     )
     db.add(default_workspace)
-    await db.commit()
-    await db.refresh(default_workspace)
-    
+    await db.flush()
+
     # Create WorkspaceMember record with OWNER role (RBAC)
     owner_member = WorkspaceMember(
         workspace_id=default_workspace.id,
@@ -180,6 +170,18 @@ async def register(
     )
     db.add(owner_member)
     await db.commit()
+    await db.refresh(user)
+    await db.refresh(default_workspace)
+
+    # Keep default workspaces aligned with manually created workspaces.
+    try:
+        vector_index.create_collection(str(default_workspace.id))
+    except Exception:
+        logger.warning(
+            "Default workspace %s created but vector collection initialization failed",
+            default_workspace.id,
+            exc_info=True,
+        )
     
     # Log audit event
     await log_audit_event(
@@ -424,10 +426,8 @@ async def get_user_workspaces_endpoint(
         WorkspaceInfo(**ws) for ws in workspaces
     ])
 
-
-from pydantic import BaseModel, Field
-
 class InviteMemberRequest(BaseModel):
+    email: EmailStr
     role: str = Field("member", pattern="^(owner|admin|member|viewer)$")
 
 

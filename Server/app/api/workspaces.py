@@ -1,11 +1,12 @@
 """Workspace API routes."""
+import logging
 from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_
 
 from app.database.session import get_db
 from app.database.models import Workspace, WorkspaceMember, User as DBUser
@@ -21,6 +22,7 @@ from app.core.audit import log_audit_event, AuditAction, EntityType, AuditLogger
 from app.ingestion.vector_index import vector_index
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
+logger = logging.getLogger(__name__)
 
 
 # Schemas
@@ -57,6 +59,7 @@ class WorkspaceResponse(BaseModel):
     name: str
     description: Optional[str]
     owner_id: str
+    role: str
     created_at: str
     updated_at: Optional[str]
     member_count: int
@@ -96,20 +99,24 @@ async def create_workspace(
     )
     
     db.add(workspace)
-    await db.commit()
-    await db.refresh(workspace)
-    
-    # Add owner as member
+    await db.flush()
+
+    # Add owner as member in the same transaction
     member = WorkspaceMember(
         workspace_id=workspace.id,
         user_id=current_user.id,
-        role=WorkspaceRole.OWNER.value
+        role=WorkspaceRole.OWNER
     )
     db.add(member)
     await db.commit()
+    await db.refresh(workspace)
     
-    # Create vector collection
-    vector_index.create_collection(str(workspace.id))
+    # Create vector collection best-effort so a Qdrant issue does not orphan the
+    # user-facing create call after the DB transaction has already succeeded.
+    try:
+        vector_index.create_collection(str(workspace.id))
+    except Exception:
+        logger.warning("Workspace %s created but vector collection initialization failed", workspace.id, exc_info=True)
     
     # Log audit event
     logger = AuditLogger(db, current_user.id).with_request(request)
@@ -126,6 +133,7 @@ async def create_workspace(
         name=workspace.name,
         description=workspace.description,
         owner_id=str(workspace.owner_id),
+        role=WorkspaceRole.OWNER.value,
         created_at=workspace.created_at.isoformat(),
         updated_at=workspace.updated_at.isoformat() if workspace.updated_at else None,
         member_count=1
@@ -147,24 +155,43 @@ async def list_workspaces(
         List of workspaces
     """
     # Get workspaces where user is a member
+    member_count_subquery = (
+        select(
+            WorkspaceMember.workspace_id.label("workspace_id"),
+            func.count(WorkspaceMember.id).label("member_count"),
+        )
+        .group_by(WorkspaceMember.workspace_id)
+        .subquery()
+    )
     result = await db.execute(
-        select(Workspace, func.count(WorkspaceMember.id).label("member_count"))
-        .join(WorkspaceMember, Workspace.id == WorkspaceMember.workspace_id)
-        .where(WorkspaceMember.user_id == current_user.id)
-        .group_by(Workspace.id)
+        select(
+            Workspace,
+            WorkspaceMember.role.label("current_role"),
+            func.coalesce(member_count_subquery.c.member_count, 0).label("member_count"),
+        )
+        .join(
+            WorkspaceMember,
+            and_(
+                Workspace.id == WorkspaceMember.workspace_id,
+                WorkspaceMember.user_id == current_user.id,
+            ),
+        )
+        .outerjoin(member_count_subquery, member_count_subquery.c.workspace_id == Workspace.id)
         .order_by(Workspace.created_at.desc())
     )
     
     workspaces = []
     for row in result.all():
         workspace = row[0]
-        member_count = row[1]
+        role = row[1]
+        member_count = row[2]
         
         workspaces.append(WorkspaceResponse(
             id=str(workspace.id),
             name=workspace.name,
             description=workspace.description,
             owner_id=str(workspace.owner_id),
+            role=role.value if isinstance(role, WorkspaceRole) else str(role),
             created_at=workspace.created_at.isoformat(),
             updated_at=workspace.updated_at.isoformat() if workspace.updated_at else None,
             member_count=member_count
@@ -193,11 +220,29 @@ async def get_workspace(
     await get_workspace_context(workspace_id, current_user, db)
     
     # Get workspace with member count
+    member_count_subquery = (
+        select(
+            WorkspaceMember.workspace_id.label("workspace_id"),
+            func.count(WorkspaceMember.id).label("member_count"),
+        )
+        .group_by(WorkspaceMember.workspace_id)
+        .subquery()
+    )
     result = await db.execute(
-        select(Workspace, func.count(WorkspaceMember.id).label("member_count"))
-        .join(WorkspaceMember, Workspace.id == WorkspaceMember.workspace_id)
+        select(
+            Workspace,
+            WorkspaceMember.role.label("current_role"),
+            func.coalesce(member_count_subquery.c.member_count, 0).label("member_count"),
+        )
+        .join(
+            WorkspaceMember,
+            and_(
+                Workspace.id == WorkspaceMember.workspace_id,
+                WorkspaceMember.user_id == current_user.id,
+            ),
+        )
+        .outerjoin(member_count_subquery, member_count_subquery.c.workspace_id == Workspace.id)
         .where(Workspace.id == workspace_id)
-        .group_by(Workspace.id)
     )
     
     row = result.first()
@@ -207,13 +252,14 @@ async def get_workspace(
             detail="Workspace not found"
         )
     
-    workspace, member_count = row
+    workspace, role, member_count = row
     
     return WorkspaceResponse(
         id=str(workspace.id),
         name=workspace.name,
         description=workspace.description,
         owner_id=str(workspace.owner_id),
+        role=role.value if isinstance(role, WorkspaceRole) else str(role),
         created_at=workspace.created_at.isoformat(),
         updated_at=workspace.updated_at.isoformat() if workspace.updated_at else None,
         member_count=member_count
@@ -342,6 +388,7 @@ async def update_workspace(
         name=workspace.name,
         description=workspace.description,
         owner_id=str(workspace.owner_id),
+        role=context.role.value if isinstance(context.role, WorkspaceRole) else str(context.role),
         created_at=workspace.created_at.isoformat(),
         updated_at=workspace.updated_at.isoformat() if workspace.updated_at else None,
         member_count=member_count
@@ -406,7 +453,7 @@ async def invite_member(
     member = WorkspaceMember(
         workspace_id=workspace_id,
         user_id=user.id,
-        role=invite_data.role.value
+        role=invite_data.role
     )
     db.add(member)
     await db.commit()
@@ -566,8 +613,12 @@ async def delete_workspace(
             detail="Workspace not found"
         )
     
-    # Delete vector collection
-    vector_index.delete_collection(str(workspace_id))
+    # Delete vector collection best-effort so storage cleanup problems do not
+    # block the source-of-truth workspace deletion.
+    try:
+        vector_index.delete_collection(str(workspace_id))
+    except Exception:
+        logger.warning("Workspace %s deleted but vector collection cleanup failed", workspace_id, exc_info=True)
     
     # Delete workspace (cascades to members, documents, etc.)
     await db.delete(workspace)
