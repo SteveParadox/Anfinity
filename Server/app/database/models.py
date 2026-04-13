@@ -211,7 +211,13 @@ class Chunk(Base):
     
     # Relationships
     document = relationship("Document", back_populates="chunks")
-    embedding = relationship("Embedding", back_populates="chunk", uselist=False)
+    embedding = relationship(
+        "Embedding",
+        back_populates="chunk",
+        uselist=False,
+        cascade="all, delete-orphan",
+        single_parent=True,
+    )
     
     __table_args__ = (
         UniqueConstraint('document_id', 'chunk_index', name='unique_chunk_index'),
@@ -225,7 +231,7 @@ class Embedding(Base):
     __tablename__ = "embeddings"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    chunk_id = Column(UUID(as_uuid=True), ForeignKey("chunks.id"), nullable=False, unique=True)
+    chunk_id = Column(UUID(as_uuid=True), ForeignKey("chunks.id", ondelete="CASCADE"), nullable=False, unique=True)
     
     # Vector DB reference
     vector_id = Column(String(255), nullable=False, index=True)  # Qdrant point ID
