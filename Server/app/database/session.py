@@ -6,11 +6,25 @@ from sqlalchemy import create_engine
 
 from app.config import settings
 
-# Convert PostgreSQL URL to async version
-# postgresql:// -> postgresql+asyncpg://
-ASYNC_DATABASE_URL = settings.DATABASE_URL.replace(
-    "postgresql://", "postgresql+asyncpg://"
-)
+
+def _to_async_database_url(url: str) -> str:
+    """Return an async SQLAlchemy URL for FastAPI request handlers."""
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+
+def _to_sync_database_url(url: str) -> str:
+    """Return a sync SQLAlchemy URL for Celery/background workers."""
+    if url.startswith("postgresql+asyncpg://"):
+        return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+    return url
+
+
+ASYNC_DATABASE_URL = _to_async_database_url(settings.DATABASE_URL)
+SYNC_DATABASE_URL = _to_sync_database_url(settings.DATABASE_URL)
 
 # Async engine for FastAPI
 async_engine = create_async_engine(
@@ -33,7 +47,7 @@ AsyncSessionLocal = async_sessionmaker(
 
 # Sync engine for Celery workers
 sync_engine = create_engine(
-    settings.DATABASE_URL,
+    SYNC_DATABASE_URL,
     pool_size=10,
     max_overflow=5,
     pool_pre_ping=True,
