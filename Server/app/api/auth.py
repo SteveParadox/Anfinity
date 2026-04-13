@@ -309,6 +309,8 @@ async def refresh(
     access_token = create_access_token(
         data={"sub": str(current_user.id), "email": current_user.email}
     )
+
+    workspaces = await get_user_workspaces(current_user, db)
     
     return TokenResponse(
         access_token=access_token,
@@ -318,7 +320,8 @@ async def refresh(
             "id": str(current_user.id),
             "email": current_user.email,
             "full_name": current_user.full_name
-        }
+        },
+        workspaces=workspaces
     )
 
 

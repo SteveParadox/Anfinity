@@ -7,11 +7,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 
 from app.config import settings  # FIXED: was imported inside function body
 from app.database.session import get_db
-from app.database.models import Document, Chunk, DocumentStatus, SourceType
+from app.database.models import Document, Chunk, DocumentStatus, SourceType, Embedding, IngestionLog
 from app.core.auth import (
     get_current_active_user,
     get_workspace_context,
@@ -440,6 +440,19 @@ async def delete_document(
                 "S3 delete failed for %s (continuing): %s", document.storage_path, exc
             )
 
+    # Delete dependent rows explicitly before removing the document. The
+    # embeddings table has a NOT NULL chunk_id FK, so letting the ORM
+    # disassociate children can trigger UPDATE ... SET chunk_id = NULL.
+    chunk_ids_result = await db.execute(
+        select(Chunk.id).where(Chunk.document_id == document.id)
+    )
+    chunk_ids = list(chunk_ids_result.scalars().all())
+
+    if chunk_ids:
+        await db.execute(delete(Embedding).where(Embedding.chunk_id.in_(chunk_ids)))
+
+    await db.execute(delete(IngestionLog).where(IngestionLog.document_id == document.id))
+    await db.execute(delete(Chunk).where(Chunk.document_id == document.id))
     await db.delete(document)
     await db.commit()
 

@@ -1,18 +1,16 @@
 """Conflict Detection API endpoints."""
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, func
 
 from app.database.session import get_db
 from app.database.models import ConflictReport, Note, User as DBUser
 from app.core.auth import get_current_user, get_workspace_context
 from app.tasks.conflict_detection import run_conflict_detection
-from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/conflicts", tags=["Conflict Detection"])
@@ -314,7 +312,7 @@ async def resolve_conflict(
     conflict.resolved_at = datetime.utcnow()
     conflict.resolved_by = current_user.id
     
-    db.commit()
+    await db.commit()
     
     return {
         "success": True,
@@ -328,7 +326,7 @@ async def resolve_conflict(
 async def get_conflict_stats(
     workspace_id: str,
     current_user: DBUser = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> ConflictStatsResponse:
     """
     Get conflict statistics for a workspace.
@@ -338,33 +336,32 @@ async def get_conflict_stats(
     - Breakdown by severity
     - Breakdown by conflict type
     """
-    # Verify access to workspace
-    workspace_context = await get_workspace_context(current_user, workspace_id, db)
-    if not workspace_context:
+    try:
+        workspace_uuid = UUID(workspace_id)
+    except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied to workspace"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid workspace ID format"
         )
-    
-    # Query all conflicts
-    conflicts = db.query(ConflictReport).filter(
-        ConflictReport.workspace_id == UUID(workspace_id)
-    ).all()
-    
-    # Count by status
+
+    await get_workspace_context(workspace_uuid, current_user, db)
+
+    conflicts_result = await db.execute(
+        select(ConflictReport).where(ConflictReport.workspace_id == workspace_uuid)
+    )
+    conflicts = conflicts_result.scalars().all()
+
     total_pending = sum(1 for c in conflicts if c.status == "pending")
     total_resolved = sum(1 for c in conflicts if c.status == "resolved")
     total_dismissed = sum(1 for c in conflicts if c.status == "dismissed")
-    
-    # Count by severity
-    by_severity = {}
-    for c in conflicts:
-        by_severity[c.severity] = by_severity.get(c.severity, 0) + 1
-    
-    # Count by type
-    by_type = {}
-    for c in conflicts:
-        by_type[c.conflict_type] = by_type.get(c.conflict_type, 0) + 1
+
+    by_severity: Dict[str, int] = {}
+    for conflict in conflicts:
+        by_severity[conflict.severity] = by_severity.get(conflict.severity, 0) + 1
+
+    by_type: Dict[str, int] = {}
+    for conflict in conflicts:
+        by_type[conflict.conflict_type] = by_type.get(conflict.conflict_type, 0) + 1
     
     return ConflictStatsResponse(
         total_pending=total_pending,
@@ -379,7 +376,7 @@ async def get_conflict_stats(
 async def trigger_conflict_detection(
     workspace_id: str,
     current_user: DBUser = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """
     Manually trigger conflict detection for a workspace.
@@ -390,9 +387,16 @@ async def trigger_conflict_detection(
     Normal flow: Nightly job runs automatically.
     Use this for testing or after bulk note imports.
     """
-    # Verify access to workspace and user is owner
-    workspace_context = await get_workspace_context(current_user, workspace_id, db)
-    if not workspace_context or workspace_context.get("role") != "owner":
+    try:
+        workspace_uuid = UUID(workspace_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid workspace ID format"
+        )
+
+    workspace_context = await get_workspace_context(workspace_uuid, current_user, db)
+    if workspace_context.role.value != "owner":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only workspace owner can trigger detection"
@@ -413,35 +417,47 @@ async def trigger_conflict_detection(
 async def get_pending_conflict_count(
     workspace_id: str,
     current_user: DBUser = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """
     Get count of pending conflicts.
     
     Quick endpoint for dashboard badge.
     """
-    # Verify access to workspace
-    workspace_context = await get_workspace_context(current_user, workspace_id, db)
-    if not workspace_context:
+    try:
+        workspace_uuid = UUID(workspace_id)
+    except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied to workspace"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid workspace ID format"
         )
-    
-    pending_count = db.query(ConflictReport).filter(
-        and_(
-            ConflictReport.workspace_id == UUID(workspace_id),
-            ConflictReport.status == "pending"
+
+    await get_workspace_context(workspace_uuid, current_user, db)
+
+    pending_result = await db.execute(
+        select(func.count())
+        .select_from(ConflictReport)
+        .where(
+            and_(
+                ConflictReport.workspace_id == workspace_uuid,
+                ConflictReport.status == "pending"
+            )
         )
-    ).count()
-    
-    high_severity_count = db.query(ConflictReport).filter(
-        and_(
-            ConflictReport.workspace_id == UUID(workspace_id),
-            ConflictReport.status == "pending",
-            ConflictReport.severity == "high"
+    )
+    pending_count = pending_result.scalar() or 0
+
+    high_severity_result = await db.execute(
+        select(func.count())
+        .select_from(ConflictReport)
+        .where(
+            and_(
+                ConflictReport.workspace_id == workspace_uuid,
+                ConflictReport.status == "pending",
+                ConflictReport.severity == "high"
+            )
         )
-    ).count()
+    )
+    high_severity_count = high_severity_result.scalar() or 0
     
     return {
         "workspace_id": workspace_id,
