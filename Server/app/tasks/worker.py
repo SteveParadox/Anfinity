@@ -129,6 +129,43 @@ def _log_ingestion_event(
     db.commit()
 
 
+def _fail_document_without_retry(
+    db,
+    *,
+    document: Document,
+    document_uuid: UUID,
+    document_id: str,
+    workspace_id: str,
+    stage: str,
+    message: str,
+    error_code: str,
+) -> dict:
+    """Mark a document as failed for a deterministic ingest issue."""
+    document.status = DocumentStatus.FAILED
+    db.commit()
+    _log_ingestion_event(
+        db,
+        document_uuid,
+        DocumentStatus.FAILED,
+        stage=stage,
+        error_message=message,
+    )
+    broadcast_ingestion_failed_sync(workspace_id, document_id, error_message=message)
+    logger.warning(
+        "Document %s failed during %s without retry: %s",
+        document_id,
+        stage,
+        message,
+    )
+    return {
+        "status": "failed",
+        "document_id": document_id,
+        "error": message,
+        "error_code": error_code,
+        "retryable": False,
+    }
+
+
 def _save_chunks(db, document_uuid: UUID, chunks: List[TextChunk]) -> list:
     """Upsert chunks and return ORM instances in chunk_index order.
 
@@ -373,8 +410,15 @@ def process_document(self, document_id: str) -> dict:
             parser = get_parser(document.source_metadata.get("content_type", "text/plain"))
             logger.debug("🔄 [PARSER] Parsing file bytes (size: %d bytes)", len(file_bytes))
             parsed = parser.parse(file_bytes)
+            parsed_text = parsed.text or ""
+            extracted_chars = len(parsed_text.strip())
+            pages_with_text = (
+                parsed.metadata.get("pages_with_text")
+                if isinstance(parsed.metadata, dict)
+                else None
+            )
             document.title = parsed.title or document.title
-            document.token_count = chunker.count_tokens(parsed.text)
+            document.token_count = chunker.count_tokens(parsed_text)
             db.commit()
             logger.debug("💾 [DB UPDATE] Document title and token count updated - Title: %s, Tokens: %d", document.title, document.token_count)
 
@@ -398,6 +442,25 @@ def process_document(self, document_id: str) -> dict:
             )
 
             # ── Stage 3: Chunk ─────────────────────────────────────────────
+            if not extracted_chars:
+                message = "Document contains no extractable text."
+                if document.source_metadata.get("content_type") == "application/pdf":
+                    message = (
+                        "PDF contains no extractable text. This often means it is scanned/image-only and needs OCR."
+                    )
+                if pages_with_text is not None:
+                    message = f"{message} pages_with_text={pages_with_text}/{parsed.page_count or 0}"
+                return _fail_document_without_retry(
+                    db,
+                    document=document,
+                    document_uuid=document_uuid,
+                    document_id=document_id,
+                    workspace_id=workspace_id,
+                    stage="parse",
+                    message=message,
+                    error_code="NO_EXTRACTABLE_TEXT",
+                )
+
             logger.info("✂️ [STAGE 3 START] Chunking - Parsing complete")
             t0 = time.time()
             broadcast_stage_update_sync(
@@ -405,15 +468,26 @@ def process_document(self, document_id: str) -> dict:
                 progress={"status": "Creating chunks…"},
             )
 
-            logger.debug("🔄 [CHUNKER] Starting text chunking - Text length: %d chars", len(parsed.text))
+            logger.debug("🔄 [CHUNKER] Starting text chunking - Text length: %d chars", len(parsed_text))
             chunks = chunker.chunk_text(
-                parsed.text,
+                parsed_text,
                 metadata={
                     "document_id": document_id,
                     "source_type": document.source_type.value,
                     **parsed.metadata,
                 },
             )
+            if not chunks:
+                return _fail_document_without_retry(
+                    db,
+                    document=document,
+                    document_uuid=document_uuid,
+                    document_id=document_id,
+                    workspace_id=workspace_id,
+                    stage="chunk",
+                    message="Document parsing succeeded but produced zero chunks. Review parser output or chunking thresholds.",
+                    error_code="NO_CHUNKS_CREATED",
+                )
             logger.debug("💾 [DB INSERT] Saving %d chunks to database", len(chunks))
             db_chunks = _save_chunks(db, document_uuid, chunks)
             document.chunk_count = len(chunks)
