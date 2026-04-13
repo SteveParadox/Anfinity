@@ -1,12 +1,13 @@
 """Rate limiting middleware."""
-import time
 import logging
+import time
 from typing import Dict, List, Optional
-import redis.asyncio as redis
 
+import redis.asyncio as redis
+from fastapi import status
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from fastapi import HTTPException, status
+from starlette.responses import JSONResponse
 
 from app.config import settings
 
@@ -141,14 +142,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not await rate_limiter.is_allowed(key):
             remaining = await rate_limiter.get_remaining(key)
             logger.warning(f"Rate limit exceeded for {key}")
-            raise HTTPException(
+            return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded",
+                content={
+                    "error": {
+                        "code": "RATE_LIMIT_EXCEEDED",
+                        "message": "Rate limit exceeded",
+                        "timestamp": time.time(),
+                    }
+                },
                 headers={
                     "Retry-After": str(settings.RATE_LIMIT_WINDOW_SECONDS),
                     "X-RateLimit-Remaining": str(remaining),
-                    "X-RateLimit-Limit": str(settings.RATE_LIMIT_REQUESTS)
-                }
+                    "X-RateLimit-Limit": str(settings.RATE_LIMIT_REQUESTS),
+                },
             )
         
         # Process request
