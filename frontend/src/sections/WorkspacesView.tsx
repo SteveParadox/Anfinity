@@ -198,11 +198,13 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
   const [workspaceMembers, setWorkspaceMembers] = useState<any[]>([]);
   const [workspaceNotes, setWorkspaceNotes] = useState<any[]>([]);
   const [inviteEmail, setInviteEmail] = useState('');
-  const [inviteRole, setInviteRole] = useState<string>('MEMBER');
+  const [inviteRole, setInviteRole] = useState<string>('member');
   const [inviteDialogOpen, setInviteDialogOpen] = useState(false);
   
   const authContext = useContext(AuthContext);
   const currentUser = user || authContext?.user;
+  const refreshAuthWorkspaces = authContext?.refreshWorkspaces;
+  const setCurrentWorkspace = authContext?.setCurrentWorkspace;
 
   useEffect(() => {
     loadWorkspaces();
@@ -227,6 +229,8 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
       createdAt: isNaN(createdAt.getTime()) ? new Date() : createdAt,
       updatedAt: isNaN(updatedAt.getTime()) ? new Date() : updatedAt,
       members: workspace.members || [],
+      member_count: workspace.member_count ?? workspace.memberCount ?? workspace.members?.length ?? 1,
+      role: workspace.role || 'member',
     };
   };
 
@@ -301,7 +305,13 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
         description: newWorkspace.description,
       });
       console.log('✅ [WORKSPACE CREATED] New workspace ID:', created.id);
-      setWorkspaces([transformWorkspace(created), ...workspaces]);
+      await loadWorkspaces();
+      if (refreshAuthWorkspaces) {
+        await refreshAuthWorkspaces();
+      }
+      if (created.id && setCurrentWorkspace) {
+        setCurrentWorkspace(created.id);
+      }
       setIsCreating(false);
       setNewWorkspace({ name: '', description: '' });
       setError(null);
@@ -329,7 +339,10 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
       });
       console.log('✅ [WORKSPACE UPDATED] Workspace updated successfully');
       const safe = transformWorkspace(updated);
-      setWorkspaces(workspaces.map(w => w.id === safe.id ? safe : w));
+      setWorkspaces(prev => prev.map(w => w.id === safe.id ? safe : w));
+      if (refreshAuthWorkspaces) {
+        await refreshAuthWorkspaces();
+      }
       setEditingWorkspace(null);
       if (selectedWorkspace?.id === safe.id) setSelectedWorkspace(safe);
       setError(null);
@@ -353,7 +366,10 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
       console.debug('📡 [API CALL] Calling api.deleteWorkspace()');
       await api.deleteWorkspace(id);
       console.log('✅ [WORKSPACE DELETED] Workspace deleted from backend');
-      setWorkspaces(workspaces.filter(w => w.id !== id));
+      setWorkspaces(prev => prev.filter(w => w.id !== id));
+      if (refreshAuthWorkspaces) {
+        await refreshAuthWorkspaces();
+      }
       if (selectedWorkspace?.id === id) setSelectedWorkspace(null);
       setError(null);
       console.log('✅ [DELETE WORKSPACE SUCCESS] State updated and workspace removed from list');
@@ -505,7 +521,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                   <Users size={10} color={TT.inkMuted} />
                   <span style={{ fontFamily: TT.fontMono, fontSize: 9.5, color: TT.inkMuted, letterSpacing: '0.04em' }}>
-                    {workspace.members?.length || 1} member{(workspace.members?.length || 1) !== 1 ? 's' : ''}
+                    {workspace.member_count || 1} member{(workspace.member_count || 1) !== 1 ? 's' : ''}
                   </span>
                 </div>
                 {/* FIX: safeFromNow never throws on missing/invalid dates */}
@@ -715,15 +731,15 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
           <div>
             <FieldLabel>Role</FieldLabel>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {['VIEWER', 'MEMBER', 'ADMIN', 'OWNER'].map((role) => (
+              {['viewer', 'member', 'admin', 'owner'].map((role) => (
                 <label key={role} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
                   <input type="radio" name="role" value={role} checked={inviteRole === role} onChange={(e) => setInviteRole(e.target.value)} style={{ margin: 0 }} />
-                  <span style={{ fontFamily: TT.fontMono, fontSize: 12, color: TT.snow }}>{role}</span>
+                  <span style={{ fontFamily: TT.fontMono, fontSize: 12, color: TT.snow }}>{role.toUpperCase()}</span>
                   <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
-                    {role === 'VIEWER' && '(View only)'}
-                    {role === 'MEMBER' && '(Contribute)'}
-                    {role === 'ADMIN' && '(Manage members)'}
-                    {role === 'OWNER' && '(Full control)'}
+                    {role === 'viewer' && '(View only)'}
+                    {role === 'member' && '(Contribute)'}
+                    {role === 'admin' && '(Manage members)'}
+                    {role === 'owner' && '(Full control)'}
                   </span>
                 </label>
               ))}

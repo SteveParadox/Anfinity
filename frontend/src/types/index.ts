@@ -157,9 +157,14 @@ export interface Workspace {
   id: string;
   name: string;
   description?: string;
+  role?: 'owner' | 'admin' | 'member' | 'viewer';
+  owner_id?: string;
+  member_count?: number;
   members: WorkspaceMember[];
   createdAt: Date;
   updatedAt: Date;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface WorkspaceMember {
