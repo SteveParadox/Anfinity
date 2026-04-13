@@ -53,42 +53,28 @@ export function InviteMembersDialog({ workspaceId, onInviteSent }: InviteMembers
     setSuccess(false);
     setIsLoading(true);
 
-      try {
-        // Validate email
-        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-          setError('Please enter a valid email address');
-          setIsLoading(false);
-          return;
-        }
+    try {
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        setError('Please enter a valid email address');
+        setIsLoading(false);
+        return;
+      }
 
-        // Call the API through a public method
-        // For now, use the built-in fetch
-        const res = await fetch(
-          `/api/auth/workspaces/${workspaceId}/invite`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              email,
-              role,
-            }),
-          }
-        );
+      await api.inviteToWorkspace(
+        workspaceId,
+        email,
+        role as 'owner' | 'admin' | 'member' | 'viewer'
+      );
 
-        if (!res.ok) {
-          throw new Error('Failed to send invite');
-        }
+      setSuccess(true);
+      setEmail('');
+      setRole('member');
 
-        setSuccess(true);
-        setEmail('');
-        setRole('member');
-
-        // Reset form after 2 seconds
-        setTimeout(() => {
-          setSuccess(false);
-          setOpen(false);
-          onInviteSent?.();
-        }, 2000);
+      setTimeout(() => {
+        setSuccess(false);
+        setOpen(false);
+        onInviteSent?.();
+      }, 2000);
     } catch (err: any) {
       setError(err.message || 'Failed to send invitation');
     } finally {

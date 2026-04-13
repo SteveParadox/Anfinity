@@ -903,7 +903,7 @@ class ApiClient {
   }
 
   async inviteToWorkspace(workspaceId: string, email: string, role: 'owner' | 'admin' | 'member' | 'viewer'): Promise<any> {
-    return this.request(`/auth/workspaces/${workspaceId}/invite`, {
+    return this.request(`/workspaces/${workspaceId}/invite`, {
       method: 'POST',
       body: JSON.stringify({ email, role }),
     });

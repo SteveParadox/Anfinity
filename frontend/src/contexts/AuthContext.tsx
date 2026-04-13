@@ -37,6 +37,7 @@ export interface AuthContextType {
   register: (email: string, password: string, fullName?: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshAuth: () => Promise<void>;
+  refreshWorkspaces: () => Promise<void>;
   setCurrentWorkspace: (workspaceId: string) => void;
   clearError: () => void;
   hasRole: (workspaceId: string, minRole: WorkspaceRole) => boolean;
@@ -400,6 +401,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     register,
     logout,
     refreshAuth,
+    refreshWorkspaces: loadWorkspaces,
     setCurrentWorkspace,
     clearError,
     hasRole,
