@@ -4,7 +4,7 @@ from datetime import timedelta
 from typing import Optional, List
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +25,18 @@ from app.ingestion.vector_index import vector_index
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 security = HTTPBearer()
 logger = logging.getLogger(__name__)
+
+
+def _initialize_workspace_vector_collection(workspace_id: str) -> None:
+    """Initialize per-workspace vector storage without blocking auth flows."""
+    try:
+        vector_index.create_collection(workspace_id)
+    except Exception:
+        logger.warning(
+            "Default workspace %s created but vector collection initialization failed",
+            workspace_id,
+            exc_info=True,
+        )
 
 
 async def get_user_workspaces(user: DBUser, db: AsyncSession) -> List[dict]:
@@ -115,6 +127,7 @@ class UserWorkspacesResponse(BaseModel):
 async def register(
     user_data: UserRegister,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Register a new user.
@@ -173,15 +186,7 @@ async def register(
     await db.refresh(user)
     await db.refresh(default_workspace)
 
-    # Keep default workspaces aligned with manually created workspaces.
-    try:
-        vector_index.create_collection(str(default_workspace.id))
-    except Exception:
-        logger.warning(
-            "Default workspace %s created but vector collection initialization failed",
-            default_workspace.id,
-            exc_info=True,
-        )
+    background_tasks.add_task(_initialize_workspace_vector_collection, str(default_workspace.id))
     
     # Log audit event
     await log_audit_event(

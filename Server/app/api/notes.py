@@ -3,12 +3,12 @@ from typing import Optional, List, Any, Dict
 from datetime import datetime
 from uuid import UUID
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, text
 
-from app.database.session import get_db
+from app.database.session import get_db, AsyncSessionLocal
 from app.database.models import Note, NoteConnectionSuggestion, User as DBUser
 from app.core.auth import get_current_user, get_workspace_context
 from app.core.audit import log_audit_event, AuditAction, EntityType
@@ -162,6 +162,17 @@ async def sync_note_search_index(db: AsyncSession, note_id: UUID) -> None:
         logger.warning("Skipping content_tsv sync for note %s: %s", note_id, exc)
 
 
+async def sync_note_search_index_by_id(note_id: UUID) -> None:
+    """Update the optional search index in a fresh session after note writes commit."""
+    async with AsyncSessionLocal() as db:
+        try:
+            await sync_note_search_index(db, note_id)
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("Skipping async content_tsv sync for note %s: %s", note_id, exc)
+
+
 async def sync_note_graph(db: AsyncSession, note: Note) -> None:
     """Best-effort graph sync that never blocks note persistence."""
     try:
@@ -169,6 +180,21 @@ async def sync_note_graph(db: AsyncSession, note: Note) -> None:
     except Exception as exc:
         await db.rollback()
         logger.warning("Skipping graph sync for note %s in workspace %s: %s", note.id, note.workspace_id, exc)
+
+
+async def sync_note_graph_by_id(note_id: UUID) -> None:
+    """Run graph sync in a fresh session so note creation can return quickly."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Note).where(Note.id == note_id))
+        note = result.scalar_one_or_none()
+        if not note or not note.workspace_id:
+            return
+        try:
+            await get_graph_service().sync_note_to_graph(db, note)
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("Skipping async graph sync for note %s in workspace %s: %s", note_id, note.workspace_id, exc)
 
 
 async def remove_note_graph(db: AsyncSession, workspace_id: UUID, note_id: UUID) -> None:
@@ -208,11 +234,35 @@ def serialize_connection_suggestion(suggestion: NoteConnectionSuggestion) -> Con
     )
 
 
+async def safe_log_note_audit(
+    db: AsyncSession,
+    *,
+    current_user_id: UUID,
+    workspace_id: Optional[UUID],
+    note_id: UUID,
+    action: AuditAction,
+) -> None:
+    """Best-effort audit logging that never blocks note persistence."""
+    try:
+        await log_audit_event(
+            user_id=current_user_id,
+            workspace_id=workspace_id,
+            action=action,
+            entity_type=EntityType.NOTE,
+            entity_id=note_id,
+            db=db,
+        )
+    except Exception as exc:
+        await db.rollback()
+        logger.warning("Skipping audit log for note %s action %s: %s", note_id, action.value, exc)
+
+
 # ==================== Endpoints ====================
 
 @router.post("", response_model=NoteResponse, status_code=status.HTTP_201_CREATED)
 async def create_note(
     note_data: NoteCreate,
+    background_tasks: BackgroundTasks,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -266,46 +316,50 @@ async def create_note(
     
     db.add(new_note)
     await db.flush()
-    await sync_note_search_index(db, new_note.id)
-    
-    # Log action
-    await log_audit_event(
-        user_id=current_user.id,
-        workspace_id=workspace_id,
-        action=AuditAction.NOTE_CREATED,
-        entity_type=EntityType.NOTE,
-        entity_id=new_note.id,
-        db=db
-    )
     
     await db.commit()
-    await sync_note_graph(db, new_note)
-    
-    # Queue background tasks for data enrichment
-    # Always generate embedding
-    queue_note_embedding(str(new_note.id))
-    queue_note_connection_suggestions(str(new_note.id))
-    
-    # Generate summary for longer notes
-    if len(note_data.content.split()) > 20:  # >20 words is substantive
-        queue_note_summary(str(new_note.id))
+    persisted_note_result = await db.execute(
+        select(Note).where(Note.id == new_note.id)
+    )
+    persisted_note = persisted_note_result.scalar_one_or_none() or new_note
+    await safe_log_note_audit(
+        db,
+        current_user_id=current_user.id,
+        workspace_id=workspace_id,
+        note_id=persisted_note.id,
+        action=AuditAction.NOTE_CREATED,
+    )
+
+    # Queue post-create enrichment after the response so the control-plane note
+    # save stays fast and a downstream service issue does not fail note creation.
+    background_tasks.add_task(sync_note_graph_by_id, persisted_note.id)
+    background_tasks.add_task(sync_note_search_index_by_id, persisted_note.id)
+    background_tasks.add_task(queue_note_embedding, str(persisted_note.id))
+    background_tasks.add_task(queue_note_connection_suggestions, str(persisted_note.id))
+
+    if len(note_data.content.split()) > 20:
+        background_tasks.add_task(queue_note_summary, str(persisted_note.id))
     
     return NoteResponse(
-        id=str(new_note.id),
-        workspace_id=str(new_note.workspace_id) if new_note.workspace_id else None,
-        user_id=str(new_note.user_id),
-        title=new_note.title,
-        content=new_note.content,
-        summary=new_note.summary,
-        tags=new_note.tags or [],
-        connections=new_note.connections or [],
-        note_type=new_note.note_type,
-        word_count=new_note.word_count or 0,
-        ai_generated=bool(new_note.ai_generated),
-        confidence_score=new_note.confidence_score,
-        source_url=new_note.source_url,
-        created_at=new_note.created_at.isoformat(),
-        updated_at=new_note.updated_at.isoformat() if new_note.updated_at else new_note.created_at.isoformat(),
+        id=str(persisted_note.id),
+        workspace_id=str(persisted_note.workspace_id) if persisted_note.workspace_id else None,
+        user_id=str(persisted_note.user_id),
+        title=persisted_note.title,
+        content=persisted_note.content,
+        summary=persisted_note.summary,
+        tags=persisted_note.tags or [],
+        connections=persisted_note.connections or [],
+        note_type=persisted_note.note_type,
+        word_count=persisted_note.word_count or 0,
+        ai_generated=bool(persisted_note.ai_generated),
+        confidence_score=persisted_note.confidence_score,
+        source_url=persisted_note.source_url,
+        created_at=persisted_note.created_at.isoformat() if persisted_note.created_at else datetime.utcnow().isoformat(),
+        updated_at=(
+            persisted_note.updated_at.isoformat()
+            if persisted_note.updated_at
+            else (persisted_note.created_at.isoformat() if persisted_note.created_at else datetime.utcnow().isoformat())
+        ),
     )
 
 
@@ -462,6 +516,7 @@ async def get_note(
 async def update_note(
     note_id: str,
     updates: NoteUpdate,
+    background_tasks: BackgroundTasks,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -510,30 +565,24 @@ async def update_note(
         note.note_type = updates.note_type
     
     note.updated_at = datetime.utcnow()
-    if semantic_fields_updated:
-        await sync_note_search_index(db, note.id)
-    
-    # Log action
-    await log_audit_event(
-        user_id=current_user.id,
-        workspace_id=note.workspace_id,
-        action=AuditAction.NOTE_UPDATED,
-        entity_type=EntityType.NOTE,
-        entity_id=note.id,
-        db=db
-    )
     
     await db.commit()
-    await sync_note_graph(db, note)
+    await safe_log_note_audit(
+        db,
+        current_user_id=current_user.id,
+        workspace_id=note.workspace_id,
+        note_id=note.id,
+        action=AuditAction.NOTE_UPDATED,
+    )
+    background_tasks.add_task(sync_note_graph_by_id, note.id)
     
     # Queue background tasks if content changed
-    queue_note_connection_suggestions(str(note.id))
+    background_tasks.add_task(queue_note_connection_suggestions, str(note.id))
     if semantic_fields_updated:
-        # Re-generate embedding for updated content
-        queue_note_embedding(str(note.id))
-        # Re-generate summary if content is substantive
+        background_tasks.add_task(sync_note_search_index_by_id, note.id)
+        background_tasks.add_task(queue_note_embedding, str(note.id))
         if len(note.content.split()) > 20:
-            queue_note_summary(str(note.id))
+            background_tasks.add_task(queue_note_summary, str(note.id))
     
     return NoteResponse(
         id=str(note.id),

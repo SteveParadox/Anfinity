@@ -3,7 +3,7 @@ import logging
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
@@ -23,6 +23,18 @@ from app.ingestion.vector_index import vector_index
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
 logger = logging.getLogger(__name__)
+
+
+def _initialize_workspace_vector_collection(workspace_id: str) -> None:
+    """Initialize per-workspace vector storage without blocking the API response."""
+    try:
+        vector_index.create_collection(workspace_id)
+    except Exception:
+        logger.warning(
+            "Workspace %s created but vector collection initialization failed",
+            workspace_id,
+            exc_info=True,
+        )
 
 
 # Schemas
@@ -76,6 +88,7 @@ class WorkspaceStatsResponse(BaseModel):
 async def create_workspace(
     workspace_data: WorkspaceCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -111,12 +124,9 @@ async def create_workspace(
     await db.commit()
     await db.refresh(workspace)
     
-    # Create vector collection best-effort so a Qdrant issue does not orphan the
-    # user-facing create call after the DB transaction has already succeeded.
-    try:
-        vector_index.create_collection(str(workspace.id))
-    except Exception:
-        logger.warning("Workspace %s created but vector collection initialization failed", workspace.id, exc_info=True)
+    # Initialize vector storage after the response so Qdrant latency/outages do
+    # not slow down the control-plane create request.
+    background_tasks.add_task(_initialize_workspace_vector_collection, str(workspace.id))
     
     # Log audit event
     logger = AuditLogger(db, current_user.id).with_request(request)
