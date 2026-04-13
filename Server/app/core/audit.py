@@ -45,6 +45,7 @@ class AuditAction(str, Enum):
     # Verification actions
     ANSWER_VERIFIED = "answer_verified"
     ANSWER_REJECTED = "answer_rejected"
+    ANSWER_FAILED = "answer_failed"
     
     # Feedback actions
     FEEDBACK_SUBMITTED = "feedback_submitted"
@@ -101,7 +102,7 @@ async def log_audit_event(
         action=action.value,
         entity_type=entity_type.value if entity_type else None,
         entity_id=entity_id,
-        metadata=metadata or {},
+        audit_metadata=metadata or {},
         ip_address=ip_address,
         user_agent=user_agent
     )
