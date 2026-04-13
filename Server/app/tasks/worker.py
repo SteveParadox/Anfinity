@@ -60,7 +60,9 @@ def _task_postrun_handler(
     )
     # FIX: Explicitly close SyncSessionLocal to prevent phantom ROLLBACK on connection return
     # This ensures pool_reset_on_return=None doesn't start implicit transactions
-    SyncSessionLocal.remove()
+    remove = getattr(SyncSessionLocal, "remove", None)
+    if callable(remove):
+        remove()
 
 
 #  FIXED: Explicitly connect signal handlers to the celery_app instance
@@ -311,6 +313,7 @@ def process_document(self, document_id: str) -> dict:
 
     with get_db_session() as db:
         document = None
+        workspace_id = None
         try:
             logger.debug("🔍 [DB QUERY] Attempting to fetch document %s from database", document_id)
             document = db.query(Document).filter(Document.id == document_uuid).first()
@@ -520,17 +523,20 @@ def process_document(self, document_id: str) -> dict:
             
             # Rollback any pending transactions to clear the session state
             db.rollback()
-            
-            document.status = DocumentStatus.FAILED
-            db.commit()
-            logger.debug("💾 [DB UPDATE] Document status set to FAILED - Document: %s", document_id)
+
+            if document is not None:
+                document.status = DocumentStatus.FAILED
+                db.commit()
+                logger.debug("💾 [DB UPDATE] Document status set to FAILED - Document: %s", document_id)
 
             error_msg = str(exc)
-            _log_ingestion_event(
-                db, document_uuid, DocumentStatus.FAILED,
-                stage="error", error_message=error_msg,
-            )
-            broadcast_ingestion_failed_sync(workspace_id, document_id, error_message=error_msg)
+            if document is not None:
+                _log_ingestion_event(
+                    db, document_uuid, DocumentStatus.FAILED,
+                    stage="error", error_message=error_msg,
+                )
+            if workspace_id:
+                broadcast_ingestion_failed_sync(workspace_id, document_id, error_message=error_msg)
 
             logger.error("❌ Document %s processing failed: %s", document_id, error_msg, exc_info=True)
 
