@@ -50,6 +50,50 @@ const STAGE_STATUS_MAP: Record<string, string> = {
   embedding: 'embedding',
 };
 
+function normalizeIngestionDetails(
+  details?: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const base = { ...(details ?? {}) };
+
+  const chunkCount =
+    typeof base.chunks_created === 'number'
+      ? base.chunks_created
+      : typeof base.chunk_count === 'number'
+        ? base.chunk_count
+        : undefined;
+
+  const embeddingCount =
+    typeof base.embeddings_created === 'number'
+      ? base.embeddings_created
+      : typeof base.embedding_count === 'number'
+        ? base.embedding_count
+        : undefined;
+
+  const tokenCount =
+    typeof base.total_tokens === 'number'
+      ? base.total_tokens
+      : typeof base.token_count === 'number'
+        ? base.token_count
+        : undefined;
+
+  if (chunkCount !== undefined) {
+    base.chunks_created = chunkCount;
+    base.chunk_count = chunkCount;
+  }
+
+  if (embeddingCount !== undefined) {
+    base.embeddings_created = embeddingCount;
+    base.embedding_count = embeddingCount;
+  }
+
+  if (tokenCount !== undefined) {
+    base.total_tokens = tokenCount;
+    base.token_count = tokenCount;
+  }
+
+  return base;
+}
+
 // ─── useDocumentIngestion ─────────────────────────────────────────────────────
 
 type IngestionStatus =
@@ -112,7 +156,7 @@ export function useDocumentIngestion(
             setStatus((STAGE_STATUS_MAP[event.stage ?? ''] ?? 'started') as IngestionStatus);
             setProgress({
               stage:   event.stage,
-              details: event.data?.progress ?? {},
+              details: normalizeIngestionDetails(event.data?.progress),
             });
             break;
 
@@ -120,18 +164,21 @@ export function useDocumentIngestion(
             setProgress((prev) => ({
               ...prev,
               stage:   event.stage,
-              details: { ...prev.details, ...event.data?.progress },
+              details: {
+                ...normalizeIngestionDetails(prev.details as Record<string, unknown> | undefined),
+                ...normalizeIngestionDetails(event.data?.progress),
+              },
             }));
             break;
 
           case EventType.PROGRESS_UPDATE:
-            setProgress({ details: event.data });
+            setProgress({ details: normalizeIngestionDetails(event.data) });
             break;
 
           case EventType.DOCUMENT_COMPLETED:
             setStatus('completed');
             setEndTime(Date.now());
-            setProgress({ details: event.data, percentage: 100 });
+            setProgress({ details: normalizeIngestionDetails(event.data), percentage: 100 });
             break;
 
           case EventType.DOCUMENT_FAILED:

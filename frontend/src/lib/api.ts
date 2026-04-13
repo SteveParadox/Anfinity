@@ -69,6 +69,13 @@ export class ServerError extends ApiError {
   }
 }
 
+export class RateLimitError extends ApiError {
+  constructor(message: string = 'Rate limit exceeded') {
+    super(429, 'RATE_LIMIT_EXCEEDED', message);
+    this.name = 'RateLimitError';
+  }
+}
+
 // Types
 export interface Document {
   id: string;
@@ -317,8 +324,7 @@ class ApiClient {
         if (error instanceof ApiError) {
           if (
             error.status < 500 &&
-            error.status !== 408 &&
-            error.status !== 429
+            error.status !== 408
           ) {
             throw error;
           }
@@ -446,7 +452,7 @@ class ApiClient {
         case 422:
           throw new ValidationError(message, error.metadata);
         case 429:
-          throw new ServerError('Rate limited - please try again later');
+          throw new RateLimitError(message || 'Rate limited - please try again later');
         case 500:
         case 502:
         case 503:
@@ -865,7 +871,8 @@ class ApiClient {
 
   async getKnowledgeGraph(
     workspaceId: string,
-    filters?: Partial<KnowledgeGraphFilters>
+    filters?: Partial<KnowledgeGraphFilters>,
+    options?: { signal?: AbortSignal; retries?: boolean }
   ): Promise<KnowledgeGraph> {
     const queryParams = new URLSearchParams();
     for (const nodeType of filters?.nodeTypes || []) {
@@ -885,7 +892,11 @@ class ApiClient {
     }
 
     return this.request(
-      `/knowledge-graph/${workspaceId}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`
+      `/knowledge-graph/${workspaceId}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`,
+      {
+        signal: options?.signal,
+        retries: options?.retries,
+      }
     );
   }
 

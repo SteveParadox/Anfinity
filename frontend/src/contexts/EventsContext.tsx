@@ -60,6 +60,8 @@ export function EventsProvider({
       console.warn(
         'EventsProvider: workspaceId not provided, events disabled'
       );
+      setClient(null);
+      setConnected(false);
       return;
     }
 
@@ -69,6 +71,8 @@ export function EventsProvider({
       setConnected(false);
       return;
     }
+
+    let activeClient: EventClient | null = null;
 
     const initializeClient = async () => {
       try {
@@ -99,6 +103,7 @@ export function EventsProvider({
             console.error('❌ [EVENTS ERROR] Event streaming error:', err);
           },
         });
+        activeClient = newClient;
 
         // Listen to all events and track the last one
         console.debug('🎧 [LISTENER] Registering event listener for all event types');
@@ -126,7 +131,7 @@ export function EventsProvider({
 
     return () => {
       // Cleanup on unmount
-      client?.disconnect();
+      activeClient?.disconnect();
       resetEventClient();
     };
   }, [workspaceId, token]);

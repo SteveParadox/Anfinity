@@ -1,46 +1,101 @@
-/**
- * Workspace Switcher Component
- * Allows users to switch between workspaces they have access to
- */
-
-import { useAuth } from '@/contexts/AuthContext';
-import { Button } from '@/components/ui/button';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import { Briefcase } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
 
-export function WorkspaceSwitcher() {
+interface WorkspaceSwitcherProps {
+  compact?: boolean;
+}
+
+const TT = {
+  inkBorder: '#252525',
+  inkMuted: '#5A5A5A',
+  inkSubtle: '#888888',
+  snow: '#F5F5F5',
+  yolk: '#F5E642',
+  inkDeep: '#111111',
+  inkRaised: '#1A1A1A',
+  fontMono: "'IBM Plex Mono', monospace",
+};
+
+export function WorkspaceSwitcher({ compact = false }: WorkspaceSwitcherProps) {
   const { workspaces, currentWorkspaceId, setCurrentWorkspace } = useAuth();
 
-  if (!workspaces || workspaces.length === 0) {
+  if (!workspaces.length) {
     return null;
   }
 
-  const currentWorkspace = workspaces.find(w => w.id === currentWorkspaceId);
+  const resolvedWorkspaceId =
+    workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.id ||
+    workspaces[0]?.id ||
+    '';
 
   return (
-    <div className="flex items-center gap-2">
-      <Briefcase className="w-4 h-4 text-slate-400" />
-      <Select value={currentWorkspaceId || ''} onValueChange={setCurrentWorkspace}>
-        <SelectTrigger className="w-48">
-          <SelectValue placeholder="Select workspace" />
-        </SelectTrigger>
-        <SelectContent>
-          {workspaces.map(workspace => (
-            <SelectItem key={workspace.id} value={workspace.id}>
-              <div className="flex items-center gap-2">
-                <span>{workspace.name}</span>
-                <span className="text-xs text-slate-500">({workspace.role})</span>
-              </div>
-            </SelectItem>
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        minWidth: compact ? 0 : 220,
+      }}
+    >
+      <div
+        style={{
+          width: compact ? 28 : 30,
+          height: compact ? 28 : 30,
+          borderRadius: 3,
+          background: 'rgba(245,230,66,0.08)',
+          border: '1px solid rgba(245,230,66,0.18)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0,
+        }}
+      >
+        <Briefcase size={compact ? 13 : 14} color={TT.yolk} />
+      </div>
+
+      <div style={{ minWidth: 0, flex: 1 }}>
+        {!compact && (
+          <div
+            style={{
+              fontFamily: TT.fontMono,
+              fontSize: 9,
+              letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              color: TT.inkSubtle,
+              marginBottom: 4,
+            }}
+          >
+            Workspace
+          </div>
+        )}
+
+        <select
+          value={resolvedWorkspaceId}
+          onChange={(event) => setCurrentWorkspace(event.target.value)}
+          aria-label="Switch workspace"
+          style={{
+            width: compact ? 170 : '100%',
+            maxWidth: '100%',
+            height: compact ? 30 : 34,
+            background: compact ? TT.inkDeep : TT.inkRaised,
+            border: `1px solid ${TT.inkBorder}`,
+            borderRadius: 3,
+            color: TT.snow,
+            fontFamily: TT.fontMono,
+            fontSize: compact ? 10.5 : 11,
+            letterSpacing: '0.04em',
+            padding: compact ? '0 28px 0 10px' : '0 32px 0 10px',
+            outline: 'none',
+            cursor: 'pointer',
+          }}
+        >
+          {workspaces.map((workspace) => (
+            <option key={workspace.id} value={workspace.id} style={{ background: TT.inkDeep, color: TT.snow }}>
+              {compact ? workspace.name : `${workspace.name} (${workspace.role})`}
+            </option>
           ))}
-        </SelectContent>
-      </Select>
+        </select>
+      </div>
     </div>
   );
 }
