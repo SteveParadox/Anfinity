@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.database.session import get_db
-from app.database.models import User as DBUser, WorkspaceMember, WorkspaceRole
+from app.database.models import User as DBUser, Workspace, WorkspaceMember, WorkspaceRole
 from app.core.security import get_token_payload
 
 # Security scheme
@@ -215,6 +215,17 @@ async def get_workspace_context(
     Raises:
         HTTPException: If user is not a workspace member
     """
+    workspace_result = await db.execute(
+        select(Workspace.id).where(Workspace.id == workspace_id)
+    )
+    workspace_exists = workspace_result.scalar_one_or_none()
+
+    if workspace_exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workspace not found"
+        )
+
     result = await db.execute(
         select(WorkspaceMember).where(
             WorkspaceMember.workspace_id == workspace_id,
