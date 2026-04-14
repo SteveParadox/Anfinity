@@ -1,15 +1,17 @@
 """Notes API routes for user note management."""
-from typing import Optional, List, Any, Dict
-from datetime import datetime
+from typing import Optional, List, Any, Dict, Sequence
+from datetime import datetime, timezone
 from uuid import UUID
 import logging
+import re
+from difflib import SequenceMatcher
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, text
 
 from app.database.session import get_db, AsyncSessionLocal
-from app.database.models import Note, NoteConnectionSuggestion, User as DBUser
+from app.database.models import Note, NoteConnectionSuggestion, NoteVersion, User as DBUser
 from app.core.auth import get_current_user, get_workspace_context
 from app.core.audit import log_audit_event, AuditAction, EntityType
 from app.services.graph_service import get_graph_service
@@ -127,6 +129,38 @@ class ConnectionSuggestionActionResponse(BaseModel):
     connections: List[str] = Field(default_factory=list)
 
 
+class NoteVersionDiffSegmentResponse(BaseModel):
+    type: str
+    text: str
+    word_count: int
+
+
+class NoteVersionResponse(BaseModel):
+    id: str
+    note_id: str
+    workspace_id: Optional[str]
+    user_id: str
+    version_number: int
+    change_reason: str
+    restored_from_version_id: Optional[str] = None
+    title: str
+    content: str
+    summary: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    connections: List[str] = Field(default_factory=list)
+    note_type: str
+    source_url: Optional[str] = None
+    word_count: int
+    diff_segments: List[NoteVersionDiffSegmentResponse] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class NoteVersionRestoreResponse(BaseModel):
+    note: NoteResponse
+    restored_version: NoteVersionResponse
+
+
 # ==================== Routes ====================
 
 # ==================== Utility Functions ====================
@@ -143,6 +177,175 @@ def calculate_word_count(content: str) -> int:
     if not content:
         return 0
     return len(content.strip().split())
+
+
+def serialize_note(note: Note) -> NoteResponse:
+    created_at = note.created_at or datetime.now(timezone.utc)
+    updated_at = note.updated_at or created_at
+    return NoteResponse(
+        id=str(note.id),
+        workspace_id=str(note.workspace_id) if note.workspace_id else None,
+        user_id=str(note.user_id),
+        title=note.title,
+        content=note.content,
+        summary=note.summary,
+        tags=list(note.tags or []),
+        connections=[str(connection_id) for connection_id in (note.connections or [])],
+        note_type=note.note_type,
+        word_count=note.word_count or 0,
+        ai_generated=bool(note.ai_generated),
+        confidence_score=note.confidence_score,
+        source_url=note.source_url,
+        created_at=created_at.isoformat(),
+        updated_at=updated_at.isoformat(),
+    )
+
+
+def _tokenize_for_diff(text: str) -> List[str]:
+    return re.findall(r"\S+|\s+", text or "")
+
+
+def _count_words(text: str) -> int:
+    return len(re.findall(r"\S+", text or ""))
+
+
+def build_word_diff_segments(previous_text: str, current_text: str) -> List[Dict[str, Any]]:
+    previous_tokens = _tokenize_for_diff(previous_text)
+    current_tokens = _tokenize_for_diff(current_text)
+    matcher = SequenceMatcher(a=previous_tokens, b=current_tokens, autojunk=False)
+
+    segments: List[Dict[str, Any]] = []
+    for opcode, a_start, a_end, b_start, b_end in matcher.get_opcodes():
+        if opcode == "equal":
+            text_value = "".join(current_tokens[b_start:b_end])
+            segment_type = "unchanged"
+        elif opcode == "insert":
+            text_value = "".join(current_tokens[b_start:b_end])
+            segment_type = "added"
+        elif opcode == "delete":
+            text_value = "".join(previous_tokens[a_start:a_end])
+            segment_type = "deleted"
+        else:
+            deleted_text = "".join(previous_tokens[a_start:a_end])
+            added_text = "".join(current_tokens[b_start:b_end])
+            if deleted_text:
+                segments.append(
+                    {
+                        "type": "deleted",
+                        "text": deleted_text,
+                        "word_count": _count_words(deleted_text),
+                    }
+                )
+            if added_text:
+                segments.append(
+                    {
+                        "type": "added",
+                        "text": added_text,
+                        "word_count": _count_words(added_text),
+                    }
+                )
+            continue
+
+        if text_value:
+            segments.append(
+                {
+                    "type": segment_type,
+                    "text": text_value,
+                    "word_count": _count_words(text_value),
+                }
+            )
+
+    return segments
+
+
+async def get_latest_note_version(db: AsyncSession, note_id: UUID) -> Optional[NoteVersion]:
+    version_result = await db.execute(
+        select(NoteVersion)
+        .where(NoteVersion.note_id == note_id)
+        .order_by(NoteVersion.version_number.desc())
+        .limit(1)
+    )
+    return version_result.scalar_one_or_none()
+
+
+async def create_note_version_snapshot(
+    db: AsyncSession,
+    *,
+    note: Note,
+    user_id: UUID,
+    change_reason: str,
+    restored_from_version_id: Optional[UUID] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[NoteVersion]:
+    latest_version = await get_latest_note_version(db, note.id)
+    previous_content = latest_version.content if latest_version else ""
+    version_number = (latest_version.version_number if latest_version else 0) + 1
+
+    if latest_version is not None:
+        comparable_fields = (
+            latest_version.title == note.title,
+            latest_version.content == note.content,
+            list(latest_version.tags or []) == list(note.tags or []),
+            [str(connection_id) for connection_id in (latest_version.connections or [])]
+            == [str(connection_id) for connection_id in (note.connections or [])],
+            latest_version.note_type == note.note_type,
+            latest_version.source_url == note.source_url,
+        )
+        if all(comparable_fields):
+            return None
+
+    diff_segments = build_word_diff_segments(previous_content, note.content or "")
+    version = NoteVersion(
+        note_id=note.id,
+        workspace_id=note.workspace_id,
+        user_id=user_id,
+        version_number=version_number,
+        change_reason=change_reason,
+        restored_from_version_id=restored_from_version_id,
+        title=note.title,
+        content=note.content,
+        summary=note.summary,
+        tags=list(note.tags or []),
+        connections=[str(connection_id) for connection_id in (note.connections or [])],
+        note_type=note.note_type,
+        source_url=note.source_url,
+        word_count=note.word_count or calculate_word_count(note.content),
+        diff_segments=diff_segments,
+        version_metadata=extra_metadata or {},
+    )
+    db.add(version)
+    await db.flush()
+    return version
+
+
+def serialize_note_version(version: NoteVersion) -> NoteVersionResponse:
+    return NoteVersionResponse(
+        id=str(version.id),
+        note_id=str(version.note_id),
+        workspace_id=str(version.workspace_id) if version.workspace_id else None,
+        user_id=str(version.user_id),
+        version_number=int(version.version_number or 0),
+        change_reason=version.change_reason,
+        restored_from_version_id=str(version.restored_from_version_id) if version.restored_from_version_id else None,
+        title=version.title,
+        content=version.content,
+        summary=version.summary,
+        tags=list(version.tags or []),
+        connections=[str(connection_id) for connection_id in (version.connections or [])],
+        note_type=version.note_type,
+        source_url=version.source_url,
+        word_count=version.word_count or 0,
+        diff_segments=[
+            NoteVersionDiffSegmentResponse(
+                type=str(segment.get("type") or "unchanged"),
+                text=str(segment.get("text") or ""),
+                word_count=int(segment.get("word_count") or 0),
+            )
+            for segment in (version.diff_segments or [])
+        ],
+        metadata=dict(version.version_metadata or {}),
+        created_at=(version.created_at or datetime.now(timezone.utc)).isoformat(),
+    )
 
 
 async def sync_note_search_index(db: AsyncSession, note_id: UUID) -> None:
@@ -322,6 +525,15 @@ async def create_note(
         select(Note).where(Note.id == new_note.id)
     )
     persisted_note = persisted_note_result.scalar_one_or_none() or new_note
+    created_version = await create_note_version_snapshot(
+        db,
+        note=persisted_note,
+        user_id=current_user.id,
+        change_reason="created",
+        extra_metadata={"trigger": "create_note"},
+    )
+    if created_version is not None:
+        await db.commit()
     await safe_log_note_audit(
         db,
         current_user_id=current_user.id,
@@ -340,27 +552,7 @@ async def create_note(
     if len(note_data.content.split()) > 20:
         background_tasks.add_task(queue_note_summary, str(persisted_note.id))
     
-    return NoteResponse(
-        id=str(persisted_note.id),
-        workspace_id=str(persisted_note.workspace_id) if persisted_note.workspace_id else None,
-        user_id=str(persisted_note.user_id),
-        title=persisted_note.title,
-        content=persisted_note.content,
-        summary=persisted_note.summary,
-        tags=persisted_note.tags or [],
-        connections=persisted_note.connections or [],
-        note_type=persisted_note.note_type,
-        word_count=persisted_note.word_count or 0,
-        ai_generated=bool(persisted_note.ai_generated),
-        confidence_score=persisted_note.confidence_score,
-        source_url=persisted_note.source_url,
-        created_at=persisted_note.created_at.isoformat() if persisted_note.created_at else datetime.utcnow().isoformat(),
-        updated_at=(
-            persisted_note.updated_at.isoformat()
-            if persisted_note.updated_at
-            else (persisted_note.created_at.isoformat() if persisted_note.created_at else datetime.utcnow().isoformat())
-        ),
-    )
+    return serialize_note(persisted_note)
 
 
 @router.get("", response_model=NoteListResponse)
@@ -435,26 +627,7 @@ async def list_notes(
     notes = result.scalars().all()
     
     return NoteListResponse(
-        items=[
-            NoteResponse(
-                id=str(note.id),
-                workspace_id=str(note.workspace_id) if note.workspace_id else None,
-                user_id=str(note.user_id),
-                title=note.title,
-                content=note.content,
-                summary=note.summary,
-                tags=note.tags or [],
-                connections=note.connections or [],
-                note_type=note.note_type,
-                word_count=note.word_count or 0,
-                ai_generated=bool(note.ai_generated),
-                confidence_score=note.confidence_score,
-                source_url=note.source_url,
-                created_at=note.created_at.isoformat(),
-                updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
-            )
-            for note in notes
-        ],
+        items=[serialize_note(note) for note in notes],
         total=total,
         page=page,
         page_size=page_size,
@@ -493,22 +666,134 @@ async def get_note(
             detail="Note not found"
         )
     
-    return NoteResponse(
-        id=str(note.id),
-        workspace_id=str(note.workspace_id) if note.workspace_id else None,
-        user_id=str(note.user_id),
-        title=note.title,
-        content=note.content,
-        summary=note.summary,
-        tags=note.tags or [],
-        connections=note.connections or [],
-        note_type=note.note_type,
-        word_count=note.word_count or 0,
-        ai_generated=bool(note.ai_generated),
-        confidence_score=note.confidence_score,
-        source_url=note.source_url,
-        created_at=note.created_at.isoformat(),
-        updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
+    return serialize_note(note)
+
+
+@router.get("/{note_id}/versions", response_model=List[NoteVersionResponse])
+async def list_note_versions(
+    note_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """List immutable note versions for timeline and lineage views."""
+    note_uuid = UUID(note_id)
+    note_result = await db.execute(
+        select(Note).where(
+            and_(
+                Note.id == note_uuid,
+                Note.user_id == current_user.id,
+            )
+        )
+    )
+    note = note_result.scalar_one_or_none()
+    if not note:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    version_result = await db.execute(
+        select(NoteVersion)
+        .where(NoteVersion.note_id == note_uuid)
+        .order_by(NoteVersion.version_number.desc(), NoteVersion.created_at.desc())
+    )
+    return [serialize_note_version(version) for version in version_result.scalars().all()]
+
+
+@router.post("/{note_id}/versions/{version_id}/restore", response_model=NoteVersionRestoreResponse)
+async def restore_note_version(
+    note_id: str,
+    version_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Restore a historical note version by creating a new current version."""
+    note_uuid = UUID(note_id)
+    version_uuid = UUID(version_id)
+
+    note_result = await db.execute(
+        select(Note).where(
+            and_(
+                Note.id == note_uuid,
+                Note.user_id == current_user.id,
+            )
+        )
+    )
+    note = note_result.scalar_one_or_none()
+    if not note:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    version_result = await db.execute(
+        select(NoteVersion).where(
+            and_(
+                NoteVersion.id == version_uuid,
+                NoteVersion.note_id == note_uuid,
+            )
+        )
+    )
+    version = version_result.scalar_one_or_none()
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note version not found")
+
+    current_state_matches = (
+        note.title == version.title
+        and note.content == version.content
+        and list(note.tags or []) == list(version.tags or [])
+        and [str(connection_id) for connection_id in (note.connections or [])]
+        == [str(connection_id) for connection_id in (version.connections or [])]
+        and note.note_type == version.note_type
+        and note.source_url == version.source_url
+    )
+    if current_state_matches:
+        restored_snapshot = await get_latest_note_version(db, note.id)
+        return NoteVersionRestoreResponse(
+            note=serialize_note(note),
+            restored_version=serialize_note_version(restored_snapshot or version),
+        )
+
+    note.title = version.title
+    note.content = version.content
+    note.summary = version.summary
+    note.tags = list(version.tags or [])
+    note.connections = [str(connection_id) for connection_id in (version.connections or [])]
+    note.note_type = version.note_type
+    note.source_url = version.source_url
+    note.word_count = version.word_count or calculate_word_count(version.content)
+    note.updated_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    refreshed_result = await db.execute(select(Note).where(Note.id == note.id))
+    note = refreshed_result.scalar_one_or_none() or note
+
+    restored_snapshot = await create_note_version_snapshot(
+        db,
+        note=note,
+        user_id=current_user.id,
+        change_reason="restored",
+        restored_from_version_id=version.id,
+        extra_metadata={
+            "trigger": "restore_note_version",
+            "restored_from_version_number": version.version_number,
+        },
+    )
+    if restored_snapshot is not None:
+        await db.commit()
+
+    await safe_log_note_audit(
+        db,
+        current_user_id=current_user.id,
+        workspace_id=note.workspace_id,
+        note_id=note.id,
+        action=AuditAction.NOTE_UPDATED,
+    )
+    background_tasks.add_task(sync_note_graph_by_id, note.id)
+    background_tasks.add_task(sync_note_search_index_by_id, note.id)
+    background_tasks.add_task(queue_note_embedding, str(note.id))
+    background_tasks.add_task(queue_note_connection_suggestions, str(note.id))
+    if len(note.content.split()) > 20:
+        background_tasks.add_task(queue_note_summary, str(note.id))
+
+    return NoteVersionRestoreResponse(
+        note=serialize_note(note),
+        restored_version=serialize_note_version(restored_snapshot or version),
     )
 
 
@@ -549,24 +834,51 @@ async def update_note(
     
     # Update fields
     semantic_fields_updated = False
+    note_changed = False
     if updates.title is not None:
-        note.title = updates.title
-        semantic_fields_updated = True
+        if updates.title != note.title:
+            note.title = updates.title
+            semantic_fields_updated = True
+            note_changed = True
     if updates.content is not None:
-        note.content = updates.content
-        note.word_count = calculate_word_count(updates.content)
-        semantic_fields_updated = True
+        if updates.content != note.content:
+            note.content = updates.content
+            note.word_count = calculate_word_count(updates.content)
+            semantic_fields_updated = True
+            note_changed = True
     if updates.tags is not None:
-        note.tags = updates.tags
-        semantic_fields_updated = True
+        normalized_tags = list(updates.tags or [])
+        if normalized_tags != list(note.tags or []):
+            note.tags = normalized_tags
+            semantic_fields_updated = True
+            note_changed = True
     if updates.connections is not None:
-        note.connections = updates.connections
+        normalized_connections = [str(connection_id) for connection_id in (updates.connections or [])]
+        if normalized_connections != [str(connection_id) for connection_id in (note.connections or [])]:
+            note.connections = normalized_connections
+            note_changed = True
     if updates.note_type is not None:
-        note.note_type = updates.note_type
-    
-    note.updated_at = datetime.utcnow()
+        if updates.note_type != note.note_type:
+            note.note_type = updates.note_type
+            note_changed = True
+
+    if not note_changed:
+        return serialize_note(note)
+
+    note.updated_at = datetime.now(timezone.utc)
     
     await db.commit()
+    refreshed_result = await db.execute(select(Note).where(Note.id == note.id))
+    note = refreshed_result.scalar_one_or_none() or note
+    created_version = await create_note_version_snapshot(
+        db,
+        note=note,
+        user_id=current_user.id,
+        change_reason="updated",
+        extra_metadata={"trigger": "update_note"},
+    )
+    if created_version is not None:
+        await db.commit()
     await safe_log_note_audit(
         db,
         current_user_id=current_user.id,
@@ -584,23 +896,7 @@ async def update_note(
         if len(note.content.split()) > 20:
             background_tasks.add_task(queue_note_summary, str(note.id))
     
-    return NoteResponse(
-        id=str(note.id),
-        workspace_id=str(note.workspace_id) if note.workspace_id else None,
-        user_id=str(note.user_id),
-        title=note.title,
-        content=note.content,
-        summary=note.summary,
-        tags=note.tags or [],
-        connections=note.connections or [],
-        note_type=note.note_type,
-        word_count=note.word_count or 0,
-        ai_generated=bool(note.ai_generated),
-        confidence_score=note.confidence_score,
-        source_url=note.source_url,
-        created_at=note.created_at.isoformat(),
-        updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
-    )
+    return serialize_note(note)
 
 
 @router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -866,26 +1162,7 @@ async def get_workspace_notes(
     notes = result.scalars().all()
     
     return NoteListResponse(
-        items=[
-            NoteResponse(
-                id=str(note.id),
-                workspace_id=str(note.workspace_id) if note.workspace_id else None,
-                user_id=str(note.user_id),
-                title=note.title,
-                content=note.content,
-                summary=note.summary,
-                tags=note.tags or [],
-                connections=note.connections or [],
-                note_type=note.note_type,
-                word_count=note.word_count or 0,
-                ai_generated=bool(note.ai_generated),
-                confidence_score=note.confidence_score,
-                source_url=note.source_url,
-                created_at=note.created_at.isoformat(),
-                updated_at=note.updated_at.isoformat() if note.updated_at else note.created_at.isoformat(),
-            )
-            for note in notes
-        ],
+        items=[serialize_note(note) for note in notes],
         total=total,
         page=page,
         page_size=page_size,

@@ -166,7 +166,7 @@ async def retrieve_context(
         retriever = get_top_k_retriever(db=db, top_k=k, similarity_threshold=threshold)
 
         # Offload sync retriever to a thread so the event loop stays clear.
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
             lambda: retriever.retrieve(
@@ -191,17 +191,19 @@ async def retrieve_context(
             if raw_date:
                 created_at = raw_date.isoformat() if hasattr(raw_date, "isoformat") else str(raw_date)
 
+            similarity = max(0.0, min(float(chunk.similarity), 1.0))
             sources.append(
                 RAGSource(
                     noteId=str(chunk.document_id),
                     title=title,
                     excerpt=extract_excerpt(chunk.text, query),
                     createdAt=created_at,
-                    similarity=float(chunk.similarity),
+                    similarity=similarity,
                 )
             )
 
-        return sources
+        sources.sort(key=lambda item: item.similarity, reverse=True)
+        return sources[:k]
 
     except Exception:
         logger.exception("Error retrieving context for query=%r workspace=%s", query, workspace_id)
@@ -215,7 +217,10 @@ async def retrieve_context(
 def build_rag_system_prompt(query: str, sources: List[RAGSource]) -> str:
     """Build a strictly-grounded system prompt from retrieved sources."""
     if not sources:
-        return f'The user\'s knowledge base contains no notes relevant to: "{query}"'
+        return (
+            "The user's knowledge base does not contain any relevant notes for this question. "
+            "Do not answer with general knowledge."
+        )
 
     source_context = "\n".join(
         f"""
@@ -233,11 +238,16 @@ Your job is to answer their question using ONLY information from the provided so
 
 STRICT RULES:
 1. ONLY use information from the provided sources. Never use general knowledge.
-2. Cite every claim with [SOURCE N] inline.
-3. If the sources don't contain enough information, say exactly that.
-4. Refer to the user in second person ("you wrote", "your notes say").
-5. Include the note title and date when referencing a source.
-6. End with 2-3 follow-up questions the user might want to explore.
+2. Cite every claim inline using this exact format: [Note Title | YYYY-MM-DD | NN%].
+3. Every citation must use the matching source title, date, and relevance percentage from the provided sources.
+4. If the sources don't contain enough information, say exactly: "I couldn't find enough in your notes to answer that."
+5. Never invent facts, dates, or explanations that are not explicitly supported by the sources.
+6. Refer to the user in second person ("you wrote", "your notes say").
+7. Keep the answer focused and grounded in the cited notes.
+8. Do not use [SOURCE N] style placeholders in the final answer.
+9. Do not answer from memory or world knowledge even if you know the topic.
+10. Include the note title, date, and similarity percentage in every citation.
+11. End with 2-3 follow-up questions the user might want to explore.
 
 SOURCES FROM YOUR KNOWLEDGE BASE:
 {source_context}
@@ -408,6 +418,14 @@ async def _rag_stream(
     # --- Retrieve context --------------------------------------------------
     sources = await retrieve_context(query, workspace_id, db, k=top_k, threshold=threshold)
     yield json.dumps({"type": "sources", "sources": [s.model_dump() for s in sources]}) + "\n"
+
+    if not sources:
+        yield json.dumps({
+            "type": "token",
+            "text": "I couldn't find enough in your notes to answer that.",
+        }) + "\n"
+        yield json.dumps({"type": "done", "followUpQuestions": []}) + "\n"
+        return
 
     # --- Build prompt & messages -------------------------------------------
     system_prompt = build_rag_system_prompt(query, sources)
