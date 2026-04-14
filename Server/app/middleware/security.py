@@ -26,6 +26,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         
         # Modern browsers only send Referer header when following same protocol
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-site"
+        response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+        response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/auth") else response.headers.get("Cache-Control", "no-store, max-age=0")
         
         # HSTS (only in production with HTTPS)
         if settings.ENVIRONMENT == "production":
@@ -34,13 +38,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Content Security Policy
         if settings.ENVIRONMENT == "production":
             response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-                "style-src 'self' 'unsafe-inline'; "
-                "img-src 'self' data: https:; "
-                "font-src 'self' data:; "
-                "connect-src 'self'; "
-                "frame-ancestors 'none'"
+                "default-src 'none'; "
+                "base-uri 'none'; "
+                "frame-ancestors 'none'; "
+                "form-action 'self'; "
+                "connect-src 'self'"
             )
         
         return response
