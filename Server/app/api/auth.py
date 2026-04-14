@@ -16,7 +16,8 @@ from app.core.security import (
     verify_password,
     get_password_hash,
     create_access_token,
-    decode_token
+    decode_token,
+    validate_password_strength,
 )
 from app.core.auth import get_current_user, get_current_active_user
 from app.core.audit import log_audit_event, AuditAction, EntityType
@@ -77,7 +78,7 @@ async def get_user_workspaces(user: DBUser, db: AsyncSession) -> List[dict]:
 class UserRegister(BaseModel):
     """User registration schema."""
     email: EmailStr
-    password: str = Field(..., min_length=8, max_length=100)
+    password: str = Field(..., min_length=10, max_length=128)
     full_name: Optional[str] = Field(None, max_length=255)
 
 
@@ -90,7 +91,7 @@ class UserLogin(BaseModel):
 class ChangePassword(BaseModel):
     """Change password schema."""
     old_password: str
-    new_password: str = Field(..., min_length=8)
+    new_password: str = Field(..., min_length=10, max_length=128)
 
 
 class TokenResponse(BaseModel):
@@ -155,7 +156,13 @@ async def register(
         )
     
     # Create new user
-    hashed_password = get_password_hash(user_data.password)
+    try:
+        hashed_password = get_password_hash(user_data.password)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
     
     user = DBUser(
         email=user_data.email,
@@ -398,9 +405,22 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Incorrect current password"
         )
+
+    if password_data.old_password == password_data.new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from the current password"
+        )
     
     # Update password
-    current_user.hashed_password = get_password_hash(password_data.new_password)
+    try:
+        validate_password_strength(password_data.new_password)
+        current_user.hashed_password = get_password_hash(password_data.new_password)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc)
+        ) from exc
     await db.commit()
     
     # Log audit event
