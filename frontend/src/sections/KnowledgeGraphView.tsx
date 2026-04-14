@@ -137,6 +137,8 @@ function applyFilters(
 export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewProps) {
   const authContext = useContext(AuthContext);
   const workspaceId = authContext?.currentWorkspaceId;
+  const hasPermission = authContext?.hasPermission ?? (() => false);
+  const canViewGraph = Boolean(workspaceId && hasPermission(workspaceId, 'knowledge_graph', 'view'));
   const filters = useKnowledgeGraphFilters();
   const viewportRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -180,7 +182,7 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
   }, []);
 
   useEffect(() => {
-    if (!workspaceId) {
+    if (!workspaceId || !canViewGraph) {
       setRawGraphData(generateKnowledgeGraph(notes));
       return undefined;
     }
@@ -209,12 +211,12 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
       isMounted = false;
       abortController.abort();
     };
-  }, [workspaceId]);
+  }, [canViewGraph, workspaceId]);
 
   useEffect(() => {
-    if (workspaceId) return;
+    if (workspaceId && canViewGraph) return;
     setRawGraphData(generateKnowledgeGraph(notes));
-  }, [workspaceId, notes]);
+  }, [canViewGraph, workspaceId, notes]);
 
   useEffect(() => {
     resetKnowledgeGraphFilters();
@@ -225,6 +227,16 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
   }, [workspaceId]);
 
   const graphData = useMemo(() => applyFilters(rawGraphData, { ...filters, search: debouncedSearch }), [rawGraphData, filters, debouncedSearch]);
+
+  if (workspaceId && !canViewGraph) {
+    return (
+      <div style={{ padding: 32, background: TT.inkBlack, minHeight: '100vh', fontFamily: TT.fontMono }}>
+        <div style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '16px 18px', color: TT.inkMuted, fontSize: 11, letterSpacing: '0.04em' }}>
+          Your current role does not allow viewing the knowledge graph in this workspace.
+        </div>
+      </div>
+    );
+  }
 
   useEffect(() => {
     if (selectedNode && !graphData.nodes.some((node) => node.id === selectedNode.id)) setSelectedNode(null);

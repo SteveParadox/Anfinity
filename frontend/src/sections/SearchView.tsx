@@ -111,10 +111,12 @@ export function SearchView() {
   
   const authContext = useContext(AuthContext);
   const workspaceId = authContext?.currentWorkspaceId;
+  const hasPermission = authContext?.hasPermission ?? (() => false);
+  const canUseSearch = Boolean(workspaceId && hasPermission(workspaceId, 'search', 'view'));
 
   // Load notes from workspace for generating suggestions
   useEffect(() => {
-    if (!workspaceId) {
+    if (!workspaceId || !canUseSearch) {
       console.debug('ℹ️ [NO WORKSPACE] No workspace ID, clearing notes');
       setNotes([]);
       return;
@@ -135,7 +137,7 @@ export function SearchView() {
     };
 
     loadWorkspaceNotes();
-  }, [workspaceId]);
+  }, [canUseSearch, workspaceId]);
 
   // Generate suggested searches from workspace note titles and tags
   const generateSuggestions = (): string[] => {
@@ -225,7 +227,7 @@ export function SearchView() {
       return;
     }
     
-    if (!workspaceId) {
+    if (!workspaceId || !canUseSearch) {
       console.warn('⚠️ [VALIDATION] Workspace context not loaded');
       setError('Workspace is not loaded. Please try again.');
       setIsSearching(false);
@@ -300,7 +302,7 @@ export function SearchView() {
       return;
     }
 
-    if (!workspaceId) {
+    if (!workspaceId || !canUseSearch) {
       setError('Workspace is not loaded. Please try again.');
       setIsSearching(false);
       return;
@@ -406,6 +408,16 @@ export function SearchView() {
   };
 
   const suggested = generateSuggestions();
+
+  if (workspaceId && !canUseSearch) {
+    return (
+      <div style={{ padding: 32, background: TT.inkBlack, minHeight: '100vh', fontFamily: TT.fontMono }}>
+        <div style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '16px 18px', color: TT.inkMuted, fontSize: 11, letterSpacing: '0.04em' }}>
+          Your current role does not allow AI search in this workspace.
+        </div>
+      </div>
+    );
+  }
 
   // STEP 8: Submit feedback on answer quality
   const handleSubmitFeedback = async (status: 'verified' | 'rejected') => {

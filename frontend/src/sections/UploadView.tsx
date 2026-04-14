@@ -175,6 +175,8 @@ export function DocumentUploadView({
   const authContext = useContext(AuthContext);
   const currentWorkspaceId = authContext?.currentWorkspaceId;
   const workspaces = authContext?.workspaces ?? [];
+  const hasPermission = authContext?.hasPermission ?? (() => false);
+  const creatableWorkspaces = workspaces.filter((workspace) => hasPermission(workspace.id, 'documents', 'create'));
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -189,8 +191,12 @@ export function DocumentUploadView({
 
   // Sync workspace selection with context changes
   useEffect(() => {
-    setSelectedUploadWorkspaceId(currentWorkspaceId ?? null);
-  }, [currentWorkspaceId]);
+    if (currentWorkspaceId && hasPermission(currentWorkspaceId, 'documents', 'create')) {
+      setSelectedUploadWorkspaceId(currentWorkspaceId);
+      return;
+    }
+    setSelectedUploadWorkspaceId(creatableWorkspaces[0]?.id ?? null);
+  }, [creatableWorkspaces, currentWorkspaceId, hasPermission]);
 
   const { status, progress, error: ingestionError } = useDocumentIngestion(
     uploadedDocumentId ?? '',
@@ -289,9 +295,9 @@ export function DocumentUploadView({
       return;
     }
 
-    if (!currentWorkspaceId) {
+    if (!selectedUploadWorkspaceId || !hasPermission(selectedUploadWorkspaceId, 'documents', 'create')) {
       console.error('❌ [WORKSPACE ERROR] No active workspace found');
-      setValidationError('No active workspace found. Please select a workspace and try again.');
+      setValidationError('You do not have permission to upload documents in the selected workspace.');
       return;
     }
 
@@ -303,12 +309,7 @@ export function DocumentUploadView({
     try {
       clearError?.();
       console.debug('📡 [API CALL] Calling uploadDocument()');
-      const workspaceToUse = selectedUploadWorkspaceId || currentWorkspaceId;
-      if (!workspaceToUse) {
-        console.error('❌ [WORKSPACE VALIDATION] No workspace selected for upload');
-        setValidationError('No workspace selected for upload. Please select a workspace.');
-        return;
-      }
+      const workspaceToUse = selectedUploadWorkspaceId;
       console.log('📦 [WORKSPACE CONTEXT] Uploading to workspace:', workspaceToUse);
       const doc = await uploadDocument(selectedFile, workspaceToUse, {
         signal: abortRef.current.signal,
@@ -339,7 +340,7 @@ export function DocumentUploadView({
       abortRef.current = null;
       console.debug('🧹 [CLEANUP] Abort controller cleared');
     }
-  }, [selectedFile, currentWorkspaceId, uploadDocument, clearError, onUploadComplete, onError]);
+  }, [selectedFile, selectedUploadWorkspaceId, hasPermission, uploadDocument, clearError, onUploadComplete, onError]);
 
   const handleCancelUpload = useCallback(() => {
     console.log('⏹️ [CANCEL UPLOAD] User cancelled upload');
@@ -419,7 +420,7 @@ export function DocumentUploadView({
         </div>
 
         {/* ── Workspace Selector ── */}
-        {workspaces.length > 0 && (
+        {creatableWorkspaces.length > 0 && (
           <div style={{ marginBottom: '32px', display: 'flex', alignItems: 'center', gap: '12px' }}>
             <label
               htmlFor="workspace-select"
@@ -454,13 +455,17 @@ export function DocumentUploadView({
               }}
             >
               <option value="">Select workspace...</option>
-              {workspaces.map((ws) => (
+              {creatableWorkspaces.map((ws) => (
                 <option key={ws.id} value={ws.id} style={{ background: TT.inkDeep, color: TT.snow }}>
                   {ws.name}
                 </option>
               ))}
             </select>
           </div>
+        )}
+
+        {creatableWorkspaces.length === 0 && (
+          <InlineError message="Your current role does not allow document uploads in any available workspace." />
         )}
 
         <AnimatePresence mode="wait">
@@ -543,7 +548,7 @@ export function DocumentUploadView({
                 <div style={{ marginTop: '24px', display: 'flex', gap: '12px' }}>
                   <button
                     onClick={handleUpload}
-                    disabled={uploading}
+                    disabled={uploading || !selectedUploadWorkspaceId || !hasPermission(selectedUploadWorkspaceId, 'documents', 'create')}
                     aria-busy={uploading}
                     style={{
                       flex: 1,

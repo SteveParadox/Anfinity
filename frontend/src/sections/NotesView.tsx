@@ -318,10 +318,12 @@ export function NotesView({
     currentWorkspaceId,
     workspaces: ctxWorkspaces,
     setCurrentWorkspace,
+    hasPermission,
   } = authContext || {
     currentWorkspaceId: null,
     workspaces: [],
     setCurrentWorkspace: () => {},
+    hasPermission: () => false,
   };
   const [notes, setNotes] = useState<Note[]>(initialNotes);
   const [workspaces, setWorkspaces] = useState<Workspace[]>(propWorkspaces || (ctxWorkspaces as any) || []);
@@ -341,6 +343,9 @@ export function NotesView({
 
   const workspaceId = currentWorkspaceId || initialSelectedWorkspace;
   const defaultWorkspaceId = workspaceId || workspaces[0]?.id || '';
+  const canViewWorkspaceNotes = Boolean(workspaceId && hasPermission(workspaceId, 'notes', 'view'));
+  const canCreateWorkspaceNotes = Boolean(defaultWorkspaceId && hasPermission(defaultWorkspaceId, 'notes', 'create'));
+  const canUpdateSelectedNote = Boolean(selectedNote?.workspaceId && hasPermission(selectedNote.workspaceId, 'notes', 'update'));
 
   const createEmptyNote = (targetWorkspaceId = '') => ({
     title: '',
@@ -389,7 +394,10 @@ export function NotesView({
 
   // Load notes from API
   useEffect(() => {
-    if (!workspaceId) return;
+    if (!workspaceId || !canViewWorkspaceNotes) {
+      setNotes([]);
+      return;
+    }
 
     const loadNotes = async () => {
       try {
@@ -403,7 +411,7 @@ export function NotesView({
     };
 
     loadNotes();
-  }, [workspaceId]);
+  }, [canViewWorkspaceNotes, workspaceId]);
 
   // Load workspace details for selected note
   useEffect(() => {
@@ -512,6 +520,7 @@ export function NotesView({
   const handleCreateNote = async () => {
     const targetWorkspaceId = newNote.workspaceId || defaultWorkspaceId;
     if (!newNote.title.trim() || !targetWorkspaceId) return;
+    if (!hasPermission(targetWorkspaceId, 'notes', 'create')) return;
 
     try {
       const createdNoteResponse: any = await api.createNote({
@@ -551,7 +560,8 @@ export function NotesView({
   };
 
   const handleUpdateNote = async () => {
-    if (!editingNote || !workspaceId) return;
+    if (!editingNote || !editingNote.workspaceId) return;
+    if (!hasPermission(editingNote.workspaceId, 'notes', 'update')) return;
 
     try {
       const updatedNote: any = await api.updateNote(editingNote.id, {
@@ -580,6 +590,7 @@ export function NotesView({
 
   const handleRestoreVersion = async (version: NoteVersion) => {
     if (!selectedNote) return;
+    if (!selectedNote.workspaceId || !hasPermission(selectedNote.workspaceId, 'notes', 'update')) return;
 
     try {
       setRestoringVersionId(version.id);
@@ -602,6 +613,7 @@ export function NotesView({
 
   const handleUpdateConnections = async () => {
     if (!selectedNote) return;
+    if (!selectedNote.workspaceId || !hasPermission(selectedNote.workspaceId, 'notes', 'update')) return;
     try {
       const updatedNote: any = await api.updateNote(selectedNote.id, {
         connections: selectedNote.connections || [],
@@ -618,6 +630,7 @@ export function NotesView({
 
   const handleConfirmConnectionSuggestion = async (suggestion: NoteConnectionSuggestion) => {
     if (!selectedNote) return;
+    if (!selectedNote.workspaceId || !hasPermission(selectedNote.workspaceId, 'notes', 'update')) return;
 
     try {
       const response = await api.confirmNoteConnectionSuggestion(selectedNote.id, suggestion.id);
@@ -638,6 +651,7 @@ export function NotesView({
 
   const handleDismissConnectionSuggestion = async (suggestion: NoteConnectionSuggestion) => {
     if (!selectedNote) return;
+    if (!selectedNote.workspaceId || !hasPermission(selectedNote.workspaceId, 'notes', 'update')) return;
 
     try {
       await api.dismissNoteConnectionSuggestion(selectedNote.id, suggestion.id);
@@ -648,6 +662,8 @@ export function NotesView({
   };
 
   const handleDeleteNote = async (noteId: string) => {
+    const targetNote = notes.find((note) => note.id === noteId) || selectedNote;
+    if (!targetNote?.workspaceId || !hasPermission(targetNote.workspaceId, 'notes', 'delete')) return;
     try {
       await api.deleteNote(noteId);
       setNotes(notes.filter(n => n.id !== noteId));
@@ -702,10 +718,16 @@ export function NotesView({
             {filteredNotes.length} notes in your knowledge base
           </p>
         </div>
-        <YellowBtn onClick={() => setIsCreating(true)}>
+        <YellowBtn onClick={() => setIsCreating(true)} disabled={!canCreateWorkspaceNotes}>
           <Plus size={13} /> New Note
         </YellowBtn>
       </div>
+
+      {!canViewWorkspaceNotes && workspaceId && (
+        <div style={{ marginBottom: 20, padding: '12px 14px', background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, color: TT.inkMuted, fontSize: 11, letterSpacing: '0.04em' }}>
+          You can access this workspace, but your current role does not allow viewing notes here.
+        </div>
+      )}
 
       {/* ── Filters ─────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap' }}>
@@ -837,10 +859,11 @@ export function NotesView({
                     >
                       <button
                         onClick={() => setEditingNote(note)}
+                        disabled={!note.workspaceId || !hasPermission(note.workspaceId, 'notes', 'update')}
                         style={{
                           background: 'none', border: `1px solid ${TT.inkBorder}`,
-                          borderRadius: 2, cursor: 'pointer', padding: '3px 5px',
-                          color: TT.inkMuted, transition: 'all 0.15s',
+                          borderRadius: 2, cursor: !note.workspaceId || !hasPermission(note.workspaceId, 'notes', 'update') ? 'not-allowed' : 'pointer', padding: '3px 5px',
+                          color: TT.inkMuted, transition: 'all 0.15s', opacity: !note.workspaceId || !hasPermission(note.workspaceId, 'notes', 'update') ? 0.35 : 1,
                         }}
                         onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = TT.yolk; (e.currentTarget as HTMLElement).style.borderColor = 'rgba(245,230,66,0.3)'; }}
                         onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = TT.inkMuted; (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder; }}
@@ -849,10 +872,11 @@ export function NotesView({
                       </button>
                       <button
                         onClick={() => handleDeleteNote(note.id)}
+                        disabled={!note.workspaceId || !hasPermission(note.workspaceId, 'notes', 'delete')}
                         style={{
                           background: 'none', border: `1px solid ${TT.inkBorder}`,
-                          borderRadius: 2, cursor: 'pointer', padding: '3px 5px',
-                          color: TT.inkMuted, transition: 'all 0.15s',
+                          borderRadius: 2, cursor: !note.workspaceId || !hasPermission(note.workspaceId, 'notes', 'delete') ? 'not-allowed' : 'pointer', padding: '3px 5px',
+                          color: TT.inkMuted, transition: 'all 0.15s', opacity: !note.workspaceId || !hasPermission(note.workspaceId, 'notes', 'delete') ? 0.35 : 1,
                         }}
                         onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = TT.error; (e.currentTarget as HTMLElement).style.borderColor = 'rgba(255,69,69,0.3)'; }}
                         onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = TT.inkMuted; (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder; }}
@@ -1034,7 +1058,7 @@ export function NotesView({
           </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 8 }}>
             <GhostBtn onClick={() => setIsCreating(false)}>Cancel</GhostBtn>
-            <YellowBtn onClick={handleCreateNote} disabled={!newNote.title.trim() || !newNote.workspaceId}>
+            <YellowBtn onClick={handleCreateNote} disabled={!newNote.title.trim() || !newNote.workspaceId || !hasPermission(newNote.workspaceId, 'notes', 'create')}>
               <Check size={13} /> Create
             </YellowBtn>
           </div>
@@ -1112,7 +1136,7 @@ export function NotesView({
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 8 }}>
               <GhostBtn onClick={() => setEditingNote(null)}>Cancel</GhostBtn>
-              <YellowBtn onClick={handleUpdateNote}>
+              <YellowBtn onClick={handleUpdateNote} disabled={!editingNote.workspaceId || !hasPermission(editingNote.workspaceId, 'notes', 'update')}>
                 <Check size={13} /> Save
               </YellowBtn>
             </div>
@@ -1394,7 +1418,7 @@ export function NotesView({
                         </div>
                         <button
                           onClick={() => handleRestoreVersion(selectedVersion)}
-                          disabled={restoringVersionId === selectedVersion.id}
+                          disabled={restoringVersionId === selectedVersion.id || !canUpdateSelectedNote}
                           style={{
                             height: 34,
                             padding: '0 12px',
@@ -1406,7 +1430,8 @@ export function NotesView({
                             fontSize: 10,
                             letterSpacing: '0.05em',
                             textTransform: 'uppercase',
-                            cursor: restoringVersionId === selectedVersion.id ? 'default' : 'pointer',
+                            cursor: restoringVersionId === selectedVersion.id || !canUpdateSelectedNote ? 'default' : 'pointer',
+                            opacity: canUpdateSelectedNote ? 1 : 0.45,
                           }}
                         >
                           {restoringVersionId === selectedVersion.id ? 'Restoring...' : 'Restore As New Version'}
@@ -1667,23 +1692,25 @@ export function NotesView({
             <div style={{ display: 'flex', gap: 8, paddingTop: 8, borderTop: `1px solid ${TT.inkBorder}` }}>
               <button
                 onClick={() => handleUpdateConnections()}
+                disabled={!canUpdateSelectedNote}
                 style={{
                   flex: 1, height: 36, padding: '0 14px',
-                  background: '#60A5FA',
+                  background: canUpdateSelectedNote ? '#60A5FA' : TT.inkMid,
                   border: 'none',
                   borderRadius: 3,
                   fontFamily: TT.fontMono,
                   fontSize: 10.5, letterSpacing: '0.05em', textTransform: 'uppercase', fontWeight: 500,
-                  color: 'white',
-                  cursor: 'pointer',
+                  color: canUpdateSelectedNote ? 'white' : TT.inkMuted,
+                  cursor: canUpdateSelectedNote ? 'pointer' : 'not-allowed',
                   transition: 'all 0.15s',
                 }}
                 onMouseEnter={(e) => {
+                  if (!canUpdateSelectedNote) return;
                   (e.currentTarget as HTMLElement).style.background = '#3b82f6';
                   (e.currentTarget as HTMLElement).style.boxShadow = '0 0 12px rgba(96,165,250,0.4)';
                 }}
                 onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLElement).style.background = '#60A5FA';
+                  (e.currentTarget as HTMLElement).style.background = canUpdateSelectedNote ? '#60A5FA' : TT.inkMid;
                   (e.currentTarget as HTMLElement).style.boxShadow = 'none';
                 }}
               >

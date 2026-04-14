@@ -204,6 +204,7 @@ interface DocumentRowProps {
   onDelete: (id: string) => void;
   onRetryOptimistic: (id: string) => void;
   onReload: () => Promise<void>;
+  canMutate: boolean;
 }
 
 function DocumentRow({
@@ -212,6 +213,7 @@ function DocumentRow({
   onDelete,
   onRetryOptimistic,
   onReload,
+  canMutate,
 }: DocumentRowProps) {
   const ingestion = useDocumentIngestion(doc.id, workspaceId);
 
@@ -357,6 +359,7 @@ function DocumentRow({
           {isFailed && (
             <IconButton
               onClick={handleRetry}
+              disabled={!canMutate}
               title="Retry processing"
               aria-label="Retry processing this document"
               color={TT.yolk}
@@ -387,7 +390,7 @@ function DocumentRow({
           ) : (
             <IconButton
               onClick={handleDeleteClick}
-              disabled={deleting}
+              disabled={deleting || !canMutate}
               title="Delete document"
               aria-label="Delete this document"
               color={TT.errorText}
@@ -458,12 +461,15 @@ export function DocumentsView() {
 
   const authContext = useContext(AuthContext);
   const workspaceId = authContext?.currentWorkspaceId;
+  const hasPermission = authContext?.hasPermission ?? (() => false);
+  const canViewDocuments = Boolean(workspaceId && hasPermission(workspaceId, 'documents', 'view'));
+  const canMutateDocuments = Boolean(workspaceId && (hasPermission(workspaceId, 'documents', 'delete') || hasPermission(workspaceId, 'documents', 'update')));
 
   // ── Data fetching ───────────────────────────────────────────────────────────
 
   const loadDocuments = useCallback(
     async (opts: { silent?: boolean } = {}) => {
-      if (!workspaceId) return;
+      if (!workspaceId || !canViewDocuments) return;
 
       // Distinguish first-load (shows spinner) from background refresh (no spinner).
       if (!opts.silent) setIsLoading(true);
@@ -488,7 +494,7 @@ export function DocumentsView() {
         setIsRefreshing(false);
       }
     },
-    [workspaceId],
+    [canViewDocuments, workspaceId],
   );
 
   // Initial load + background polling
@@ -498,11 +504,17 @@ export function DocumentsView() {
       return;
     }
 
+    if (!canViewDocuments) {
+      setDocuments([]);
+      setIsLoading(false);
+      return;
+    }
+
     loadDocuments({ silent: false });
 
     const interval = setInterval(() => loadDocuments({ silent: true }), POLL_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [workspaceId, loadDocuments]);
+  }, [canViewDocuments, workspaceId, loadDocuments]);
 
   // ── Row callbacks ───────────────────────────────────────────────────────────
 
@@ -532,6 +544,14 @@ export function DocumentsView() {
     return (
       <div style={{ padding: '24px', textAlign: 'center', color: TT.inkSubtle }}>
         Please select a workspace to view documents.
+      </div>
+    );
+  }
+
+  if (!canViewDocuments) {
+    return (
+      <div style={{ padding: '24px', textAlign: 'center', color: TT.inkSubtle }}>
+        Your current role does not allow viewing documents in this workspace.
       </div>
     );
   }
@@ -679,6 +699,7 @@ export function DocumentsView() {
                 onDelete={handleDelete}
                 onRetryOptimistic={handleRetryOptimistic}
                 onReload={handleReload}
+                canMutate={canMutateDocuments}
               />
             ))}
           </AnimatePresence>

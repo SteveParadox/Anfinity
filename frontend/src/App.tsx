@@ -106,7 +106,7 @@ function useStableStats() {
 
 function App() {
   const navigate   = useNavigate();
-  const { user: contextUser, logout, isLoading: authLoading, currentWorkspaceId } = useAuth();
+  const { user: contextUser, logout, isLoading: authLoading, currentWorkspaceId, hasPermission } = useAuth();
   const windowWidth = useWindowWidth();
   const stats       = useStableStats();
 
@@ -146,7 +146,28 @@ function App() {
     setMobileSidebarOpen(false);
   }, []);
 
-  const canOpenWorkspaceScopedChat = Boolean(currentWorkspaceId);
+  const canViewNotes = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'notes', 'view'));
+  const canCreateNotes = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'notes', 'create'));
+  const canViewDocuments = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'documents', 'view'));
+  const canCreateDocuments = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'documents', 'create'));
+  const canViewGraph = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'knowledge_graph', 'view'));
+  const canUseSearch = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'search', 'view'));
+  const canOpenWorkspaceScopedChat = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'chat', 'create'));
+  const availableViews = useMemo<View[]>(() => {
+    const views: View[] = ['dashboard', 'workspaces', 'workflows', 'pricing'];
+    if (canViewNotes) views.push('notes');
+    if (canViewDocuments) views.push('documents');
+    if (canCreateDocuments) views.push('upload');
+    if (canViewGraph) views.push('graph');
+    if (canUseSearch) views.push('search');
+    return views;
+  }, [canCreateDocuments, canUseSearch, canViewDocuments, canViewGraph, canViewNotes]);
+
+  useEffect(() => {
+    if (!availableViews.includes(currentView)) {
+      setCurrentView(availableViews[0] ?? 'dashboard');
+    }
+  }, [availableViews, currentView]);
 
   // ── View registry (replaces large switch) ──────────────────────────────
   const viewRegistry = useMemo<Partial<Record<View, React.ReactNode>>>(() => {
@@ -156,10 +177,10 @@ function App() {
       dashboard: (
         <Dashboard
           user={contextUser}
-          onCreateNote={() => setCurrentView('notes')}
-          onViewGraph={() => setCurrentView('graph')}
-          onViewAllNotes={() => setCurrentView('notes')}
-          onViewAllInsights={() => setCurrentView('search')}
+          onCreateNote={() => setCurrentView(canViewNotes ? 'notes' : 'workspaces')}
+          onViewGraph={() => setCurrentView(canViewGraph ? 'graph' : 'workspaces')}
+          onViewAllNotes={() => setCurrentView(canViewNotes ? 'notes' : 'workspaces')}
+          onViewAllInsights={() => setCurrentView(canUseSearch ? 'search' : 'workspaces')}
         />
       ),
       notes:      <NotesView />,
@@ -171,7 +192,7 @@ function App() {
       upload:     <DocumentUploadView />,
       documents:  <DocumentsView />,
     };
-  }, [contextUser]);
+  }, [canUseSearch, canViewGraph, canViewNotes, contextUser]);
 
   // ── Derived layout values ───────────────────────────────────────────────
   const sidebarWidth   = sidebarCollapsed ? SIDEBAR_COLLAPSED : SIDEBAR_EXPANDED;
@@ -258,6 +279,8 @@ function App() {
           collapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
           user={contextUser as User | undefined}
+          availableViews={availableViews}
+          canCreateNotes={canCreateNotes}
         />
       </div>
 

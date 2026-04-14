@@ -198,9 +198,27 @@ export interface Workspace {
   updated_at?: string;
 }
 
+export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
+export type WorkspacePermissionSection = 'workspace' | 'documents' | 'notes' | 'search' | 'knowledge_graph' | 'chat';
+export type WorkspacePermissionAction = 'view' | 'create' | 'update' | 'delete' | 'manage';
+
+export interface WorkspacePermissionState {
+  view: boolean;
+  create: boolean;
+  update: boolean;
+  delete: boolean;
+  manage: boolean;
+}
+
+export interface WorkspacePermissions {
+  workspace_id: string;
+  role: WorkspaceRole;
+  permissions: Record<WorkspacePermissionSection, WorkspacePermissionState>;
+}
+
 export interface WorkspaceMember {
   userId: string;
-  role: 'owner' | 'admin' | 'member';
+  role: WorkspaceRole;
   joinedAt: Date;
 }
 

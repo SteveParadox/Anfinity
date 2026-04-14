@@ -207,6 +207,9 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
   const currentWorkspaceId = authContext?.currentWorkspaceId ?? null;
   const refreshAuthWorkspaces = authContext?.refreshWorkspaces;
   const setCurrentWorkspace = authContext?.setCurrentWorkspace;
+  const hasPermission = authContext?.hasPermission ?? (() => false);
+  const canManageSelectedWorkspace = Boolean(selectedWorkspace?.id && hasPermission(selectedWorkspace.id, 'workspace', 'manage'));
+  const canUpdateSelectedWorkspace = Boolean(selectedWorkspace?.id && hasPermission(selectedWorkspace.id, 'workspace', 'update'));
 
   useEffect(() => {
     if (authWorkspaces.length > 0) {
@@ -525,8 +528,8 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
                   <FolderOpen size={18} color={TT.yolk} />
                 </div>
                 <div className="ws-actions" style={{ display: 'flex', gap: 4, opacity: 0, transition: 'opacity 0.15s' }} onClick={(e) => e.stopPropagation()}>
-                  <SmallBtn onClick={() => setEditingWorkspace(workspace)}><Edit2 size={10} /></SmallBtn>
-                  <SmallBtn danger onClick={() => handleDeleteWorkspace(workspace.id)}><Trash2 size={10} /></SmallBtn>
+                  {hasPermission(workspace.id, 'workspace', 'update') && <SmallBtn onClick={() => setEditingWorkspace(workspace)}><Edit2 size={10} /></SmallBtn>}
+                  {hasPermission(workspace.id, 'workspace', 'delete') && <SmallBtn danger onClick={() => handleDeleteWorkspace(workspace.id)}><Trash2 size={10} /></SmallBtn>}
                 </div>
               </div>
 
@@ -603,7 +606,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
                   <Users size={12} color={TT.yolk} />
                   <span style={{ fontFamily: TT.fontDisplay, fontSize: 17, letterSpacing: '0.06em', color: TT.snow }}>MEMBERS</span>
                 </div>
-                <SmallBtn onClick={() => setInviteDialogOpen(true)}><UserPlus size={10} /> Invite</SmallBtn>
+                {canManageSelectedWorkspace && <SmallBtn onClick={() => setInviteDialogOpen(true)}><UserPlus size={10} /> Invite</SmallBtn>}
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -632,7 +635,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.07em', textTransform: 'uppercase', padding: '2px 8px', background: rc.bg, color: rc.color, border: `1px solid ${rc.border}`, borderRadius: 2 }}>
                           <RoleIcon size={9} /> {role}
                         </span>
-                        {!isCurrentUser && <SmallBtn danger onClick={() => handleRemoveMember(member.user_id)}><Trash2 size={10} /></SmallBtn>}
+                        {!isCurrentUser && canManageSelectedWorkspace && <SmallBtn danger onClick={() => handleRemoveMember(member.user_id)}><Trash2 size={10} /></SmallBtn>}
                       </div>
                     </div>
                   );
@@ -735,7 +738,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
               <GhostBtn onClick={() => setEditingWorkspace(null)}>Cancel</GhostBtn>
-              <YellowBtn onClick={() => handleUpdateWorkspace(editingWorkspace.id, editingWorkspace)}>Save Changes</YellowBtn>
+              <YellowBtn onClick={() => handleUpdateWorkspace(editingWorkspace.id, editingWorkspace)} disabled={!canUpdateSelectedWorkspace}>Save Changes</YellowBtn>
             </div>
           </div>
         )}
@@ -769,7 +772,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
             <GhostBtn onClick={() => setInviteDialogOpen(false)}>Cancel</GhostBtn>
             <YellowBtn
               onClick={() => { if (selectedWorkspace && inviteEmail.trim()) handleInviteMember(); }}
-              disabled={!inviteEmail.trim() || !selectedWorkspace}
+              disabled={!inviteEmail.trim() || !selectedWorkspace || !canManageSelectedWorkspace}
             >
               Send Invite
             </YellowBtn>
