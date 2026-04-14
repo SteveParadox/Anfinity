@@ -490,6 +490,44 @@ class Note(Base):
     )
 
 
+class NoteVersion(Base):
+    """Immutable note history snapshot with structured diff metadata."""
+    __tablename__ = "note_versions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=True, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+
+    version_number = Column(Integer, nullable=False)
+    change_reason = Column(String(50), nullable=False, default="updated")
+    restored_from_version_id = Column(UUID(as_uuid=True), ForeignKey("note_versions.id"), nullable=True)
+
+    title = Column(String(500), nullable=False)
+    content = Column(Text, nullable=False)
+    summary = Column(Text, nullable=True)
+    tags = Column(JSONB, default=list)
+    connections = Column(JSONB, default=list)
+    note_type = Column(String(50), nullable=False, default="note")
+    source_url = Column(String(1000), nullable=True)
+    word_count = Column(Integer, default=0)
+
+    diff_segments = Column(JSONB, default=list)
+    version_metadata = Column("metadata", JSONB, default=dict)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    note = relationship("Note", foreign_keys=[note_id], lazy="joined")
+    author = relationship("User", foreign_keys=[user_id], lazy="joined")
+    restored_from_version = relationship("NoteVersion", remote_side=[id], lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("note_id", "version_number", name="uq_note_versions_note_version_number"),
+        Index("idx_note_versions_note_created", "note_id", "created_at"),
+        Index("idx_note_versions_workspace_note", "workspace_id", "note_id", "created_at"),
+    )
+
+
 class NoteConnectionSuggestion(Base):
     """Suggested note-to-note connection derived from similarity."""
 
