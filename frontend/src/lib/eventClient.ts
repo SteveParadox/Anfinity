@@ -13,6 +13,14 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 const HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds
 const CONNECTION_TIMEOUT_MS = 10000; // 10 seconds
 
+function isTerminalWebSocketCloseCode(code: number): boolean {
+  return code === 1008 || code === 4401 || code === 4403;
+}
+
+function isTerminalConnectionError(error: Error): boolean {
+  return /authentication|unauthorized|forbidden|policy/i.test(error.message);
+}
+
 export type ConnectionMethod = 'websocket' | 'sse';
 
 export interface EventClientConfig {
@@ -54,6 +62,7 @@ export class EventClient {
   private heartbeatTimer?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
   private config: Partial<EventClientConfig>;
+  private shouldReconnect: boolean = true;
 
   constructor(config: EventClientConfig) {
     this.workspaceId = config.workspaceId;
@@ -75,6 +84,8 @@ export class EventClient {
       return;
     }
 
+    this.shouldReconnect = true;
+
     try {
       if (this.method === 'websocket') {
         await this.connectWebSocket();
@@ -89,7 +100,9 @@ export class EventClient {
       const err = error instanceof Error ? error : new Error(String(error));
       console.error('Failed to connect:', err);
       this.config.onError?.(err);
-      this.scheduleReconnect();
+      if (this.shouldReconnect && !isTerminalConnectionError(err)) {
+        this.scheduleReconnect();
+      }
     }
   }
 
@@ -99,6 +112,8 @@ export class EventClient {
   private connectWebSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
+        let settled = false;
+        let opened = false;
         const url = new URL(
           `/events/ws/ingestion/${this.workspaceId}`,
           WS_BASE_URL
@@ -116,13 +131,16 @@ export class EventClient {
 
         this.ws = new WebSocket(url.toString());
 
-        const timeout = setTimeout(
-          () => reject(new Error('WebSocket connection timeout')),
-          CONNECTION_TIMEOUT_MS
-        );
+        const timeout = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          reject(new Error('WebSocket connection timeout'));
+        }, CONNECTION_TIMEOUT_MS);
 
         this.ws.onopen = () => {
           clearTimeout(timeout);
+          settled = true;
+          opened = true;
           this.connected = true;
           this.startHeartbeat();
           resolve();
@@ -138,16 +156,34 @@ export class EventClient {
         };
 
         this.ws.onerror = (error) => {
-          clearTimeout(timeout);
           console.error('WebSocket error:', error);
-          reject(new Error('WebSocket error'));
         };
 
-        this.ws.onclose = () => {
+        this.ws.onclose = (event) => {
+          clearTimeout(timeout);
           this.connected = false;
           this.stopHeartbeat();
           this.config.onDisconnected?.();
-          this.scheduleReconnect();
+
+          if (isTerminalWebSocketCloseCode(event.code)) {
+            this.shouldReconnect = false;
+          }
+
+          if (!opened && !settled) {
+            settled = true;
+            reject(
+              new Error(
+                isTerminalWebSocketCloseCode(event.code)
+                  ? 'WebSocket authentication failed'
+                  : `WebSocket closed before connection was established (${event.code})`
+              )
+            );
+            return;
+          }
+
+          if (this.shouldReconnect && !isTerminalWebSocketCloseCode(event.code)) {
+            this.scheduleReconnect();
+          }
         };
       } catch (error) {
         reject(error);
@@ -211,6 +247,7 @@ export class EventClient {
    * Disconnect from the event stream.
    */
   disconnect(): void {
+    this.shouldReconnect = false;
     this.connected = false;
     this.stopHeartbeat();
 
