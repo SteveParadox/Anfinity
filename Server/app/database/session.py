@@ -1,8 +1,8 @@
 """Database session management."""
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine, event, text
 
 from app.config import settings
 
@@ -43,6 +43,7 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False,
     autocommit=False,
     autoflush=False,
+    info={"app_rls_bypass": False},
 )
 
 # Sync engine for Celery workers
@@ -60,10 +61,47 @@ SyncSessionLocal = sessionmaker(
     bind=sync_engine,
     autocommit=False,
     autoflush=False,
+    info={"app_rls_bypass": True},
 )
 
 # Alias for backwards compatibility
 SessionLocal = SyncSessionLocal
+
+
+@event.listens_for(Session, "after_begin")
+def _apply_session_security_context(session: Session, transaction, connection) -> None:
+    current_user_id = session.info.get("app_current_user_id")
+    rls_bypass = session.info.get("app_rls_bypass", False)
+
+    connection.execute(
+        text("select set_config('app.rls_bypass', :value, true)"),
+        {"value": "true" if rls_bypass else "false"},
+    )
+
+    connection.execute(
+        text("select set_config('app.current_user_id', :value, true)"),
+        {"value": str(current_user_id) if current_user_id else ""},
+    )
+
+
+def bind_db_user_context(db: AsyncSession | Session, user_id) -> None:
+    if isinstance(db, AsyncSession):
+        db.sync_session.info["app_current_user_id"] = str(user_id)
+        db.sync_session.info["app_rls_bypass"] = False
+        return
+    db.info["app_current_user_id"] = str(user_id)
+    db.info["app_rls_bypass"] = False
+
+
+def bind_db_rls_bypass(db: AsyncSession | Session, enabled: bool = True) -> None:
+    if isinstance(db, AsyncSession):
+        db.sync_session.info["app_rls_bypass"] = enabled
+        if enabled:
+            db.sync_session.info.pop("app_current_user_id", None)
+        return
+    db.info["app_rls_bypass"] = enabled
+    if enabled:
+        db.info.pop("app_current_user_id", None)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

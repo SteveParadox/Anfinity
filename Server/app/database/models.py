@@ -5,7 +5,7 @@ from enum import Enum as PyEnum
 import uuid
 
 from sqlalchemy import (
-    Column, String, DateTime, ForeignKey, Integer, 
+    Column, String, DateTime, ForeignKey, Integer, Boolean,
     JSON, Text, Enum, Float, Index, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -48,6 +48,16 @@ class WorkspaceRole(str, PyEnum):
     ADMIN = "admin"      # Can manage members and settings
     MEMBER = "member"    # Can create and edit documents
     VIEWER = "viewer"    # Read-only access
+
+
+class WorkspaceSection(str, PyEnum):
+    """Workspace permission sections."""
+    WORKSPACE = "workspace"
+    DOCUMENTS = "documents"
+    NOTES = "notes"
+    SEARCH = "search"
+    KNOWLEDGE_GRAPH = "knowledge_graph"
+    CHAT = "chat"
 
 
 class GraphNodeType(str, PyEnum):
@@ -138,6 +148,30 @@ class WorkspaceMember(Base):
     
     __table_args__ = (
         UniqueConstraint('workspace_id', 'user_id', name='unique_workspace_member'),
+    )
+
+
+class WorkspacePermissionOverride(Base):
+    """Per-user permission overrides layered on top of workspace role defaults."""
+    __tablename__ = "workspace_permission_overrides"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    section = Column(Enum(WorkspaceSection), nullable=False, index=True)
+
+    can_view = Column(Boolean, nullable=True)
+    can_create = Column(Boolean, nullable=True)
+    can_update = Column(Boolean, nullable=True)
+    can_delete = Column(Boolean, nullable=True)
+    can_manage = Column(Boolean, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "user_id", "section", name="uq_workspace_permission_override_scope"),
+        Index("idx_workspace_permission_override_lookup", "workspace_id", "user_id", "section"),
     )
 
 
