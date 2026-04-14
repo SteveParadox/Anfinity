@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, status, WebSocket
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.websockets import WebSocketState
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -13,6 +14,14 @@ from app.core.security import get_token_payload
 
 # Security scheme
 security = HTTPBearer(auto_error=False)
+
+
+def _can_close_websocket(websocket: WebSocket) -> bool:
+    """Return True when the socket is still in a closeable state."""
+    return (
+        websocket.client_state != WebSocketState.DISCONNECTED
+        and websocket.application_state != WebSocketState.DISCONNECTED
+    )
 
 
 # Role hierarchy for permission checking
@@ -71,8 +80,17 @@ async def get_current_user(
         )
     
     # Get user from database
+    try:
+        parsed_user_id = UUID(str(user_id))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     result = await db.execute(
-        select(DBUser).where(DBUser.id == UUID(user_id))
+        select(DBUser).where(DBUser.id == parsed_user_id)
     )
     user = result.scalar_one_or_none()
     
@@ -134,7 +152,8 @@ async def get_websocket_user(
     token = websocket.query_params.get("token")
     
     if not token:
-        await websocket.close(code=1008, reason="Unauthorized: Missing token")
+        if _can_close_websocket(websocket):
+            await websocket.close(code=1008, reason="Unauthorized")
         raise Exception("Missing authentication token")
     
     try:
@@ -142,27 +161,37 @@ async def get_websocket_user(
         user_id = payload.get("sub")
         
         if not user_id:
-            await websocket.close(code=1008, reason="Unauthorized: Invalid token")
+            if _can_close_websocket(websocket):
+                await websocket.close(code=1008, reason="Unauthorized")
+            raise Exception("Invalid token payload")
+
+        try:
+            parsed_user_id = UUID(str(user_id))
+        except (TypeError, ValueError):
+            if _can_close_websocket(websocket):
+                await websocket.close(code=1008, reason="Unauthorized")
             raise Exception("Invalid token payload")
         
         # Get user from database
         result = await db.execute(
-            select(DBUser).where(DBUser.id == UUID(user_id))
+            select(DBUser).where(DBUser.id == parsed_user_id)
         )
         user = result.scalar_one_or_none()
         
         if not user:
-            await websocket.close(code=1008, reason="Unauthorized: User not found")
+            if _can_close_websocket(websocket):
+                await websocket.close(code=1008, reason="Unauthorized")
             raise Exception("User not found")
         
         if not user.is_active:
-            await websocket.close(code=1008, reason="Unauthorized: User disabled")
+            if _can_close_websocket(websocket):
+                await websocket.close(code=1008, reason="Unauthorized")
             raise Exception("User account is disabled")
         
         return user
     except Exception as e:
-        if not websocket.client_state.disconnected:
-            await websocket.close(code=1008, reason=f"Unauthorized: {str(e)}")
+        if _can_close_websocket(websocket):
+            await websocket.close(code=1008, reason="Unauthorized")
         raise
 
 

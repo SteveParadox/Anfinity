@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from datetime import datetime, timedelta
+import logging
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
 import bcrypt
@@ -14,10 +17,32 @@ from app.config import settings
 
 LEGACY_BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
 SHA256_BCRYPT_PREFIX = "bcrypt_sha256$"
+logger = logging.getLogger(__name__)
 
 
 def _password_bytes(password: str) -> bytes:
     return (password or "").encode("utf-8")
+
+
+def validate_password_strength(password: str) -> None:
+    """Enforce a baseline password policy server-side."""
+    if not password or len(password) < 10:
+        raise ValueError("Password must be at least 10 characters long")
+    if len(password) > 128:
+        raise ValueError("Password must be at most 128 characters long")
+    if not any(char.islower() for char in password):
+        raise ValueError("Password must include a lowercase letter")
+    if not any(char.isupper() for char in password):
+        raise ValueError("Password must include an uppercase letter")
+    if not any(char.isdigit() for char in password):
+        raise ValueError("Password must include a number")
+
+
+def _jwt_secret() -> str:
+    secret = (settings.JWT_SECRET or "").strip()
+    if not secret:
+        raise RuntimeError("JWT secret is not configured")
+    return secret
 
 
 def _bcrypt_sha256_input(password: str) -> bytes:
@@ -51,6 +76,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def get_password_hash(password: str) -> str:
     """Hash a password safely without bcrypt's 72-byte input limit."""
+    validate_password_strength(password)
     hashed = bcrypt.hashpw(_bcrypt_sha256_input(password), bcrypt.gensalt()).decode("utf-8")
     return f"{SHA256_BCRYPT_PREFIX}{hashed}"
 
@@ -69,21 +95,33 @@ def create_access_token(
         JWT token string
     """
     to_encode = data.copy()
-    
+    subject = str(to_encode.get("sub") or "").strip()
+    if not subject:
+        raise ValueError("JWT subject is required")
+    try:
+        uuid.UUID(subject)
+    except ValueError as exc:
+        raise ValueError("JWT subject must be a valid UUID") from exc
+
+    now = datetime.now(timezone.utc)
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = now + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(hours=settings.JWT_EXPIRATION_HOURS)
-    
+        expire = now + timedelta(hours=settings.JWT_EXPIRATION_HOURS)
+
     to_encode.update({
         "exp": expire,
-        "iat": datetime.utcnow(),
+        "iat": now,
+        "nbf": now,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
+        "jti": secrets.token_urlsafe(16),
         "type": "access"
     })
     
     encoded_jwt = jwt.encode(
         to_encode,
-        settings.JWT_SECRET,
+        _jwt_secret(),
         algorithm=settings.JWT_ALGORITHM
     )
     
@@ -102,12 +140,42 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
     try:
         payload = jwt.decode(
             token,
-            settings.JWT_SECRET,
-            algorithms=[settings.JWT_ALGORITHM]
+            _jwt_secret(),
+            algorithms=[settings.JWT_ALGORITHM],
+            issuer=settings.JWT_ISSUER,
+            audience=settings.JWT_AUDIENCE,
+            options={
+                "require_sub": True,
+                "require_exp": True,
+                "require_iat": True,
+                "require_nbf": True,
+                "require_iss": True,
+                "require_aud": True,
+                "require_jti": True,
+            }
         )
         return payload
     except JWTError:
-        return None
+        # Backward-compatibility path for tokens minted before issuer/audience/jti/nbf
+        # claims were added. This avoids forcing an immediate logout for active
+        # development sessions while all newly issued tokens remain on the stricter
+        # format above.
+        try:
+            payload = jwt.decode(
+                token,
+                _jwt_secret(),
+                algorithms=[settings.JWT_ALGORITHM],
+                options={
+                    "require_sub": True,
+                    "require_exp": True,
+                    "require_iat": True,
+                    "verify_aud": False,
+                    "verify_iss": False,
+                },
+            )
+            return payload
+        except JWTError:
+            return None
 
 
 def get_token_payload(token: str) -> Dict[str, Any]:
@@ -133,7 +201,7 @@ def get_token_payload(token: str) -> Dict[str, Any]:
     
     # Check expiration
     exp = payload.get("exp")
-    if exp and datetime.utcnow().timestamp() > exp:
+    if exp and datetime.now(timezone.utc).timestamp() > exp:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired",
