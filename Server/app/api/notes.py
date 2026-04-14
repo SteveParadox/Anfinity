@@ -15,14 +15,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, func, text
 
 from app.database.session import get_db, AsyncSessionLocal
-from app.database.models import Note, NoteConnectionSuggestion, NoteVersion, User as DBUser
-from app.core.auth import get_current_user, get_workspace_context
+from app.database.models import Note, NoteConnectionSuggestion, NoteVersion, User as DBUser, WorkspaceSection
+from app.core.auth import get_current_user
 from app.core.audit import log_audit_event, AuditAction, EntityType
+from app.core.permissions import ensure_workspace_permission
 from app.services.graph_service import get_graph_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/notes", tags=["Notes"])
+
+
+async def ensure_note_permission(
+    note: Note,
+    user: DBUser,
+    db: AsyncSession,
+    action: str,
+):
+    if note.workspace_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Note has no workspace",
+        )
+    return await ensure_workspace_permission(
+        workspace_id=note.workspace_id,
+        user=user,
+        db=db,
+        section=WorkspaceSection.NOTES,
+        action=action,
+    )
 
 # Helper function for lazy task imports to avoid Celery import hang at startup
 def queue_note_embedding(note_id: str) -> None:
@@ -561,9 +582,14 @@ async def create_note(
     
     logger.info(f"📝 [NOTE CREATE] User {current_user.id} creating note in workspace {workspace_id}")
     
-    # Verify workspace membership and permission
-    context = await get_workspace_context(workspace_id, current_user, db)
-    logger.debug(f"✅ [WORKSPACE VERIFIED] User has {context.role} role in workspace {workspace_id}")
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.NOTES,
+        action="create",
+    )
+    logger.debug(f"✅ [WORKSPACE VERIFIED] User can create notes in workspace {workspace_id}")
     
     # Create note
     new_note = Note(
@@ -640,11 +666,27 @@ async def list_notes(
     Returns:
         Paginated notes
     """
-    query = select(Note).where(Note.user_id == current_user.id)
+    query = select(Note)
     
     # Filter by workspace if provided
     if workspace_id:
-        query = query.where(Note.workspace_id == UUID(workspace_id))
+        try:
+            workspace_uuid = UUID(workspace_id)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid workspace_id format",
+            )
+        await ensure_workspace_permission(
+            workspace_id=workspace_uuid,
+            user=current_user,
+            db=db,
+            section=WorkspaceSection.NOTES,
+            action="view",
+        )
+        query = query.where(Note.workspace_id == workspace_uuid)
+    else:
+        query = query.where(Note.user_id == current_user.id)
     
     # Search filter
     if search:
@@ -662,9 +704,11 @@ async def list_notes(
             query = query.where(Note.tags.contains([tag]))
     
     # Get total count - build count query with same filters
-    count_query = select(func.count()).select_from(Note).where(Note.user_id == current_user.id)
+    count_query = select(func.count()).select_from(Note)
     if workspace_id:
-        count_query = count_query.where(Note.workspace_id == UUID(workspace_id))
+        count_query = count_query.where(Note.workspace_id == workspace_uuid)
+    else:
+        count_query = count_query.where(Note.user_id == current_user.id)
     if search:
         search_term = f"%{search}%"
         count_query = count_query.where(
@@ -711,14 +755,7 @@ async def get_note(
     Returns:
         Note details
     """
-    result = await db.execute(
-        select(Note).where(
-            and_(
-                Note.id == UUID(note_id),
-                Note.user_id == current_user.id
-            )
-        )
-    )
+    result = await db.execute(select(Note).where(Note.id == UUID(note_id)))
     note = result.scalar_one_or_none()
     
     if not note:
@@ -726,7 +763,7 @@ async def get_note(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Note not found"
         )
-    
+    await ensure_note_permission(note, current_user, db, "view")
     return serialize_note(note)
 
 
@@ -738,17 +775,11 @@ async def list_note_versions(
 ):
     """List immutable note versions for timeline and lineage views."""
     note_uuid = UUID(note_id)
-    note_result = await db.execute(
-        select(Note).where(
-            and_(
-                Note.id == note_uuid,
-                Note.user_id == current_user.id,
-            )
-        )
-    )
+    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
     note = note_result.scalar_one_or_none()
     if not note:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+    await ensure_note_permission(note, current_user, db, "view")
 
     version_result = await db.execute(
         select(NoteVersion)
@@ -770,17 +801,11 @@ async def restore_note_version(
     note_uuid = UUID(note_id)
     version_uuid = UUID(version_id)
 
-    note_result = await db.execute(
-        select(Note).where(
-            and_(
-                Note.id == note_uuid,
-                Note.user_id == current_user.id,
-            )
-        )
-    )
+    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
     note = note_result.scalar_one_or_none()
     if not note:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+    await ensure_note_permission(note, current_user, db, "update")
 
     version_result = await db.execute(
         select(NoteVersion).where(
@@ -877,14 +902,7 @@ async def update_note(
     Returns:
         Updated note
     """
-    result = await db.execute(
-        select(Note).where(
-            and_(
-                Note.id == UUID(note_id),
-                Note.user_id == current_user.id
-            )
-        )
-    )
+    result = await db.execute(select(Note).where(Note.id == UUID(note_id)))
     note = result.scalar_one_or_none()
     
     if not note:
@@ -892,7 +910,7 @@ async def update_note(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Note not found"
         )
-    
+    await ensure_note_permission(note, current_user, db, "update")
     # Update fields
     semantic_fields_updated = False
     note_changed = False
@@ -973,14 +991,7 @@ async def delete_note(
         current_user: Current user
         db: Database session
     """
-    result = await db.execute(
-        select(Note).where(
-            and_(
-                Note.id == UUID(note_id),
-                Note.user_id == current_user.id
-            )
-        )
-    )
+    result = await db.execute(select(Note).where(Note.id == UUID(note_id)))
     note = result.scalar_one_or_none()
     
     if not note:
@@ -988,7 +999,7 @@ async def delete_note(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Note not found"
         )
-    
+    await ensure_note_permission(note, current_user, db, "delete")
     # Log action before deletion
     await log_audit_event(
         user_id=current_user.id,
@@ -1026,7 +1037,7 @@ async def list_connection_suggestions(
     if note.workspace_id is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Note has no workspace")
 
-    await get_workspace_context(note.workspace_id, current_user, db)
+    await ensure_note_permission(note, current_user, db, "view")
 
     query = select(NoteConnectionSuggestion).where(NoteConnectionSuggestion.source_note_id == note.id)
     if status_filter:
@@ -1072,7 +1083,7 @@ async def confirm_connection_suggestion(
     if source_note.workspace_id is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source note has no workspace")
 
-    await get_workspace_context(source_note.workspace_id, current_user, db)
+    await ensure_note_permission(source_note, current_user, db, "update")
 
     source_connections = [str(connection_id) for connection_id in (source_note.connections or [])]
     target_connections = [str(connection_id) for connection_id in (target_note.connections or [])]
@@ -1147,7 +1158,7 @@ async def dismiss_connection_suggestion(
     if source_note.workspace_id is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source note has no workspace")
 
-    await get_workspace_context(source_note.workspace_id, current_user, db)
+    await ensure_note_permission(source_note, current_user, db, "update")
 
     suggestion.status = "dismissed"
     suggestion.responded_by = current_user.id
@@ -1187,9 +1198,14 @@ async def get_workspace_notes(
     Returns:
         Paginated notes for the workspace
     """
-    # Verify workspace membership
     workspace_uuid = UUID(workspace_id)
-    await get_workspace_context(workspace_uuid, current_user, db)
+    await ensure_workspace_permission(
+        workspace_id=workspace_uuid,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.NOTES,
+        action="view",
+    )
     
     # Build base filters
     filters = [Note.workspace_id == workspace_uuid]

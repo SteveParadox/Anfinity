@@ -10,7 +10,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.session import get_db
+from app.database.session import bind_db_user_context, get_db
 from app.database.models import User as DBUser, Workspace, WorkspaceMember, WorkspaceRole
 from app.core.security import (
     verify_password,
@@ -173,6 +173,7 @@ async def register(
     
     db.add(user)
     await db.flush()
+    bind_db_user_context(db, user.id)
 
     # Create default workspace
     default_workspace = Workspace(

@@ -11,15 +11,10 @@ from sqlalchemy import select, func, delete
 
 from app.config import settings  # FIXED: was imported inside function body
 from app.database.session import get_db
-from app.database.models import Document, Chunk, DocumentStatus, SourceType, Embedding, IngestionLog
-from app.core.auth import (
-    get_current_active_user,
-    get_workspace_context,
-    WorkspaceContext,
-    require_role,
-    WorkspaceRole,
-)
+from app.database.models import Document, Chunk, DocumentStatus, SourceType, Embedding, IngestionLog, WorkspaceSection
+from app.core.auth import get_current_active_user
 from app.core.audit import AuditLogger, AuditAction, EntityType
+from app.core.permissions import ensure_workspace_permission
 from app.storage.s3 import s3_client
 from app.tasks.worker import process_document, delete_document_vectors
 
@@ -93,10 +88,14 @@ async def upload_document(
         f"📄 [DOCUMENT UPLOAD START] User {current_user.id} uploading '{file.filename}' to workspace {workspace_id}"
     )
     
-    # Verify workspace membership and permission
-    context = await get_workspace_context(workspace_id, current_user, db)
-    context.require_role(WorkspaceRole.MEMBER)
-    logger.debug(f"✅ [WORKSPACE VERIFIED] User has {context.role.value} role in workspace {workspace_id}")
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.DOCUMENTS,
+        action="create",
+    )
+    logger.debug(f"✅ [WORKSPACE VERIFIED] User can upload documents in workspace {workspace_id}")
 
     # Read and validate content
     content = await file.read()
@@ -261,7 +260,13 @@ async def list_documents(
     """List documents in a workspace (paginated)."""
 
     # FIXED: original did UUID(str(workspace_id)) — workspace_id is already UUID
-    await get_workspace_context(workspace_id, current_user, db)
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.DOCUMENTS,
+        action="view",
+    )
 
     query = select(Document).where(Document.workspace_id == workspace_id)
     if status_filter:
@@ -328,7 +333,13 @@ async def get_document(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
     try:
-        await get_workspace_context(document.workspace_id, current_user, db)
+        await ensure_workspace_permission(
+            workspace_id=document.workspace_id,
+            user=current_user,
+            db=db,
+            section=WorkspaceSection.DOCUMENTS,
+            action="view",
+        )
     except HTTPException:
         # Surface as 404 regardless of the actual auth failure to avoid leaking
         # information about document existence in foreign workspaces.
@@ -370,7 +381,13 @@ async def get_document_chunks(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
     try:
-        await get_workspace_context(document.workspace_id, current_user, db)
+        await ensure_workspace_permission(
+            workspace_id=document.workspace_id,
+            user=current_user,
+            db=db,
+            section=WorkspaceSection.DOCUMENTS,
+            action="view",
+        )
     except HTTPException:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
@@ -409,8 +426,13 @@ async def delete_document(
     if not document:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    context = await get_workspace_context(document.workspace_id, current_user, db)
-    context.require_role(WorkspaceRole.ADMIN)
+    await ensure_workspace_permission(
+        workspace_id=document.workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.DOCUMENTS,
+        action="delete",
+    )
 
     # Queue vector deletion before removing the DB row so the task has the IDs
     delete_document_vectors.delay(

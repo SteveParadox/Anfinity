@@ -10,9 +10,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.core.auth import get_current_active_user, get_workspace_context
+from app.core.auth import get_current_active_user
+from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser
-from app.database.session import get_db
+from app.database.models import WorkspaceSection
+from app.database.session import bind_db_rls_bypass, get_db
 from app.services.graph_service import get_graph_service
 
 router = APIRouter(prefix="/knowledge-graph", tags=["Knowledge Graph"])
@@ -118,6 +120,7 @@ async def require_graph_sync_token(request: Request) -> None:
 
 @router.get("/internal/workspaces", response_model=WorkspaceListResponse, dependencies=[Depends(require_graph_sync_token)])
 async def list_graph_workspaces(db: AsyncSession = Depends(get_db)) -> WorkspaceListResponse:
+    bind_db_rls_bypass(db, True)
     workspace_ids = await get_graph_service().list_workspace_ids(db)
     return WorkspaceListResponse(workspace_ids=[str(workspace_id) for workspace_id in workspace_ids])
 
@@ -131,6 +134,7 @@ async def get_internal_cluster_input(
     workspace_id: UUID,
     db: AsyncSession = Depends(get_db),
 ) -> ClusterInputResponse:
+    bind_db_rls_bypass(db, True)
     payload = await get_graph_service().build_cluster_input(db=db, workspace_id=workspace_id)
     return ClusterInputResponse(**payload)
 
@@ -145,6 +149,7 @@ async def sync_internal_workspace_clusters(
     request: GraphClusterSyncRequest,
     db: AsyncSession = Depends(get_db),
 ) -> GraphClusterSyncResponse:
+    bind_db_rls_bypass(db, True)
     payload = await get_graph_service().sync_workspace_clusters(
         db=db,
         workspace_id=workspace_id,
@@ -165,7 +170,13 @@ async def get_knowledge_graph(
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> KnowledgeGraphResponse:
-    await get_workspace_context(workspace_id, current_user, db)
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.KNOWLEDGE_GRAPH,
+        action="view",
+    )
 
     graph_data = await get_graph_service().build_graph_data(
         db=db,
@@ -188,6 +199,12 @@ async def get_cluster_input(
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> ClusterInputResponse:
-    await get_workspace_context(workspace_id, current_user, db)
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.KNOWLEDGE_GRAPH,
+        action="view",
+    )
     payload = await get_graph_service().build_cluster_input(db=db, workspace_id=workspace_id)
     return ClusterInputResponse(**payload)

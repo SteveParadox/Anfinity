@@ -16,7 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.auth import WorkspaceContext, get_current_active_user, get_workspace_context
+from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser
+from app.database.models import WorkspaceSection
 from app.database.session import get_db
 from app.services.semantic_search import SemanticSearchResult, get_semantic_search_service
 
@@ -196,6 +198,14 @@ async def semantic_search(
     workspace_ctx: Annotated[WorkspaceContext, Depends(get_workspace_context)] = None,
     db: Annotated[AsyncSession, Depends(get_db)] = None,
 ) -> SemanticSearchResponse:
+    await ensure_workspace_permission(
+        workspace_id=workspace_ctx.workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.SEARCH,
+        action="create",
+        context=workspace_ctx,
+    )
     filters: Dict[str, Any] = {}
     if tags:
         filters["tags"] = [item.strip() for item in tags.split(",") if item.strip()]
@@ -215,6 +225,14 @@ async def semantic_search_post(
     workspace_ctx: Annotated[WorkspaceContext, Depends(get_workspace_context)] = None,
     db: Annotated[AsyncSession, Depends(get_db)] = None,
 ) -> SemanticSearchResponse:
+    await ensure_workspace_permission(
+        workspace_id=workspace_ctx.workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.SEARCH,
+        action="create",
+        context=workspace_ctx,
+    )
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else {}
     return await _run_semantic_search(payload.query, payload.limit, filters, current_user, workspace_ctx, db)
 
@@ -226,6 +244,14 @@ async def trending_searches(
     db: Annotated[AsyncSession, Depends(get_db)] = None,
     limit: int = QueryParam(10, ge=1, le=50),
 ) -> TrendingResponse:
+    await ensure_workspace_permission(
+        workspace_id=workspace_ctx.workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.SEARCH,
+        action="view",
+        context=workspace_ctx,
+    )
     try:
         stmt = text(
             """
@@ -259,6 +285,15 @@ async def log_search_click(
     db: Annotated[AsyncSession, Depends(get_db)] = None,
 ) -> ClickLogResponse:
     from app.database.models import SearchLog
+
+    await ensure_workspace_permission(
+        workspace_id=workspace_ctx.workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.SEARCH,
+        action="update",
+        context=workspace_ctx,
+    )
 
     try:
         result = await db.execute(

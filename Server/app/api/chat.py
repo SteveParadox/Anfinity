@@ -11,12 +11,12 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.auth import get_current_active_user
-from app.database.models import User as DBUser, Workspace, WorkspaceMember
+from app.core.permissions import ensure_workspace_permission
+from app.database.models import User as DBUser, WorkspaceSection
 from app.database.session import get_db
 from app.services.top_k_retriever import get_top_k_retriever
 
@@ -73,29 +73,20 @@ async def _verify_workspace_access(
     workspace_id: UUID,
     user: DBUser,
     db: AsyncSession,
-) -> Workspace:
+) -> None:
     """
     Verify the user has access to the requested workspace.
     Raises HTTPException on any failure — call this *before* starting a stream.
 
-    Returns the workspace on success.
+    Raises before any retrieval or streaming work if the user cannot use chat in the workspace.
     """
-    result = await db.execute(select(Workspace).where(Workspace.id == workspace_id))
-    workspace = result.scalar_one_or_none()
-    if not workspace:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
-
-    if workspace.owner_id != user.id:
-        membership = await db.execute(
-            select(WorkspaceMember).where(
-                WorkspaceMember.workspace_id == workspace_id,
-                WorkspaceMember.user_id == user.id,
-            )
-        )
-        if not membership.scalar_one_or_none():
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to workspace")
-
-    return workspace
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=user,
+        db=db,
+        section=WorkspaceSection.CHAT,
+        action="create",
+    )
 
 
 def _determine_confidence(sources: List[RAGSource]) -> str:

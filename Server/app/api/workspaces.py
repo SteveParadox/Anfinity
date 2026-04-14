@@ -1,6 +1,7 @@
 """Workspace API routes."""
+from __future__ import annotations
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
@@ -9,14 +10,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 
 from app.database.session import get_db
-from app.database.models import Workspace, WorkspaceMember, User as DBUser
+from app.database.models import Workspace, WorkspaceMember, WorkspacePermissionOverride, WorkspaceSection, User as DBUser
 from app.core.auth import (
     get_current_active_user,
     WorkspaceContext,
     get_workspace_context,
-    require_role,
     WorkspaceRole,
     has_required_role
+)
+from app.core.permissions import (
+    WORKSPACE_PERMISSION_ACTIONS,
+    ensure_workspace_permission,
+    get_bulk_workspace_permissions_for_user,
+    get_workspace_permissions_for_user,
+    require_permission,
 )
 from app.core.audit import log_audit_event, AuditAction, EntityType, AuditLogger
 from app.ingestion.vector_index import vector_index
@@ -35,6 +42,16 @@ def _initialize_workspace_vector_collection(workspace_id: str) -> None:
             workspace_id,
             exc_info=True,
         )
+
+
+def _serialize_permission_map(payload: Dict[str, Dict[str, bool]]) -> Dict[str, PermissionStateResponse]:
+    return {
+        section: PermissionStateResponse(**{
+            action: bool(values.get(action, False))
+            for action in WORKSPACE_PERMISSION_ACTIONS
+        })
+        for section, values in payload.items()
+    }
 
 
 # Schemas
@@ -82,6 +99,40 @@ class WorkspaceStatsResponse(BaseModel):
     """Workspace statistics response."""
     documents: dict = Field(..., description="Document statistics")
     vectors: int = Field(..., description="Total vector embeddings")
+
+
+class PermissionStateResponse(BaseModel):
+    view: bool
+    create: bool
+    update: bool
+    delete: bool
+    manage: bool
+
+
+class WorkspacePermissionsResponse(BaseModel):
+    workspace_id: str
+    role: str
+    permissions: Dict[str, PermissionStateResponse]
+
+
+class WorkspacePermissionOverrideUpdate(BaseModel):
+    section: WorkspaceSection
+    can_view: Optional[bool] = None
+    can_create: Optional[bool] = None
+    can_update: Optional[bool] = None
+    can_delete: Optional[bool] = None
+    can_manage: Optional[bool] = None
+
+
+class WorkspacePermissionOverrideResponse(BaseModel):
+    workspace_id: str
+    user_id: str
+    section: str
+    can_view: Optional[bool] = None
+    can_create: Optional[bool] = None
+    can_update: Optional[bool] = None
+    can_delete: Optional[bool] = None
+    can_manage: Optional[bool] = None
 
 
 @router.post("", response_model=WorkspaceResponse, status_code=status.HTTP_201_CREATED)
@@ -210,6 +261,37 @@ async def list_workspaces(
     return workspaces
 
 
+@router.get("/permissions/bulk", response_model=Dict[str, WorkspacePermissionsResponse])
+async def get_user_permissions(
+    current_user: DBUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    permission_map = await get_bulk_workspace_permissions_for_user(db, current_user)
+    return {
+        workspace_id: WorkspacePermissionsResponse(
+            workspace_id=workspace_id,
+            role=str(payload["role"]),
+            permissions=_serialize_permission_map(payload["permissions"]),  # type: ignore[arg-type]
+        )
+        for workspace_id, payload in permission_map.items()
+    }
+
+
+@router.get("/{workspace_id}/permissions", response_model=WorkspacePermissionsResponse)
+async def get_workspace_permissions(
+    workspace_id: UUID,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    context = await get_workspace_context(workspace_id, current_user, db)
+    permissions = await get_workspace_permissions_for_user(db, workspace_id, current_user, context)
+    return WorkspacePermissionsResponse(
+        workspace_id=str(workspace_id),
+        role=context.role.value if isinstance(context.role, WorkspaceRole) else str(context.role),
+        permissions=_serialize_permission_map(permissions),
+    )
+
+
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(
     workspace_id: UUID,
@@ -226,8 +308,13 @@ async def get_workspace(
     Returns:
         Workspace details
     """
-    # Verify membership
-    await get_workspace_context(workspace_id, current_user, db)
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.WORKSPACE,
+        action="view",
+    )
     
     # Get workspace with member count
     member_count_subquery = (
@@ -292,8 +379,13 @@ async def get_workspace_stats(
     Returns:
         Workspace statistics
     """
-    # Verify membership
-    await get_workspace_context(workspace_id, current_user, db)
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.WORKSPACE,
+        action="view",
+    )
     
     from app.database.models import Document, DocumentStatus
     
@@ -337,7 +429,7 @@ async def update_workspace(
     workspace_id: UUID,
     workspace_data: WorkspaceUpdate,
     request: Request,
-    context: WorkspaceContext = Depends(require_role(WorkspaceRole.ADMIN)),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "update")),
     db: AsyncSession = Depends(get_db)
 ):
     """Update workspace.
@@ -405,12 +497,96 @@ async def update_workspace(
     )
 
 
+@router.put(
+    "/{workspace_id}/permissions/{user_id}",
+    response_model=WorkspacePermissionOverrideResponse,
+)
+async def upsert_workspace_permission_override(
+    workspace_id: UUID,
+    user_id: UUID,
+    override_data: WorkspacePermissionOverrideUpdate,
+    request: Request,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    context = await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=current_user,
+        db=db,
+        section=WorkspaceSection.WORKSPACE,
+        action="manage",
+    )
+
+    membership_result = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == user_id,
+        )
+    )
+    membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace member not found")
+
+    override_result = await db.execute(
+        select(WorkspacePermissionOverride).where(
+            WorkspacePermissionOverride.workspace_id == workspace_id,
+            WorkspacePermissionOverride.user_id == user_id,
+            WorkspacePermissionOverride.section == override_data.section,
+        )
+    )
+    override = override_result.scalar_one_or_none()
+
+    if override is None:
+        override = WorkspacePermissionOverride(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            section=override_data.section,
+        )
+        db.add(override)
+
+    override.can_view = override_data.can_view
+    override.can_create = override_data.can_create
+    override.can_update = override_data.can_update
+    override.can_delete = override_data.can_delete
+    override.can_manage = override_data.can_manage
+
+    await db.commit()
+    await db.refresh(override)
+
+    logger = AuditLogger(db, context.user.id).with_request(request)
+    await logger.log(
+        action=AuditAction.WORKSPACE_UPDATED,
+        workspace_id=workspace_id,
+        entity_type=EntityType.USER,
+        entity_id=user_id,
+        metadata={
+            "permission_override_section": override_data.section.value,
+            "can_view": override.can_view,
+            "can_create": override.can_create,
+            "can_update": override.can_update,
+            "can_delete": override.can_delete,
+            "can_manage": override.can_manage,
+        },
+    )
+
+    return WorkspacePermissionOverrideResponse(
+        workspace_id=str(workspace_id),
+        user_id=str(user_id),
+        section=override.section.value if isinstance(override.section, WorkspaceSection) else str(override.section),
+        can_view=override.can_view,
+        can_create=override.can_create,
+        can_update=override.can_update,
+        can_delete=override.can_delete,
+        can_manage=override.can_manage,
+    )
+
+
 @router.post("/{workspace_id}/invite")
 async def invite_member(
     workspace_id: UUID,
     invite_data: WorkspaceInvite,
     request: Request,
-    context: WorkspaceContext = Depends(require_role(WorkspaceRole.ADMIN)),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "manage")),
     db: AsyncSession = Depends(get_db)
 ):
     """Invite a user to workspace.
@@ -491,7 +667,7 @@ async def invite_member(
 @router.get("/{workspace_id}/members", response_model=List[WorkspaceMemberResponse])
 async def list_members(
     workspace_id: UUID,
-    context: WorkspaceContext = Depends(require_role(WorkspaceRole.VIEWER)),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "view")),
     db: AsyncSession = Depends(get_db)
 ):
     """List workspace members.
@@ -529,7 +705,7 @@ async def remove_member(
     workspace_id: UUID,
     user_id: UUID,
     request: Request,
-    context: WorkspaceContext = Depends(require_role(WorkspaceRole.ADMIN)),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "manage")),
     db: AsyncSession = Depends(get_db)
 ):
     """Remove a member from workspace.
@@ -597,7 +773,7 @@ async def remove_member(
 async def delete_workspace(
     workspace_id: UUID,
     request: Request,
-    context: WorkspaceContext = Depends(require_role(WorkspaceRole.OWNER)),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "delete")),
     db: AsyncSession = Depends(get_db)
 ):
     """Delete workspace.
