@@ -343,7 +343,6 @@ async def websocket_ingestion_events(
         current_user: DBUser = await get_websocket_user(websocket, db)
     except Exception as exc:
         logger.warning("WebSocket authentication failed: %s", exc)
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     # ---- Workspace validation ------------------------------------------

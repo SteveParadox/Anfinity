@@ -327,7 +327,7 @@ async def broadcast_ingestion_completed(workspace_id, document_id, token_count, 
         event_type=EventType.DOCUMENT_COMPLETED,
         workspace_id=workspace_id,
         document_id=document_id,
-        data={"total_tokens": token_count, "chunks_created": chunk_count, "embeddings_created": embedding_count},
+        data={"token_count": token_count, "chunk_count": chunk_count, "embedding_count": embedding_count},
         priority=EventPriority.HIGH,
     ))
 
@@ -392,7 +392,7 @@ def broadcast_ingestion_completed_sync(workspace_id, document_id, token_count, c
         event_type=EventType.DOCUMENT_COMPLETED,
         workspace_id=workspace_id,
         document_id=document_id,
-        data={"total_tokens": token_count, "chunks_created": chunk_count, "embeddings_created": embedding_count},
+        data={"token_count": token_count, "chunk_count": chunk_count, "embedding_count": embedding_count},
         priority=EventPriority.HIGH,
     ))
 
