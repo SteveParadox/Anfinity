@@ -5,6 +5,10 @@ from uuid import UUID
 import logging
 import re
 from difflib import SequenceMatcher
+try:
+    from diff_match_patch import diff_match_patch
+except ImportError:  # pragma: no cover - exercised only when dependency is absent
+    diff_match_patch = None
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -209,7 +213,7 @@ def _count_words(text: str) -> int:
     return len(re.findall(r"\S+", text or ""))
 
 
-def build_word_diff_segments(previous_text: str, current_text: str) -> List[Dict[str, Any]]:
+def _build_sequence_matcher_diff_segments(previous_text: str, current_text: str) -> List[Dict[str, Any]]:
     previous_tokens = _tokenize_for_diff(previous_text)
     current_tokens = _tokenize_for_diff(current_text)
     matcher = SequenceMatcher(a=previous_tokens, b=current_tokens, autojunk=False)
@@ -256,6 +260,63 @@ def build_word_diff_segments(previous_text: str, current_text: str) -> List[Dict
             )
 
     return segments
+
+
+def _build_diff_match_patch_segments(previous_text: str, current_text: str) -> List[Dict[str, Any]]:
+    if diff_match_patch is None:
+        return _build_sequence_matcher_diff_segments(previous_text, current_text)
+
+    previous_tokens = _tokenize_for_diff(previous_text)
+    current_tokens = _tokenize_for_diff(current_text)
+    token_lookup: Dict[str, int] = {}
+    token_array: List[str] = [""]
+
+    def encode(tokens: List[str]) -> str:
+        encoded: List[str] = []
+        for token in tokens:
+            token_index = token_lookup.get(token)
+            if token_index is None:
+                token_array.append(token)
+                token_index = len(token_array) - 1
+                token_lookup[token] = token_index
+            encoded.append(chr(token_index))
+        return "".join(encoded)
+
+    previous_encoded = encode(previous_tokens)
+    current_encoded = encode(current_tokens)
+
+    dmp = diff_match_patch()
+    diffs = dmp.diff_main(previous_encoded, current_encoded, False)
+    dmp.diff_cleanupSemantic(diffs)
+
+    segments: List[Dict[str, Any]] = []
+    diff_type_map = {
+        dmp.DIFF_DELETE: "deleted",
+        dmp.DIFF_INSERT: "added",
+        dmp.DIFF_EQUAL: "unchanged",
+    }
+
+    for operation, encoded_text in diffs:
+        token_text = "".join(
+            token_array[ord(character)]
+            for character in encoded_text
+            if ord(character) < len(token_array)
+        )
+        if not token_text:
+            continue
+        segments.append(
+            {
+                "type": diff_type_map.get(operation, "unchanged"),
+                "text": token_text,
+                "word_count": _count_words(token_text),
+            }
+        )
+
+    return segments
+
+
+def build_word_diff_segments(previous_text: str, current_text: str) -> List[Dict[str, Any]]:
+    return _build_diff_match_patch_segments(previous_text, current_text)
 
 
 async def get_latest_note_version(db: AsyncSession, note_id: UUID) -> Optional[NoteVersion]:
