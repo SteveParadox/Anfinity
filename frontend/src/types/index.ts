@@ -48,6 +48,33 @@ export interface NoteConnectionSuggestion {
   createdAt: Date;
 }
 
+export interface NoteVersionDiffSegment {
+  type: 'added' | 'deleted' | 'unchanged';
+  text: string;
+  wordCount: number;
+}
+
+export interface NoteVersion {
+  id: string;
+  noteId: string;
+  workspaceId?: string;
+  userId: string;
+  versionNumber: number;
+  changeReason: 'created' | 'updated' | 'restored' | string;
+  restoredFromVersionId?: string;
+  title: string;
+  content: string;
+  summary?: string;
+  tags: string[];
+  connections: string[];
+  noteType: string;
+  sourceUrl?: string;
+  wordCount: number;
+  diffSegments: NoteVersionDiffSegment[];
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+}
+
 export type GraphNodeType = 'workspace' | 'note' | 'entity' | 'tag';
 
 export type GraphEdgeType =
@@ -113,6 +140,10 @@ export interface KnowledgeGraphFilters {
   search: string;
   minWeight: number;
   includeIsolated: boolean;
+  dateFrom?: string;
+  dateTo?: string;
+  clusterIds: string[];
+  confidenceThreshold: number;
 }
 
 export interface KnowledgeGraph {

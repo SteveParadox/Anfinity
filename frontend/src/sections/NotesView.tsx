@@ -6,7 +6,7 @@ import {
   Plus, Search, Filter, Edit2, Trash2, Link2,
   Sparkles, Brain, Globe, Mic, FileText, X, Check, Tag, Users,
 } from 'lucide-react';
-import type { Note, NoteConnectionSuggestion, Workspace } from '@/types';
+import type { Note, NoteConnectionSuggestion, NoteVersion, Workspace } from '@/types';
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
@@ -53,6 +53,19 @@ function safeFromNow(date: Date | string | undefined | null): string {
   if (!date) return 'unknown';
   const d = new Date(date);
   return isNaN(d.getTime()) ? 'unknown' : formatDistanceToNow(d, { addSuffix: true });
+}
+
+function formatAbsoluteDate(date: Date | string | undefined | null): string {
+  if (!date) return 'Unknown time';
+  const value = new Date(date);
+  return isNaN(value.getTime()) ? 'Unknown time' : value.toLocaleString();
+}
+
+function getVersionChangeLabel(version: NoteVersion): string {
+  if (version.changeReason === 'created') return 'Created';
+  if (version.changeReason === 'restored') return 'Restored';
+  if (version.changeReason === 'updated') return 'Updated';
+  return version.changeReason;
 }
 
 /* ─── Shared primitive components ─────────────────────────────────────── */
@@ -316,6 +329,10 @@ export function NotesView({
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [selectedNoteWorkspace, setSelectedNoteWorkspace] = useState<Workspace | null>(null);
   const [selectedNoteWorkspaceMembers, setSelectedNoteWorkspaceMembers] = useState<any[]>([]);
+  const [noteVersions, setNoteVersions] = useState<NoteVersion[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
+  const [restoringVersionId, setRestoringVersionId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [editingNote, setEditingNote] = useState<Note | null>(null);
   const [newTag, setNewTag] = useState('');
@@ -448,6 +465,36 @@ export function NotesView({
     loadConnectionSuggestions();
   }, [selectedNote?.id]);
 
+  useEffect(() => {
+    const loadVersions = async () => {
+      if (!selectedNote?.id) {
+        setNoteVersions([]);
+        setSelectedVersionId(null);
+        return;
+      }
+
+      try {
+        setVersionsLoading(true);
+        const versions = await api.getNoteVersions(selectedNote.id);
+        setNoteVersions(versions);
+        setSelectedVersionId((current) => {
+          if (current && versions.some((version) => version.id === current)) {
+            return current;
+          }
+          return versions[0]?.id || null;
+        });
+      } catch (err) {
+        console.error('Failed to load note versions:', err);
+        setNoteVersions([]);
+        setSelectedVersionId(null);
+      } finally {
+        setVersionsLoading(false);
+      }
+    };
+
+    loadVersions();
+  }, [selectedNote?.id]);
+
   const filteredNotes = notes.filter((note) => {
     const q = searchQuery.toLowerCase();
     return (
@@ -456,6 +503,11 @@ export function NotesView({
       note.tags.some((t) => t.toLowerCase().includes(q))
     );
   });
+
+  const selectedVersion =
+    noteVersions.find((version) => version.id === selectedVersionId) ||
+    noteVersions[0] ||
+    null;
 
   const handleCreateNote = async () => {
     const targetWorkspaceId = newNote.workspaceId || defaultWorkspaceId;
@@ -511,10 +563,40 @@ export function NotesView({
       const normalizedUpdatedNote = normalizeNote(updatedNote);
 
       setNotes(notes.map(n => n.id === normalizedUpdatedNote.id ? normalizedUpdatedNote : n) as Note[]);
+      if (selectedNote?.id === normalizedUpdatedNote.id) {
+        setSelectedNote(normalizedUpdatedNote);
+      }
+      if (selectedNote?.id === normalizedUpdatedNote.id) {
+        const versions = await api.getNoteVersions(normalizedUpdatedNote.id);
+        setNoteVersions(versions);
+        setSelectedVersionId(versions[0]?.id || null);
+      }
       setEditingNote(null);
       onNoteUpdate?.(normalizedUpdatedNote.id, normalizedUpdatedNote);
     } catch (err) {
       console.error('Update note error:', err);
+    }
+  };
+
+  const handleRestoreVersion = async (version: NoteVersion) => {
+    if (!selectedNote) return;
+
+    try {
+      setRestoringVersionId(version.id);
+      const response = await api.restoreNoteVersion(selectedNote.id, version.id);
+      const restoredNote = normalizeNote(response.note);
+
+      setSelectedNote(restoredNote);
+      setNotes((prev) => prev.map((note) => note.id === restoredNote.id ? restoredNote : note));
+
+      const versions = await api.getNoteVersions(restoredNote.id);
+      setNoteVersions(versions);
+      setSelectedVersionId(versions[0]?.id || version.id);
+      onNoteUpdate?.(restoredNote.id, restoredNote);
+    } catch (err) {
+      console.error('Restore note version error:', err);
+    } finally {
+      setRestoringVersionId(null);
     }
   };
 
@@ -1235,6 +1317,177 @@ export function NotesView({
                 <p style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.inkMuted, letterSpacing: '0.02em' }}>
                   No pending connection suggestions for this note right now.
                 </p>
+              )}
+            </div>
+
+            <div style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '14px 16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+                <div>
+                  <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.yolk, marginBottom: 4 }}>
+                    Knowledge Lineage
+                  </div>
+                  <div style={{ fontSize: 11, color: TT.inkMuted }}>
+                    Every real change creates a snapshot. Restores add a new version instead of rewriting history.
+                  </div>
+                </div>
+                <div style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.inkMuted }}>
+                  {noteVersions.length} version{noteVersions.length === 1 ? '' : 's'}
+                </div>
+              </div>
+
+              {versionsLoading ? (
+                <div style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.inkMuted }}>
+                  Loading note history...
+                </div>
+              ) : noteVersions.length === 0 ? (
+                <div style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.inkMuted }}>
+                  No saved versions yet.
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 260px) minmax(0, 1fr)', gap: 14, alignItems: 'start' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto', paddingRight: 4 }}>
+                    {noteVersions.map((version) => {
+                      const active = selectedVersion?.id === version.id;
+                      return (
+                        <button
+                          key={version.id}
+                          onClick={() => setSelectedVersionId(version.id)}
+                          style={{
+                            width: '100%',
+                            textAlign: 'left',
+                            background: active ? 'rgba(245,230,66,0.08)' : TT.inkRaised,
+                            border: `1px solid ${active ? 'rgba(245,230,66,0.35)' : TT.inkBorder}`,
+                            borderRadius: 3,
+                            padding: '10px 12px',
+                            cursor: 'pointer',
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 10, color: active ? TT.yolk : TT.snow }}>
+                              v{version.versionNumber}
+                            </span>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                              {getVersionChangeLabel(version)}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: 10.5, color: TT.snow, marginBottom: 4, lineHeight: 1.4 }}>
+                            {version.title || 'Untitled snapshot'}
+                          </div>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                            {formatAbsoluteDate(version.createdAt)}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {selectedVersion && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          <span style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.snow }}>
+                            Version v{selectedVersion.versionNumber} · {getVersionChangeLabel(selectedVersion)}
+                          </span>
+                          <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                            {formatAbsoluteDate(selectedVersion.createdAt)}
+                          </span>
+                        </div>
+                        <button
+                          onClick={() => handleRestoreVersion(selectedVersion)}
+                          disabled={restoringVersionId === selectedVersion.id}
+                          style={{
+                            height: 34,
+                            padding: '0 12px',
+                            background: restoringVersionId === selectedVersion.id ? TT.inkMid : 'rgba(245,230,66,0.08)',
+                            border: `1px solid ${restoringVersionId === selectedVersion.id ? TT.inkBorder : 'rgba(245,230,66,0.3)'}`,
+                            borderRadius: 3,
+                            color: restoringVersionId === selectedVersion.id ? TT.inkMuted : TT.yolk,
+                            fontFamily: TT.fontMono,
+                            fontSize: 10,
+                            letterSpacing: '0.05em',
+                            textTransform: 'uppercase',
+                            cursor: restoringVersionId === selectedVersion.id ? 'default' : 'pointer',
+                          }}
+                        >
+                          {restoringVersionId === selectedVersion.id ? 'Restoring...' : 'Restore As New Version'}
+                        </button>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>
+                            Snapshot
+                          </div>
+                          <div style={{ fontSize: 12, color: TT.snow, marginBottom: 8 }}>{selectedVersion.title || 'Untitled snapshot'}</div>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 8 }}>
+                            {selectedVersion.tags.map((tag) => (
+                              <span key={`version-tag-${selectedVersion.id}-${tag}`} style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, padding: '2px 6px' }}>
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                          <div style={{ fontSize: 11, lineHeight: 1.6, color: TT.inkSubtle, whiteSpace: 'pre-wrap' }}>
+                            {selectedVersion.content || 'No content saved in this version.'}
+                          </div>
+                        </div>
+
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>
+                            Current
+                          </div>
+                          <div style={{ fontSize: 12, color: TT.snow, marginBottom: 8 }}>{selectedNote.title || 'Untitled note'}</div>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 8 }}>
+                            {selectedNote.tags.map((tag) => (
+                              <span key={`current-tag-${selectedNote.id}-${tag}`} style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, padding: '2px 6px' }}>
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                          <div style={{ fontSize: 11, lineHeight: 1.6, color: TT.inkSubtle, whiteSpace: 'pre-wrap' }}>
+                            {selectedNote.content || 'No current content.'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px' }}>
+                        <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>
+                          Inline Diff
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, lineHeight: 1.9 }}>
+                          {selectedVersion.diffSegments.length > 0 ? selectedVersion.diffSegments.map((segment, index) => (
+                            <span
+                              key={`${selectedVersion.id}-segment-${index}`}
+                              style={{
+                                padding: segment.type === 'unchanged' ? '0' : '1px 3px',
+                                borderRadius: 2,
+                                background:
+                                  segment.type === 'added'
+                                    ? 'rgba(52,211,153,0.16)'
+                                    : segment.type === 'deleted'
+                                      ? 'rgba(255,69,69,0.16)'
+                                      : 'transparent',
+                                color:
+                                  segment.type === 'added'
+                                    ? '#34D399'
+                                    : segment.type === 'deleted'
+                                      ? '#FF7A7A'
+                                      : TT.inkSubtle,
+                                textDecoration: segment.type === 'deleted' ? 'line-through' : 'none',
+                                whiteSpace: 'pre-wrap',
+                              }}
+                            >
+                              {segment.text}
+                            </span>
+                          )) : (
+                            <span style={{ fontSize: 10.5, color: TT.inkMuted }}>
+                              No diff segments were saved for this version.
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
 
