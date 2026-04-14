@@ -8,7 +8,7 @@ from starlette.websockets import WebSocketState
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.session import get_db
+from app.database.session import bind_db_user_context, get_db
 from app.database.models import User as DBUser, Workspace, WorkspaceMember, WorkspaceRole
 from app.core.security import get_token_payload
 
@@ -106,6 +106,8 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is disabled",
         )
+
+    bind_db_user_context(db, user.id)
     
     return user
 
