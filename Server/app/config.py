@@ -1,4 +1,5 @@
 """Application configuration using Pydantic Settings."""
+import secrets
 from typing import Optional
 from pydantic_settings import BaseSettings
 from pydantic import Field
@@ -17,6 +18,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str = Field(default="")  # MUST be set in production via env
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_HOURS: int = 24
+    JWT_ISSUER: str = "anfinity-api"
+    JWT_AUDIENCE: str = "anfinity-clients"
+    ENCRYPTION_KEY: Optional[str] = None
     
     # CORS - configure for production
     CORS_ORIGINS: list = Field(default=["http://localhost:3000", "http://localhost:5173"])
@@ -117,6 +121,11 @@ class Settings(BaseSettings):
     def __init__(self, **data):
         """Initialize settings and validate/fix OLLAMA_BASE_URL."""
         super().__init__(**data)
+
+        if not self.JWT_SECRET:
+            if self.ENVIRONMENT == "production":
+                raise ValueError("JWT_SECRET must be set in production")
+            self.JWT_SECRET = secrets.token_urlsafe(64)
         
         # Fix common misconfiguration: OLLAMA_BASE_URL pointing to public website
         if self.OLLAMA_BASE_URL == "https://ollama.com":
