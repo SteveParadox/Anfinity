@@ -1,15 +1,16 @@
 """Schemas for connector API."""
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ConnectorCreate(BaseModel):
     """Create connector request."""
+    workspace_id: str
     connector_type: str
     access_token: str
     refresh_token: Optional[str] = None
-    config: Optional[Dict[str, Any]] = None
+    config: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ConnectorUpdate(BaseModel):
@@ -30,7 +31,7 @@ class ConnectorResponse(BaseModel):
     last_sync_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
-    config: Dict[str, Any] = {}
+    config: Dict[str, Any] = Field(default_factory=dict)
     
     class Config:
         from_attributes = True
