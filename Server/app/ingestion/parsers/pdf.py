@@ -36,29 +36,43 @@ class PDFParser(DocumentParser):
         
         # Get page count before processing (needed before closing document)
         page_count = len(doc)
-        
+        pages_with_text = 0
+        pages_without_text = 0
+        total_extracted_chars = 0
+
         # Extract text from each page
         for page_num in range(page_count):
             page = doc[page_num]
             
-            # Get text
-            text = page.get_text()
+            # Use explicit text extraction mode so metrics are more predictable.
+            text = page.get_text("text")
+            page_text_length = len(text.strip())
+            total_extracted_chars += page_text_length
             
             # Add page marker
-            if text.strip():
+            if page_text_length:
+                pages_with_text += 1
                 text_parts.append(f"\n--- Page {page_num + 1} ---\n")
                 text_parts.append(text)
+            else:
+                pages_without_text += 1
             
             # Extract page-level metadata
             page_info = {
                 'page_number': page_num + 1,
                 'width': page.rect.width,
                 'height': page.rect.height,
+                'text_length': page_text_length,
             }
             
             if 'pages' not in metadata:
                 metadata['pages'] = []
             metadata['pages'].append(page_info)
+
+        metadata['pages_with_text'] = pages_with_text
+        metadata['pages_without_text'] = pages_without_text
+        metadata['total_extracted_chars'] = total_extracted_chars
+        metadata['extraction_method'] = 'pymupdf_text'
         
         doc.close()
         
