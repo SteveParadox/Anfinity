@@ -181,7 +181,7 @@ export async function askPastSelfSync(
   return response.json();
 }
 
-export function useAskPastSelf() {
+export function useAskPastSelf(workspaceId?: string) {
   const [messages, setMessages] = React.useState<ChatStateMessage[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [streamingSources, setStreamingSources] = React.useState<RAGSource[]>([]);
@@ -193,6 +193,14 @@ export function useAskPastSelf() {
   React.useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  React.useEffect(() => {
+    abortRef.current?.abort();
+    setMessages([]);
+    setStreamingSources([]);
+    setFollowUpQuestions([]);
+    setLoading(false);
+  }, [workspaceId]);
 
   const replaceLastAssistant = React.useCallback(
     (content: string, sources: RAGSource[]) => {

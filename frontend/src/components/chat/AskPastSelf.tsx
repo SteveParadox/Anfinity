@@ -41,7 +41,7 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
     chat,
     clearChat,
     cancelChat,
-  } = useAskPastSelf();
+  } = useAskPastSelf(workspaceId);
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -50,7 +50,7 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
   }, [messages, followUpQuestions, streamingSources]);
 
   async function handleSendMessage() {
-    if (!input.trim() || loading) return;
+    if (!workspaceId || !input.trim() || loading) return;
 
     const userMessage = input;
     setInput('');
@@ -227,6 +227,7 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
                   <button
                     key={`${question}-${index}`}
                     onClick={() => {
+                      if (!workspaceId) return;
                       setInput('');
                       void chat(question, workspaceId);
                     }}
@@ -257,7 +258,7 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
           <div className='flex flex-col gap-2'>
             <button
               onClick={loading ? cancelChat : handleSendMessage}
-              disabled={!loading && !input.trim()}
+            disabled={!workspaceId || (!loading && !input.trim())}
               className='flex h-full items-center gap-2 whitespace-nowrap rounded-xl bg-indigo-600 px-6 py-3 font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50'
             >
               <span>{loading ? 'Stop' : 'Ask'}</span>

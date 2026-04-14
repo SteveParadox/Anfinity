@@ -14,7 +14,7 @@ import {
   transformWorkspacesArray,
   transformQueryResponseFromAPI,
 } from './transformers';
-import type { KnowledgeGraph, KnowledgeGraphFilters, NoteConnectionSuggestion } from '@/types';
+import type { KnowledgeGraph, KnowledgeGraphFilters, Note as AppNote, NoteConnectionSuggestion, NoteVersion } from '@/types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 const API_TIMEOUT = parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'); // 30 seconds
@@ -639,7 +639,7 @@ class ApiClient {
     tags?: string[];
     source_url?: string;
     note_type?: string;
-  }): Promise<Note> {
+  }): Promise<AppNote> {
     return this.request('/notes', {
       method: 'POST',
       body: JSON.stringify(note),
@@ -652,7 +652,7 @@ class ApiClient {
     tags?: string[];
     page?: number;
     page_size?: number;
-  }): Promise<PaginatedResponse<Note>> {
+  }): Promise<PaginatedResponse<AppNote>> {
     const queryParams = new URLSearchParams();
     if (params?.workspace_id) queryParams.append('workspace_id', params.workspace_id);
     if (params?.search) queryParams.append('search', params.search);
@@ -664,7 +664,7 @@ class ApiClient {
     return transformPaginatedNotes(response);
   }
 
-  async getNote(noteId: string): Promise<Note> {
+  async getNote(noteId: string): Promise<AppNote> {
     return this.request(`/notes/${noteId}`);
   }
 
@@ -677,7 +677,7 @@ class ApiClient {
       connections: string[];
       note_type: string;
     }>
-  ): Promise<Note> {
+  ): Promise<AppNote> {
     return this.request(`/notes/${noteId}`, {
       method: 'PATCH',
       body: JSON.stringify(updates),
@@ -688,6 +688,74 @@ class ApiClient {
     await this.request(`/notes/${noteId}`, { method: 'DELETE' });
   }
 
+  async getNoteVersions(noteId: string): Promise<NoteVersion[]> {
+    const response = await this.request<any[]>(`/notes/${noteId}/versions`);
+    return (response || []).map((version) => ({
+      id: version.id,
+      noteId: version.note_id,
+      workspaceId: version.workspace_id || undefined,
+      userId: version.user_id,
+      versionNumber: version.version_number || 0,
+      changeReason: version.change_reason || 'updated',
+      restoredFromVersionId: version.restored_from_version_id || undefined,
+      title: version.title || '',
+      content: version.content || '',
+      summary: version.summary || undefined,
+      tags: Array.isArray(version.tags) ? version.tags : [],
+      connections: Array.isArray(version.connections) ? version.connections : [],
+      noteType: version.note_type || 'note',
+      sourceUrl: version.source_url || undefined,
+      wordCount: version.word_count || 0,
+      diffSegments: Array.isArray(version.diff_segments)
+        ? version.diff_segments.map((segment: any) => ({
+            type: segment.type || 'unchanged',
+            text: segment.text || '',
+            wordCount: segment.word_count || 0,
+          }))
+        : [],
+      metadata: version.metadata || {},
+      createdAt: version.created_at ? new Date(version.created_at) : new Date(),
+    }));
+  }
+
+  async restoreNoteVersion(noteId: string, versionId: string): Promise<{ note: AppNote; restoredVersion: NoteVersion }> {
+    const response = await this.request<any>(`/notes/${noteId}/versions/${versionId}/restore`, {
+      method: 'POST',
+    });
+
+    const restoredVersion: NoteVersion = {
+      id: response.restored_version.id,
+      noteId: response.restored_version.note_id,
+      workspaceId: response.restored_version.workspace_id || undefined,
+      userId: response.restored_version.user_id,
+      versionNumber: response.restored_version.version_number || 0,
+      changeReason: response.restored_version.change_reason || 'restored',
+      restoredFromVersionId: response.restored_version.restored_from_version_id || undefined,
+      title: response.restored_version.title || '',
+      content: response.restored_version.content || '',
+      summary: response.restored_version.summary || undefined,
+      tags: Array.isArray(response.restored_version.tags) ? response.restored_version.tags : [],
+      connections: Array.isArray(response.restored_version.connections) ? response.restored_version.connections : [],
+      noteType: response.restored_version.note_type || 'note',
+      sourceUrl: response.restored_version.source_url || undefined,
+      wordCount: response.restored_version.word_count || 0,
+      diffSegments: Array.isArray(response.restored_version.diff_segments)
+        ? response.restored_version.diff_segments.map((segment: any) => ({
+            type: segment.type || 'unchanged',
+            text: segment.text || '',
+            wordCount: segment.word_count || 0,
+          }))
+        : [],
+      metadata: response.restored_version.metadata || {},
+      createdAt: response.restored_version.created_at ? new Date(response.restored_version.created_at) : new Date(),
+    };
+
+    return {
+      note: transformNoteFromAPI(response.note),
+      restoredVersion,
+    };
+  }
+
   async getWorkspaceNotes(
     workspaceId: string,
     params?: {
@@ -696,7 +764,7 @@ class ApiClient {
       page?: number;
       page_size?: number;
     }
-  ): Promise<PaginatedResponse<Note>> {
+  ): Promise<PaginatedResponse<AppNote>> {
     const queryParams = new URLSearchParams();
     if (params?.search) queryParams.append('search', params.search);
     if (params?.tags) params.tags.forEach((tag) => queryParams.append('tags', tag));
