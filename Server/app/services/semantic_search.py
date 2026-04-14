@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import SearchLog, SearchQuery
+from app.database.models import Note, SearchLog, SearchQuery
 from app.services.embeddings import get_embedding_service
 from app.services.postgresql_search import get_postgresql_search_service
 from app.services.rag_retriever import RAGRetriever, RetrievedChunk, get_rag_retriever
@@ -35,10 +35,13 @@ class SemanticSearchResult:
         created_at: datetime,
         interaction_count: int,
         similarity_score: float,
+        vector_score: float = 0.0,
+        text_score: float = 0.0,
         recency_score: float = 0.0,
         usage_score: float = 0.0,
         final_score: float = 0.0,
         highlight: str = "",
+        tags: Optional[List[str]] = None,
     ):
         self.chunk_id = chunk_id
         self.document_id = document_id
@@ -49,10 +52,13 @@ class SemanticSearchResult:
         self.created_at = created_at
         self.interaction_count = interaction_count
         self.similarity_score = similarity_score
+        self.vector_score = vector_score
+        self.text_score = text_score
         self.recency_score = recency_score
         self.usage_score = usage_score
         self.final_score = final_score
         self.highlight = highlight
+        self.tags = tags or []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,10 +71,12 @@ class SemanticSearchResult:
             "created_at": self.created_at.isoformat(),
             "interaction_count": self.interaction_count,
             "similarity_score": round(self.similarity_score, 4),
+            "text_score": round(self.text_score, 4),
             "recency_score": round(self.recency_score, 4),
             "usage_score": round(self.usage_score, 4),
             "final_score": round(self.final_score, 4),
             "highlight": self.highlight,
+            "tags": self.tags,
         }
 
     @classmethod
@@ -91,10 +99,13 @@ class SemanticSearchResult:
             created_at=created_at,
             interaction_count=int(data.get("interaction_count", 0) or 0),
             similarity_score=float(data.get("similarity_score", 0.0) or 0.0),
+            vector_score=float(data.get("vector_score", data.get("similarity_score", 0.0)) or 0.0),
+            text_score=float(data.get("text_score", 0.0) or 0.0),
             recency_score=float(data.get("recency_score", 0.0) or 0.0),
             usage_score=float(data.get("usage_score", 0.0) or 0.0),
             final_score=float(data.get("final_score", 0.0) or 0.0),
             highlight=data.get("highlight", ""),
+            tags=list(data.get("tags", []) or []),
         )
 
 
@@ -136,7 +147,8 @@ class SemanticSearchService:
     ) -> SemanticSearchExecution:
         """Perform semantic search with PostgreSQL first and retriever fallback."""
         query = (query or "").strip()
-        filters = filters or {}
+        filters = self._normalize_filters(filters)
+        limit = self._normalize_limit(limit)
         if not query:
             return SemanticSearchExecution(results=[], strategy="empty_query")
 
@@ -212,8 +224,10 @@ class SemanticSearchService:
         for row in postgres_results:
             created_at = self._parse_datetime(row.get("created_at"))
             similarity_score = max(0.0, min(float(row.get("embedding_similarity", 0.0) or 0.0), 1.0))
+            text_score = self._normalize_text_score(row.get("text_score", 0.0))
             usage_score = max(0.0, min(float(row.get("interaction_score", 0.0) or 0.0), 1.0))
             recency_score = self._calculate_recency_score(created_at)
+            semantic_score = self._calculate_semantic_score(similarity_score, text_score)
 
             normalized.append(
                 SemanticSearchResult(
@@ -225,16 +239,19 @@ class SemanticSearchService:
                     chunk_index=0,
                     created_at=created_at,
                     interaction_count=int(round(usage_score * 100)),
-                    similarity_score=similarity_score,
+                    similarity_score=semantic_score,
+                    vector_score=similarity_score,
+                    text_score=text_score,
                     recency_score=recency_score,
                     usage_score=usage_score,
-                    final_score=self._calculate_final_score(similarity_score, recency_score, usage_score),
+                    final_score=self._calculate_final_score(semantic_score, recency_score, usage_score),
                     highlight=row.get("highlight") or self._extract_highlight(row.get("content", ""), query),
                 )
             )
 
+        await self._hydrate_result_tags(db, normalized)
         filtered = self._apply_result_filters(normalized, filters)
-        return self._rerank(filtered)
+        return self._rerank(self._dedupe_results(filtered))
 
     async def _search_retriever_fallback(
         self,
@@ -275,7 +292,7 @@ class SemanticSearchService:
         query: str,
         db: Optional[AsyncSession],
     ) -> List[SemanticSearchResult]:
-        del user_id, workspace_id, db
+        del user_id, workspace_id
         enriched: List[SemanticSearchResult] = []
 
         for chunk in chunks:
@@ -295,25 +312,35 @@ class SemanticSearchService:
                         created_at=created_at,
                         interaction_count=int(metadata.get("interaction_count", 0) or 0),
                         similarity_score=similarity_score,
+                        vector_score=similarity_score,
+                        text_score=float(metadata.get("lexical_overlap", 0.0) or 0.0),
                         highlight=self._extract_highlight(chunk.text, query),
+                        tags=list(metadata.get("tags", []) or []),
                     )
                 )
             except Exception as exc:
                 logger.warning("Error enriching fallback result: %s", exc)
 
+        if db is not None:
+            await self._hydrate_result_tags(db, enriched)
         return enriched
 
     def _rerank(self, results: List[SemanticSearchResult]) -> List[SemanticSearchResult]:
         for result in results:
+            semantic_score = self._calculate_semantic_score(
+                result.vector_score or result.similarity_score,
+                result.text_score,
+            )
+            result.similarity_score = semantic_score
             result.recency_score = self._calculate_recency_score(result.created_at)
             derived_usage_score = min(math.log1p(result.interaction_count) / math.log1p(100), 1.0)
             result.usage_score = max(result.usage_score, derived_usage_score)
 
-            if result.similarity_score < 0.5:
+            if semantic_score < 0.5:
                 result.recency_score *= 0.3
 
             result.final_score = self._calculate_final_score(
-                result.similarity_score,
+                semantic_score,
                 result.recency_score,
                 result.usage_score,
             )
@@ -343,6 +370,20 @@ class SemanticSearchService:
             + (self.USAGE_WEIGHT * usage_score)
         )
 
+    def _calculate_semantic_score(self, similarity_score: float, text_score: float) -> float:
+        """Blend vector and BM25 signals into the semantic component used for reranking."""
+        normalized_similarity = max(0.0, min(similarity_score, 1.0))
+        normalized_text = self._normalize_text_score(text_score)
+        return max(0.0, min((normalized_similarity * 0.7) + (normalized_text * 0.3), 1.0))
+
+    @staticmethod
+    def _normalize_text_score(value: Any) -> float:
+        try:
+            score = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(score, 1.0))
+
     def _apply_result_filters(
         self,
         results: List[SemanticSearchResult],
@@ -354,20 +395,29 @@ class SemanticSearchService:
         if source_type:
             filtered = [result for result in filtered if result.source_type == source_type]
 
+        tags = [str(tag).strip().lower() for tag in (filters.get("tags") or []) if str(tag).strip()]
+        if tags:
+            required_tags = set(tags)
+            filtered = [
+                result
+                for result in filtered
+                if required_tags.issubset({str(tag).strip().lower() for tag in (result.tags or [])})
+            ]
+
         date_from = filters.get("date_from")
         if date_from:
-            try:
-                date_from_dt = datetime.fromisoformat(str(date_from))
+            date_from_dt = self._parse_filter_datetime(date_from)
+            if date_from_dt is not None:
                 filtered = [result for result in filtered if result.created_at >= date_from_dt]
-            except ValueError:
+            else:
                 logger.warning("Ignoring invalid date_from filter: %s", date_from)
 
         date_to = filters.get("date_to")
         if date_to:
-            try:
-                date_to_dt = datetime.fromisoformat(str(date_to))
+            date_to_dt = self._parse_filter_datetime(date_to)
+            if date_to_dt is not None:
                 filtered = [result for result in filtered if result.created_at <= date_to_dt]
-            except ValueError:
+            else:
                 logger.warning("Ignoring invalid date_to filter: %s", date_to)
 
         return filtered
@@ -398,6 +448,67 @@ class SemanticSearchService:
         prefix = "..." if start > 0 else ""
         suffix = "..." if end < len(content) else ""
         return prefix + content[start:end] + suffix
+
+    async def _hydrate_result_tags(
+        self,
+        db: AsyncSession,
+        results: List[SemanticSearchResult],
+    ) -> None:
+        if not results:
+            return
+
+        note_ids = [result.document_id for result in results]
+        try:
+            rows = await db.execute(
+                select(Note.id, Note.tags).where(Note.id.in_(note_ids))
+            )
+        except Exception as exc:
+            logger.warning("Failed to hydrate semantic-search tags: %s", exc)
+            return
+
+        tags_by_note_id = {
+            str(row[0]): list(row[1] or [])
+            for row in rows.fetchall()
+        }
+        for result in results:
+            result.tags = tags_by_note_id.get(str(result.document_id), result.tags or [])
+
+    @staticmethod
+    def _dedupe_results(results: List[SemanticSearchResult]) -> List[SemanticSearchResult]:
+        seen: set[tuple[str, str]] = set()
+        deduped: List[SemanticSearchResult] = []
+        for result in results:
+            key = (str(result.chunk_id), str(result.document_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(result)
+        return deduped
+
+    @staticmethod
+    def _normalize_limit(limit: int) -> int:
+        return max(1, min(int(limit or 10), 50))
+
+    @staticmethod
+    def _normalize_filters(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        normalized = dict(filters or {})
+        tags = normalized.get("tags")
+        if tags is None:
+            return normalized
+        normalized["tags"] = [str(tag).strip() for tag in tags if str(tag).strip()]
+        return normalized
+
+    @staticmethod
+    def _parse_filter_datetime(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     async def log_search_execution(
         self,
@@ -477,10 +588,15 @@ class SemanticSearchService:
     @staticmethod
     def _parse_datetime(value: Any) -> datetime:
         if isinstance(value, datetime):
-            return value
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
         if isinstance(value, str):
             try:
-                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
             except ValueError:
                 return datetime.now(timezone.utc)
         return datetime.now(timezone.utc)

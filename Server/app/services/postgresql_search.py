@@ -119,7 +119,7 @@ class PostgreSQLHybridSearchService:
         # 1. Generate and validate query embedding
         log_tag = query[:50]
         logger.info("Embedding query: %s", log_tag)
-        query_embedding = self.embedding_service.embed_text(query)
+        query_embedding = self.embedding_service.embed_query(query)
         self._validate_embedding(query_embedding, context=log_tag)
         logger.info("Generated %dD query embedding", len(query_embedding))
 
@@ -230,7 +230,7 @@ class PostgreSQLHybridSearchService:
             return []
 
         log_tag = query[:50]
-        query_embedding = self.embedding_service.embed_text(query)
+        query_embedding = self.embedding_service.embed_query(query)
         self._validate_embedding(query_embedding, context=log_tag)
 
         dim = self.embedding_service.dimension

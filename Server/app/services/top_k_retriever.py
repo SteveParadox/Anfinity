@@ -1,6 +1,7 @@
 """Top-K Chunk Retrieval Service for RAG Pipeline - STEP 3"""
 import logging
 import re
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 from uuid import UUID
@@ -66,6 +67,12 @@ class RetrievalResult:
 class TopKRetriever:
     STOPWORDS = {"the", "a", "an", "and", "or", "to", "of", "for", "in", "on", "with", "is", "are", "was", "were", "be", "this", "that", "what", "which", "who", "when", "where", "why", "how"}
     TECHNICAL_TERMS = {"ai", "llm", "embedding", "embeddings", "model", "models", "semantic", "search", "timeout", "latency", "retrieval", "qdrant", "ollama", "phi", "token", "sql", "python"}
+    CANDIDATE_MULTIPLIER = 3
+    MIN_CANDIDATE_LIMIT = 12
+    MIN_EXPANDED_THRESHOLD = 0.32
+    THRESHOLD_BUFFER = 0.15
+    MAX_CHUNKS_PER_DOCUMENT = 2
+    RECENCY_HALF_LIFE_DAYS = 30.0
     """Top-K chunk retriever using semantic similarity.
 
     STEP 3 Implementation:
@@ -137,6 +144,7 @@ class TopKRetriever:
         """
         import time
         start_time = time.time()
+        query = (query or "").strip()
 
         top_k = top_k or self.top_k
         threshold = (
@@ -145,6 +153,9 @@ class TopKRetriever:
             else self.similarity_threshold
         )
         workspace_id_str = str(workspace_id)
+        if not query:
+            logger.warning("TopKRetriever received empty query for workspace=%s", workspace_id_str)
+            return self._empty_result(workspace_id_str, start_time)
 
         logger.info(f"Retrieving top {top_k} chunks for query: '{query[:50]}...'")
 
@@ -170,7 +181,10 @@ class TopKRetriever:
             logger.debug(f"Query embedding generated: {embedding_dim} dimensions")
 
             # Step 2: Search vector DB with workspace filtering
-            collection_name = workspace_id_str
+            collection_name = self.vector_db.resolve_collection_name(
+                workspace_id_str,
+                embedding_dim=embedding_dim,
+            )
 
             logger.debug(
                 "Searching Qdrant collection '%s' with threshold %s...",
@@ -182,8 +196,8 @@ class TopKRetriever:
                 collection_name=collection_name,
                 query_vector=query_embedding,
                 workspace_id=workspace_id_str,
-                limit=max(top_k * 3, 12),
-                score_threshold=max(threshold - 0.15, 0.32)
+                limit=max(top_k * self.CANDIDATE_MULTIPLIER, self.MIN_CANDIDATE_LIMIT),
+                score_threshold=max(threshold - self.THRESHOLD_BUFFER, self.MIN_EXPANDED_THRESHOLD)
             )
 
             logger.info(f"Vector DB returned {len(vector_results)} results")
@@ -209,6 +223,9 @@ class TopKRetriever:
                         context_after=payload.get("context_after"),
                         metadata=payload.get("metadata")
                     )
+                    chunk.metadata = dict(chunk.metadata or {})
+                    chunk.metadata["retrieval_collection"] = collection_name
+                    chunk.metadata["vector_similarity"] = round(similarity, 4)
 
                     retrieved_chunks.append(chunk)
                     logger.debug(
@@ -221,6 +238,7 @@ class TopKRetriever:
                     continue
 
             retrieved_chunks = self._rerank_and_filter(query, retrieved_chunks, top_k, threshold)
+            retrieved_chunks = self._apply_document_cap(retrieved_chunks, top_k)
 
             avg_similarity = (
                 sum(c.similarity for c in retrieved_chunks) / len(retrieved_chunks)
@@ -244,7 +262,13 @@ class TopKRetriever:
             )
 
         except Exception as e:
-            logger.error(f"Error during retrieval: {e}", exc_info=True)
+            logger.error(
+                "Error during retrieval for workspace=%s query=%s: %s",
+                workspace_id_str,
+                query[:120],
+                e,
+                exc_info=True,
+            )
             return self._empty_result(workspace_id_str, start_time)
 
 
@@ -256,7 +280,109 @@ class TopKRetriever:
 
     def _looks_narrative(self, text: str) -> bool:
         lowered = f" {text.lower()} "
-        return lowered.count('"') >= 2 or any(term in lowered for term in (" kate ", " andy ", " lunch ", " looked at his watch ", " walked away "))
+        prose_markers = (
+            " he ",
+            " she ",
+            " they ",
+            " then ",
+            " said ",
+            " replied ",
+            " walked ",
+            " looked ",
+            " later ",
+        )
+        return lowered.count('"') >= 2 or sum(1 for term in prose_markers if term in lowered) >= 2
+
+    def _parse_timestamp(self, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            try:
+                parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    def _extract_chunk_timestamp(self, chunk: RetrievedChunk) -> Optional[datetime]:
+        metadata = chunk.metadata or {}
+        candidates = (
+            metadata.get("updated_at"),
+            metadata.get("created_at"),
+            metadata.get("document_updated_at"),
+            metadata.get("document_created_at"),
+        )
+        for candidate in candidates:
+            parsed = self._parse_timestamp(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _recency_score(self, chunk: RetrievedChunk) -> float:
+        timestamp = self._extract_chunk_timestamp(chunk)
+        if timestamp is None:
+            return 0.0
+        age_days = max((datetime.now(timezone.utc) - timestamp).total_seconds() / 86400.0, 0.0)
+        return 0.5 ** (age_days / self.RECENCY_HALF_LIFE_DAYS)
+
+    def _dedupe_chunks(self, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        deduped: List[RetrievedChunk] = []
+        seen_chunk_ids: Set[str] = set()
+        seen_signatures: Set[Tuple[str, int, str]] = set()
+
+        for chunk in chunks:
+            chunk_id = str(chunk.chunk_id or "")
+            if chunk_id and chunk_id in seen_chunk_ids:
+                continue
+
+            text_signature = " ".join((chunk.text or "").lower().split())[:240]
+            signature = (
+                str(chunk.document_id or ""),
+                int(chunk.chunk_index or 0),
+                text_signature,
+            )
+            if signature in seen_signatures:
+                continue
+
+            if chunk_id:
+                seen_chunk_ids.add(chunk_id)
+            seen_signatures.add(signature)
+            deduped.append(chunk)
+
+        return deduped
+
+    def _apply_document_cap(self, chunks: List[RetrievedChunk], top_k: int) -> List[RetrievedChunk]:
+        if not chunks:
+            return []
+
+        capped: List[RetrievedChunk] = []
+        doc_counts: Dict[str, int] = {}
+        overflow: List[RetrievedChunk] = []
+
+        for chunk in chunks:
+            document_id = str(chunk.document_id or "")
+            current = doc_counts.get(document_id, 0)
+            if current < self.MAX_CHUNKS_PER_DOCUMENT:
+                capped.append(chunk)
+                doc_counts[document_id] = current + 1
+            else:
+                overflow.append(chunk)
+
+        for chunk in overflow:
+            if len(capped) >= top_k:
+                break
+            capped.append(chunk)
+
+        return capped[:top_k]
 
     def _rerank_and_filter(
         self,
@@ -267,6 +393,7 @@ class TopKRetriever:
     ) -> List[RetrievedChunk]:
         if not chunks:
             return []
+        chunks = self._dedupe_chunks(chunks)
         query_terms = set(self._tokenize(query))
         technical = len(query_terms & self.TECHNICAL_TERMS) >= 2
         scored: List[Tuple[float, RetrievedChunk]] = []
@@ -274,9 +401,11 @@ class TopKRetriever:
             chunk_terms = set(self._tokenize(chunk.text or ""))
             lexical = len(query_terms & chunk_terms) / max(len(query_terms), 1) if query_terms else 0.0
             narrative_penalty = 0.35 if technical and self._looks_narrative(chunk.text or "") and lexical < 0.15 else 0.0
-            score = (chunk.similarity * 0.72) + (lexical * 0.28) - narrative_penalty
+            recency = self._recency_score(chunk)
+            score = (chunk.similarity * 0.68) + (lexical * 0.22) + (recency * 0.10) - narrative_penalty
             chunk.metadata = dict(chunk.metadata or {})
             chunk.metadata["lexical_overlap"] = round(lexical, 4)
+            chunk.metadata["recency_score"] = round(recency, 4)
             chunk.metadata["rerank_score"] = round(score, 4)
             scored.append((score, chunk))
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -371,8 +500,12 @@ class TopKRetriever:
         self,
         chunks: List[RetrievedChunk]
     ) -> List[RetrievedChunk]:
-        """Re-rank chunks by recency (similarity fallback until timestamps in metadata)."""
-        return sorted(chunks, key=lambda c: c.similarity, reverse=True)
+        """Re-rank chunks by recency with semantic similarity as tie-breaker."""
+        return sorted(
+            chunks,
+            key=lambda c: (self._recency_score(c), c.similarity),
+            reverse=True,
+        )
 
     def get_query_stats(
         self,

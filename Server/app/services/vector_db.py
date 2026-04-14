@@ -1,6 +1,7 @@
 """Vector database wrapper for Qdrant."""
 from typing import List, Dict, Any, Optional
 import logging
+import math
 import os
 import time
 from uuid import UUID
@@ -48,6 +49,10 @@ ALLOW_DESTRUCTIVE_RECREATE: bool = (
 RECONNECT_COOLDOWN_SECONDS: float = 5.0
 
 DEFAULT_SCORE_THRESHOLD: float = 0.6
+DEFAULT_UPSERT_BATCH_SIZE: int = max(
+    1,
+    int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "128")),
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +72,19 @@ def is_valid_vector(vec: Any, expected_dim: int) -> bool:
     if len(set(vec)) < 10:
         return False
     return True
+
+
+def cosine_similarity(left: List[float], right: List[float]) -> float:
+    """Return cosine similarity for two dense vectors."""
+    if not left or not right or len(left) != len(right):
+        return 0.0
+
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
 
 class VectorDBClient:
@@ -263,6 +281,30 @@ class VectorDBClient:
         except Exception:
             return None
 
+    def collection_exists(self, collection_name: str) -> bool:
+        if not self.client:
+            return collection_name in self.mock_storage
+        try:
+            info = self.client.get_collection(collection_name)
+            return info is not None
+        except Exception:
+            return False
+
+    def resolve_collection_name(
+        self,
+        base_name: str,
+        embedding_dim: Optional[int] = None,
+    ) -> str:
+        """Resolve to a versioned collection when one exists, else use base name."""
+        dim = embedding_dim or self.embedding_dim
+        versioned = self.versioned_collection_name(base_name, dim)
+
+        if self.collection_exists(versioned):
+            return versioned
+        if self.collection_exists(base_name):
+            return base_name
+        return base_name
+
     # ─────────────────────────────────────────────────────────────────────────
     # Vector operations
     # ─────────────────────────────────────────────────────────────────────────
@@ -334,20 +376,30 @@ class VectorDBClient:
                 "Could not probe collection '%s' before upsert: %s",
                 collection_name, probe_exc,
             )
+            if not self.create_collection(collection_name, embedding_dim=actual_dim):
+                logger.error(
+                    "upsert_vectors: failed to create missing collection '%s' (dim=%d)",
+                    collection_name,
+                    actual_dim,
+                )
+                return False
 
         try:
-            qdrant_points = [
-                PointStruct(
-                    id=p["id"],
-                    vector=p["vector"],
-                    payload=p.get("payload", {}),
-                )
-                for p in points
-            ]
-            self.client.upsert(collection_name=collection_name, points=qdrant_points)
+            total_points = len(points)
+            for start in range(0, total_points, DEFAULT_UPSERT_BATCH_SIZE):
+                batch = points[start:start + DEFAULT_UPSERT_BATCH_SIZE]
+                qdrant_points = [
+                    PointStruct(
+                        id=p["id"],
+                        vector=p["vector"],
+                        payload=p.get("payload", {}),
+                    )
+                    for p in batch
+                ]
+                self.client.upsert(collection_name=collection_name, points=qdrant_points)
             logger.info(
                 "Upserted %d vectors to '%s' (dim=%d)",
-                len(points), collection_name, actual_dim,
+                total_points, collection_name, actual_dim,
             )
             return True
 
@@ -382,7 +434,8 @@ class VectorDBClient:
             logger.error("search_similar: query_vector is empty — returning []")
             return []
 
-        expected_dim = self.get_collection_dimension(collection_name) or self.embedding_dim
+        self._ensure_connected()
+        expected_dim = self.get_collection_dimension(collection_name) or len(query_vector) or self.embedding_dim
         if not is_valid_vector(query_vector, expected_dim):
             logger.error(
                 "search_similar: query vector is invalid (dim=%d, distinct=%d, "
@@ -393,18 +446,29 @@ class VectorDBClient:
             )
             return []
 
-        self._ensure_connected()
-
         if not self.client:
             points = self.mock_storage.get(collection_name, [])
-            return [
-                {
-                    "id": p["id"],
-                    "similarity": round(0.85 - (i * 0.05), 4),
-                    "payload": p.get("payload", {}),
-                }
-                for i, p in enumerate(points[:limit])
-            ]
+            scored_points = []
+            for point in points:
+                payload = point.get("payload", {})
+                point_workspace_id = payload.get("workspace_id")
+                if workspace_id is not None and str(point_workspace_id) != str(workspace_id):
+                    continue
+                vector = point.get("vector")
+                if not is_valid_vector(vector, expected_dim):
+                    continue
+                similarity = cosine_similarity(query_vector, vector)
+                if similarity < score_threshold:
+                    continue
+                scored_points.append(
+                    {
+                        "id": point["id"],
+                        "similarity": similarity,
+                        "payload": payload,
+                    }
+                )
+            scored_points.sort(key=lambda item: item["similarity"], reverse=True)
+            return scored_points[:limit]
 
         try:
             query_filter = None
