@@ -24,6 +24,8 @@ interface SidebarProps {
   collapsed: boolean;
   onToggleCollapse: () => void;
   user?: User | null;
+  availableViews?: string[];
+  canCreateNotes?: boolean;
 }
 
 const navigation = [
@@ -60,8 +62,13 @@ export function Sidebar({
   collapsed,
   onToggleCollapse,
   user,
+  availableViews,
+  canCreateNotes = true,
 }: SidebarProps) {
   const initial = user?.name?.charAt(0) ?? user?.email?.charAt(0) ?? '?';
+  const visibleNavigation = availableViews?.length
+    ? navigation.filter((item) => availableViews.includes(item.id))
+    : navigation;
 
   return (
     <div
@@ -142,29 +149,34 @@ export function Sidebar({
       {/* ── New Note CTA ────────────────────────────────────────── */}
       <div style={{ padding: collapsed ? '12px 10px' : '12px 12px', flexShrink: 0 }}>
         <button
-          onClick={() => onViewChange('notes')}
+          onClick={() => { if (canCreateNotes) onViewChange('notes'); }}
+          disabled={!canCreateNotes}
+          title={canCreateNotes ? 'Create a new note' : 'You do not have permission to create notes in this workspace'}
           style={{
             width: '100%',
             height: 36,
-            background: TT.yolk,
-            border: `2px solid ${TT.yolk}`,
+            background: canCreateNotes ? TT.yolk : TT.inkRaised,
+            border: `2px solid ${canCreateNotes ? TT.yolk : TT.inkBorder}`,
             borderRadius: 3,
-            color: TT.inkBlack,
+            color: canCreateNotes ? TT.inkBlack : TT.inkMuted,
             fontFamily: TT.fontDisplay,
             fontSize: 14,
             letterSpacing: '0.12em',
             textTransform: 'uppercase',
-            cursor: 'pointer',
+            cursor: canCreateNotes ? 'pointer' : 'not-allowed',
             display: 'flex', alignItems: 'center',
             justifyContent: collapsed ? 'center' : 'center',
             gap: 6,
             transition: 'background 0.15s, border-color 0.15s',
+            opacity: canCreateNotes ? 1 : 0.65,
           }}
           onMouseEnter={(e) => {
+            if (!canCreateNotes) return;
             (e.currentTarget as HTMLElement).style.background = TT.yolkBright;
             (e.currentTarget as HTMLElement).style.borderColor = TT.yolkBright;
           }}
           onMouseLeave={(e) => {
+            if (!canCreateNotes) return;
             (e.currentTarget as HTMLElement).style.background = TT.yolk;
             (e.currentTarget as HTMLElement).style.borderColor = TT.yolk;
           }}
@@ -177,7 +189,7 @@ export function Sidebar({
       {/* ── Navigation ──────────────────────────────────────────── */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '4px 8px' }}>
         <nav style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          {navigation.map(({ id, label, icon: Icon, ai }) => {
+          {visibleNavigation.map(({ id, label, icon: Icon, ai }) => {
             const active = currentView === id;
             return (
               <button

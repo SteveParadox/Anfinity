@@ -5,6 +5,7 @@
 
 import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { api } from '@/lib/api';
+import type { WorkspacePermissions, WorkspacePermissionAction, WorkspacePermissionSection } from '@/types';
 
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
 
@@ -27,6 +28,7 @@ export interface User {
 export interface AuthContextType {
   user: User | null;
   workspaces: Workspace[];
+  permissionsByWorkspace: Record<string, WorkspacePermissions>;
   currentWorkspaceId: string | null;
   isLoading: boolean;
   isAuthenticated: boolean;
@@ -39,6 +41,7 @@ export interface AuthContextType {
   setCurrentWorkspace: (workspaceId: string) => void;
   clearError: () => void;
   hasRole: (workspaceId: string, minRole: WorkspaceRole) => boolean;
+  hasPermission: (workspaceId: string, section: WorkspacePermissionSection, action: WorkspacePermissionAction) => boolean;
 }
 
 export const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -56,9 +59,57 @@ const ROLE_HIERARCHY: Record<WorkspaceRole, number> = {
   viewer: 1,
 };
 
+const DEFAULT_PERMISSION_MATRIX: Record<WorkspaceRole, WorkspacePermissions['permissions']> = {
+  owner: {
+    workspace: { view: true, create: false, update: true, delete: true, manage: true },
+    settings: { view: true, create: false, update: true, delete: true, manage: true },
+    members: { view: true, create: true, update: true, delete: true, manage: true },
+    documents: { view: true, create: true, update: true, delete: true, manage: true },
+    notes: { view: true, create: true, update: true, delete: true, manage: true },
+    search: { view: true, create: true, update: false, delete: false, manage: true },
+    knowledge_graph: { view: true, create: false, update: true, delete: false, manage: true },
+    chat: { view: true, create: true, update: false, delete: false, manage: true },
+    workflows: { view: true, create: true, update: true, delete: true, manage: true },
+  },
+  admin: {
+    workspace: { view: true, create: false, update: true, delete: false, manage: true },
+    settings: { view: true, create: false, update: true, delete: false, manage: true },
+    members: { view: true, create: true, update: true, delete: true, manage: true },
+    documents: { view: true, create: true, update: true, delete: true, manage: true },
+    notes: { view: true, create: true, update: true, delete: true, manage: true },
+    search: { view: true, create: true, update: false, delete: false, manage: true },
+    knowledge_graph: { view: true, create: false, update: true, delete: false, manage: true },
+    chat: { view: true, create: true, update: false, delete: false, manage: true },
+    workflows: { view: true, create: true, update: true, delete: false, manage: true },
+  },
+  member: {
+    workspace: { view: true, create: false, update: false, delete: false, manage: false },
+    settings: { view: true, create: false, update: false, delete: false, manage: false },
+    members: { view: true, create: false, update: false, delete: false, manage: false },
+    documents: { view: true, create: true, update: true, delete: false, manage: false },
+    notes: { view: true, create: true, update: true, delete: true, manage: false },
+    search: { view: true, create: true, update: false, delete: false, manage: false },
+    knowledge_graph: { view: true, create: false, update: false, delete: false, manage: false },
+    chat: { view: true, create: true, update: false, delete: false, manage: false },
+    workflows: { view: true, create: true, update: true, delete: false, manage: false },
+  },
+  viewer: {
+    workspace: { view: true, create: false, update: false, delete: false, manage: false },
+    settings: { view: true, create: false, update: false, delete: false, manage: false },
+    members: { view: true, create: false, update: false, delete: false, manage: false },
+    documents: { view: true, create: false, update: false, delete: false, manage: false },
+    notes: { view: true, create: false, update: false, delete: false, manage: false },
+    search: { view: true, create: true, update: false, delete: false, manage: false },
+    knowledge_graph: { view: true, create: false, update: false, delete: false, manage: false },
+    chat: { view: true, create: true, update: false, delete: false, manage: false },
+    workflows: { view: true, create: false, update: false, delete: false, manage: false },
+  },
+};
+
 export function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<User | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [permissionsByWorkspace, setPermissionsByWorkspace] = useState<Record<string, WorkspacePermissions>>({});
   const [currentWorkspaceId, setCurrentWorkspaceId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -66,8 +117,21 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const clearWorkspaceState = useCallback(() => {
     setWorkspaces([]);
+    setPermissionsByWorkspace({});
     setCurrentWorkspaceId(null);
     localStorage.removeItem('currentWorkspaceId');
+  }, []);
+
+  const loadWorkspacePermissions = useCallback(async () => {
+    try {
+      const response = await api.getUserPermissions();
+      setPermissionsByWorkspace(response || {});
+      return response || {};
+    } catch (err) {
+      console.error('Failed to load workspace permissions:', err);
+      setPermissionsByWorkspace({});
+      return {};
+    }
   }, []);
 
   const normalizeWorkspaces = useCallback((items: Array<any> = []): Workspace[] => {
@@ -126,27 +190,30 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const nextWorkspaces = normalizeWorkspaces(response.workspaces || []);
     if (nextWorkspaces.length > 0) {
       reconcileWorkspaceSelection(nextWorkspaces, options?.preferredWorkspaceId);
+      await loadWorkspacePermissions();
       return;
     }
 
     if (options?.fallbackToList) {
       const listedWorkspaces = normalizeWorkspaces(await api.listWorkspaces());
       reconcileWorkspaceSelection(listedWorkspaces, options?.preferredWorkspaceId);
+      await loadWorkspacePermissions();
       return;
     }
 
     clearWorkspaceState();
-  }, [clearWorkspaceState, normalizeWorkspaces, reconcileWorkspaceSelection]);
+  }, [clearWorkspaceState, loadWorkspacePermissions, normalizeWorkspaces, reconcileWorkspaceSelection]);
 
   const loadWorkspaces = useCallback(async () => {
     try {
       const response = await api.listWorkspaces();
       const nextWorkspaces = normalizeWorkspaces(response);
       reconcileWorkspaceSelection(nextWorkspaces);
+      await loadWorkspacePermissions();
     } catch (err) {
       console.error('Failed to load workspaces:', err);
     }
-  }, [normalizeWorkspaces, reconcileWorkspaceSelection]);
+  }, [loadWorkspacePermissions, normalizeWorkspaces, reconcileWorkspaceSelection]);
 
   const setupTokenRefresh = useCallback(() => {
     if (tokenRefreshIntervalRef.current) {
@@ -280,6 +347,23 @@ export function AuthProvider({ children }: AuthProviderProps) {
     return ROLE_HIERARCHY[workspace.role] >= ROLE_HIERARCHY[minRole];
   }, [workspaces]);
 
+  const hasPermission = useCallback((
+    workspaceId: string,
+    section: WorkspacePermissionSection,
+    action: WorkspacePermissionAction,
+  ): boolean => {
+    const permissionEntry = permissionsByWorkspace[workspaceId];
+    if (permissionEntry?.permissions?.[section]) {
+      return Boolean(permissionEntry.permissions[section][action]);
+    }
+
+    const workspace = workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) {
+      return false;
+    }
+    return Boolean(DEFAULT_PERMISSION_MATRIX[workspace.role]?.[section]?.[action]);
+  }, [permissionsByWorkspace, workspaces]);
+
   const refreshAuth = async () => {
     try {
       const response = await api.refresh();
@@ -300,6 +384,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const value: AuthContextType = {
     user,
     workspaces,
+    permissionsByWorkspace,
     currentWorkspaceId,
     isLoading,
     isAuthenticated: user !== null,
@@ -312,6 +397,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setCurrentWorkspace,
     clearError,
     hasRole,
+    hasPermission,
   };
 
   return (

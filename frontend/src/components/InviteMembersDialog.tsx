@@ -32,7 +32,7 @@ export interface InviteMembersDialogProps {
 }
 
 export function InviteMembersDialog({ workspaceId, onInviteSent }: InviteMembersDialogProps) {
-  const { currentWorkspaceId, hasRole } = useAuth();
+  const { currentWorkspaceId, hasPermission } = useAuth();
   const [open, setOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [role, setRole] = useState('member');
@@ -41,7 +41,8 @@ export function InviteMembersDialog({ workspaceId, onInviteSent }: InviteMembers
   const [success, setSuccess] = useState(false);
 
   // Only allow admins and owners to invite
-  const canInvite = hasRole(workspaceId || currentWorkspaceId || '', 'admin');
+  const targetWorkspaceId = workspaceId || currentWorkspaceId || '';
+  const canInvite = Boolean(targetWorkspaceId && hasPermission(targetWorkspaceId, 'members', 'manage'));
 
   if (!canInvite) {
     return null;
@@ -63,7 +64,7 @@ export function InviteMembersDialog({ workspaceId, onInviteSent }: InviteMembers
       await api.inviteToWorkspace(
         workspaceId,
         email,
-        role as 'owner' | 'admin' | 'member' | 'viewer'
+        role as 'admin' | 'member' | 'viewer'
       );
 
       setSuccess(true);
@@ -141,14 +142,12 @@ export function InviteMembersDialog({ workspaceId, onInviteSent }: InviteMembers
                 <SelectItem value="viewer">Viewer (Read-only)</SelectItem>
                 <SelectItem value="member">Member (Can contribute)</SelectItem>
                 <SelectItem value="admin">Admin (Full control)</SelectItem>
-                <SelectItem value="owner">Owner (All permissions)</SelectItem>
               </SelectContent>
             </Select>
             <p className="text-xs text-slate-500">
               {role === 'viewer' && 'Can view documents and workspace content'}
               {role === 'member' && 'Can upload documents and create notes'}
               {role === 'admin' && 'Can manage members and workspace settings'}
-              {role === 'owner' && 'Full control over workspace'}
             </p>
           </div>
 

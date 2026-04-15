@@ -5,16 +5,18 @@
 
 import {
   transformNoteFromAPI,
-  transformWorkspaceFromAPI,
-  transformDocumentFromAPI,
   transformPaginatedNotes,
-  transformPaginatedWorkspaces,
   transformPaginatedDocuments,
-  transformNotesArray,
-  transformWorkspacesArray,
-  transformQueryResponseFromAPI,
 } from './transformers';
-import type { KnowledgeGraph, KnowledgeGraphFilters, Note as AppNote, NoteConnectionSuggestion, NoteVersion } from '@/types';
+import type {
+  KnowledgeGraph,
+  KnowledgeGraphFilters,
+  Note as AppNote,
+  NoteConnectionSuggestion,
+  NoteVersion,
+  WorkspacePermissions,
+  WorkspacePermissionSection,
+} from '@/types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 const API_TIMEOUT = parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'); // 30 seconds
@@ -841,6 +843,41 @@ class ApiClient {
     return this.request(`/workspaces/${workspaceId}`);
   }
 
+  async getUserPermissions(): Promise<Record<string, WorkspacePermissions>> {
+    return this.request('/workspaces/permissions/bulk');
+  }
+
+  async getWorkspacePermissions(workspaceId: string): Promise<WorkspacePermissions> {
+    return this.request(`/workspaces/${workspaceId}/permissions`);
+  }
+
+  async updateWorkspacePermissionOverride(
+    workspaceId: string,
+    userId: string,
+    payload: {
+      section: WorkspacePermissionSection;
+      can_view?: boolean | null;
+      can_create?: boolean | null;
+      can_update?: boolean | null;
+      can_delete?: boolean | null;
+      can_manage?: boolean | null;
+    }
+  ): Promise<{
+    workspace_id: string;
+    user_id: string;
+    section: WorkspacePermissionSection;
+    can_view?: boolean | null;
+    can_create?: boolean | null;
+    can_update?: boolean | null;
+    can_delete?: boolean | null;
+    can_manage?: boolean | null;
+  }> {
+    return this.request(`/workspaces/${workspaceId}/permissions/${userId}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  }
+
   async updateWorkspace(
     workspaceId: string,
     updates: Partial<{
@@ -981,7 +1018,7 @@ class ApiClient {
     });
   }
 
-  async inviteToWorkspace(workspaceId: string, email: string, role: 'owner' | 'admin' | 'member' | 'viewer'): Promise<any> {
+  async inviteToWorkspace(workspaceId: string, email: string, role: 'admin' | 'member' | 'viewer'): Promise<any> {
     return this.request(`/workspaces/${workspaceId}/invite`, {
       method: 'POST',
       body: JSON.stringify({ email, role }),
