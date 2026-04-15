@@ -53,11 +53,14 @@ class WorkspaceRole(str, PyEnum):
 class WorkspaceSection(str, PyEnum):
     """Workspace permission sections."""
     WORKSPACE = "workspace"
+    SETTINGS = "settings"
+    MEMBERS = "members"
     DOCUMENTS = "documents"
     NOTES = "notes"
     SEARCH = "search"
     KNOWLEDGE_GRAPH = "knowledge_graph"
     CHAT = "chat"
+    WORKFLOWS = "workflows"
 
 
 class GraphNodeType(str, PyEnum):
