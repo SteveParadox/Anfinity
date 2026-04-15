@@ -135,6 +135,12 @@ class WorkspacePermissionOverrideResponse(BaseModel):
     can_manage: Optional[bool] = None
 
 
+class WorkspaceInviteResponse(BaseModel):
+    message: str
+    user_id: str
+    role: str
+
+
 @router.post("", response_model=WorkspaceResponse, status_code=status.HTTP_201_CREATED)
 async def create_workspace(
     workspace_data: WorkspaceCreate,
@@ -312,7 +318,7 @@ async def get_workspace(
         workspace_id=workspace_id,
         user=current_user,
         db=db,
-        section=WorkspaceSection.WORKSPACE,
+        section=WorkspaceSection.SETTINGS,
         action="view",
     )
     
@@ -383,7 +389,7 @@ async def get_workspace_stats(
         workspace_id=workspace_id,
         user=current_user,
         db=db,
-        section=WorkspaceSection.WORKSPACE,
+        section=WorkspaceSection.SETTINGS,
         action="view",
     )
     
@@ -429,7 +435,7 @@ async def update_workspace(
     workspace_id: UUID,
     workspace_data: WorkspaceUpdate,
     request: Request,
-    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "update")),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.SETTINGS, "update")),
     db: AsyncSession = Depends(get_db)
 ):
     """Update workspace.
@@ -513,7 +519,7 @@ async def upsert_workspace_permission_override(
         workspace_id=workspace_id,
         user=current_user,
         db=db,
-        section=WorkspaceSection.WORKSPACE,
+        section=WorkspaceSection.MEMBERS,
         action="manage",
     )
 
@@ -581,12 +587,12 @@ async def upsert_workspace_permission_override(
     )
 
 
-@router.post("/{workspace_id}/invite")
+@router.post("/{workspace_id}/invite", response_model=WorkspaceInviteResponse)
 async def invite_member(
     workspace_id: UUID,
     invite_data: WorkspaceInvite,
     request: Request,
-    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "manage")),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.MEMBERS, "manage")),
     db: AsyncSession = Depends(get_db)
 ):
     """Invite a user to workspace.
@@ -601,6 +607,12 @@ async def invite_member(
     Returns:
         Invite result
     """
+    if invite_data.role == WorkspaceRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inviting another owner is not supported"
+        )
+
     # Find user by email
     result = await db.execute(
         select(DBUser).where(DBUser.email == invite_data.email)
@@ -657,17 +669,17 @@ async def invite_member(
         }
     )
     
-    return {
-        "message": f"Invited {invite_data.email} as {invite_data.role.value}",
-        "user_id": str(user.id),
-        "role": invite_data.role.value
-    }
+    return WorkspaceInviteResponse(
+        message=f"Invited {invite_data.email} as {invite_data.role.value}",
+        user_id=str(user.id),
+        role=invite_data.role.value
+    )
 
 
 @router.get("/{workspace_id}/members", response_model=List[WorkspaceMemberResponse])
 async def list_members(
     workspace_id: UUID,
-    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "view")),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.MEMBERS, "view")),
     db: AsyncSession = Depends(get_db)
 ):
     """List workspace members.
@@ -705,7 +717,7 @@ async def remove_member(
     workspace_id: UUID,
     user_id: UUID,
     request: Request,
-    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "manage")),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.MEMBERS, "manage")),
     db: AsyncSession = Depends(get_db)
 ):
     """Remove a member from workspace.
@@ -773,7 +785,7 @@ async def remove_member(
 async def delete_workspace(
     workspace_id: UUID,
     request: Request,
-    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.WORKSPACE, "delete")),
+    context: WorkspaceContext = Depends(require_permission(WorkspaceSection.SETTINGS, "delete")),
     db: AsyncSession = Depends(get_db)
 ):
     """Delete workspace.
