@@ -1,15 +1,15 @@
 """align workspace permission sections with settings/member/workflow scopes
 
-Revision ID: 011_workspace_permission_sections_alignment
-Revises: 010_workspace_permissions_rbac
+Revision ID: a7b8c9d0e1f2
+Revises: f1a2b3c4d5e6
 Create Date: 2026-04-14
 """
 
 from alembic import op
 
 
-revision = "011_workspace_permission_sections_alignment"
-down_revision = "010_workspace_permissions_rbac"
+revision = "a7b8c9d0e1f2"
+down_revision = "f1a2b3c4d5e6"
 branch_labels = None
 depends_on = None
 

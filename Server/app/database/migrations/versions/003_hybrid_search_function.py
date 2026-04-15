@@ -8,8 +8,8 @@ This migration creates a PostgreSQL stored function that performs hybrid search:
 
 The function combines all three signals into a unified score for ranking.
 
-Revision ID: 003_hybrid_search_function
-Revises: 002_semantic_search_phase1_foundation
+Revision ID: b3e2d7a9f812
+Revises: 002_semantic_phase1
 Create Date: 2026-03-25 12:00:00.000000
 """
 
@@ -17,8 +17,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = '003_hybrid_search_function'
-down_revision = '002_semantic_search_phase1_foundation'
+revision = 'b3e2d7a9f812'
+down_revision = '002_semantic_phase1'
 branch_labels = None
 depends_on = None
 
@@ -32,21 +32,28 @@ def upgrade() -> None:
     # Step 1: Create search_results type for function output
     # ───────────────────────────────────────────────────────────────────
     op.execute("""
-        CREATE TYPE IF NOT EXISTS search_result_type AS (
-            note_id UUID,
-            title VARCHAR,
-            content TEXT,
-            note_type VARCHAR,
-            workspace_id UUID,
-            user_id UUID,
-            created_at TIMESTAMPTZ,
-            updated_at TIMESTAMPTZ,
-            embedding_similarity FLOAT,
-            keyword_score FLOAT,
-            interaction_score FLOAT,
-            final_score FLOAT,
-            highlight TEXT
-        );
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_type WHERE typname = 'search_result_type'
+        ) THEN
+            CREATE TYPE search_result_type AS (
+                note_id UUID,
+                title VARCHAR,
+                content TEXT,
+                note_type VARCHAR,
+                workspace_id UUID,
+                user_id UUID,
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ,
+                embedding_similarity FLOAT,
+                keyword_score FLOAT,
+                interaction_score FLOAT,
+                final_score FLOAT,
+                highlight TEXT
+            );
+        END IF;
+    END$$;
     """)
 
 

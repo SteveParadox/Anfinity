@@ -1,7 +1,7 @@
 """Increase embedding column size for 1536D vectors.
 
-Revision ID: 004_increase_embedding_column_size
-Revises: 003_hybrid_search_function
+Revision ID: c4d3e8b0a923
+Revises: b3e2d7a9f812
 Create Date: 2026-03-26 21:40:00.000000
 
 """
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '004_increase_embedding_column_size'
-down_revision = '003_hybrid_search_function'
+revision = 'c4d3e8b0a923'
+down_revision = 'b3e2d7a9f812'
 branch_labels = None
 depends_on = None
 

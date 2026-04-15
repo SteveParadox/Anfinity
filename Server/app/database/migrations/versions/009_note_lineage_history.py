@@ -1,6 +1,6 @@
 """Add note lineage history snapshots.
 
-Revision ID: 009_note_lineage_history
+Revision ID: e0f9d8c7b6a5
 Revises: 008_semantic_search_hardening
 Create Date: 2026-04-14
 """
@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 
 
 # revision identifiers, used by Alembic.
-revision = "009_note_lineage_history"
+revision = "e0f9d8c7b6a5"
 down_revision = "008_semantic_search_hardening"
 branch_labels = None
 depends_on = None

@@ -1,17 +1,18 @@
 """workspace permissions rbac
 
-Revision ID: 010_workspace_permissions_rbac
-Revises: 009_note_lineage_history
+Revision ID: f1a2b3c4d5e6
+Revises: e0f9d8c7b6a5
 Create Date: 2026-04-14
 """
 
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import ENUM
 
 
-revision = "010_workspace_permissions_rbac"
-down_revision = "009_note_lineage_history"
+revision = "f1a2b3c4d5e6"
+down_revision = "e0f9d8c7b6a5"
 branch_labels = None
 depends_on = None
 
@@ -26,7 +27,23 @@ WORKSPACE_PERMISSION_SECTIONS = (
 )
 
 
+workspace_section_enum = ENUM(
+    *[section.upper() for section in WORKSPACE_PERMISSION_SECTIONS],
+    name="workspacesection",
+    create_type=False,
+)
+
+
+from sqlalchemy import inspect
+
 def _create_workspace_scoped_policies(table_name: str, workspace_expr: str, section: str) -> None:
+    bind = op.get_bind()
+    inspector = inspect(bind)
+
+    # Skip if table does not exist
+    if table_name not in inspector.get_table_names():
+        return
+
     quoted_table = f'"{table_name}"'
     statements = [
         f"ALTER TABLE {quoted_table} ENABLE ROW LEVEL SECURITY",
@@ -53,6 +70,7 @@ def _create_workspace_scoped_policies(table_name: str, workspace_expr: str, sect
             f"FOR DELETE USING (has_workspace_permission({workspace_expr}, '{section}', 'delete'))"
         ),
     ]
+
     for statement in statements:
         op.execute(statement)
 
@@ -71,18 +89,44 @@ def _drop_workspace_scoped_policies(table_name: str) -> None:
 
 
 def upgrade() -> None:
-    workspacesection_enum = postgresql.ENUM(
-        *[section.upper() for section in WORKSPACE_PERMISSION_SECTIONS],
-        name="workspacesection",
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_type
+                WHERE typname = 'workspacesection'
+            ) THEN
+                CREATE TYPE workspacesection AS ENUM (
+                    'WORKSPACE',
+                    'DOCUMENTS',
+                    'NOTES',
+                    'SEARCH',
+                    'KNOWLEDGE_GRAPH',
+                    'CHAT'
+                );
+            END IF;
+        END$$;
+        """
     )
-    workspacesection_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "workspace_permission_overrides",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column("workspace_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("section", sa.Enum(*[section.upper() for section in WORKSPACE_PERMISSION_SECTIONS], name="workspacesection"), nullable=False),
+        sa.Column(
+            "workspace_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("workspaces.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "user_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("section", workspace_section_enum, nullable=False),
         sa.Column("can_view", sa.Boolean(), nullable=True),
         sa.Column("can_create", sa.Boolean(), nullable=True),
         sa.Column("can_update", sa.Boolean(), nullable=True),
@@ -324,8 +368,4 @@ def downgrade() -> None:
     op.drop_index("idx_workspace_permission_override_lookup", table_name="workspace_permission_overrides")
     op.drop_table("workspace_permission_overrides")
 
-    workspacesection_enum = postgresql.ENUM(
-        *[section.upper() for section in WORKSPACE_PERMISSION_SECTIONS],
-        name="workspacesection",
-    )
-    workspacesection_enum.drop(op.get_bind(), checkfirst=True)
+    op.execute("DROP TYPE IF EXISTS workspacesection;")
