@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 import time
 
-from app.config import settings
+from app.config import get_ollama_request_headers, settings
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +300,7 @@ class OllamaEmbedder(EmbeddingProvider):
         self._dimension = 768  # Default for nomic-embed-text; will be updated after first call
         self._requests = requests
         self._session = requests.Session()
+        self._session.headers.update(get_ollama_request_headers())
         self._fallback_provider = fallback_provider
         self._actual_provider_used = "ollama"  # Track which provider was actually used
         
@@ -307,7 +308,11 @@ class OllamaEmbedder(EmbeddingProvider):
         
         # Verify Ollama server is accessible
         try:
-            response = self._requests.get(f"{self._base_url}/api/tags", timeout=5)
+            response = self._requests.get(
+                f"{self._base_url}/api/tags",
+                timeout=5,
+                headers=get_ollama_request_headers(include_content_type=False),
+            )
             response.raise_for_status()
             logger.info(f"✅ Ollama server is accessible at {self._base_url}")
         except Exception as e:
