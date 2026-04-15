@@ -234,6 +234,125 @@ def _count_words(text: str) -> int:
     return len(re.findall(r"\S+", text or ""))
 
 
+def _normalize_string_list(values: Sequence[Any] | None) -> List[str]:
+    normalized: List[str] = []
+    for value in values or []:
+        text_value = str(value).strip()
+        if text_value and text_value not in normalized:
+            normalized.append(text_value)
+    return normalized
+
+
+def _summarize_diff_segments(diff_segments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    words_added = 0
+    words_deleted = 0
+    words_unchanged = 0
+    added_segments = 0
+    deleted_segments = 0
+    unchanged_segments = 0
+
+    for segment in diff_segments:
+        segment_type = str(segment.get("type") or "unchanged")
+        word_count = int(segment.get("word_count") or 0)
+        if segment_type == "added":
+            words_added += word_count
+            added_segments += 1
+        elif segment_type == "deleted":
+            words_deleted += word_count
+            deleted_segments += 1
+        else:
+            words_unchanged += word_count
+            unchanged_segments += 1
+
+    return {
+        "words_added": words_added,
+        "words_deleted": words_deleted,
+        "words_unchanged": words_unchanged,
+        "added_segments": added_segments,
+        "deleted_segments": deleted_segments,
+        "unchanged_segments": unchanged_segments,
+        "changed_segments": added_segments + deleted_segments,
+    }
+
+
+def _build_note_version_metadata(
+    *,
+    note: Note,
+    latest_version: Optional[NoteVersion],
+    change_reason: str,
+    restored_from_version_id: Optional[UUID],
+    diff_segments: Sequence[Dict[str, Any]],
+    extra_metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    current_tags = _normalize_string_list(note.tags)
+    previous_tags = _normalize_string_list(latest_version.tags if latest_version else [])
+    current_connections = _normalize_string_list(note.connections)
+    previous_connections = _normalize_string_list(latest_version.connections if latest_version else [])
+
+    added_tags = [tag for tag in current_tags if tag not in previous_tags]
+    removed_tags = [tag for tag in previous_tags if tag not in current_tags]
+    added_connections = [value for value in current_connections if value not in previous_connections]
+    removed_connections = [value for value in previous_connections if value not in current_connections]
+
+    title_changed = latest_version is None or latest_version.title != note.title
+    content_changed = latest_version is None or latest_version.content != note.content
+    note_type_changed = latest_version is None or latest_version.note_type != note.note_type
+    source_url_changed = latest_version is None or latest_version.source_url != note.source_url
+
+    changed_fields: List[str] = []
+    if latest_version is None:
+        changed_fields.append("created")
+    else:
+        if title_changed:
+            changed_fields.append("title")
+        if content_changed:
+            changed_fields.append("content")
+        if added_tags or removed_tags:
+            changed_fields.append("tags")
+        if added_connections or removed_connections:
+            changed_fields.append("connections")
+        if note_type_changed:
+            changed_fields.append("note_type")
+        if source_url_changed:
+            changed_fields.append("source_url")
+
+    current_word_count = note.word_count or calculate_word_count(note.content)
+    previous_word_count = latest_version.word_count if latest_version else 0
+    diff_summary = _summarize_diff_segments(diff_segments)
+
+    metadata: Dict[str, Any] = {
+        "snapshot_kind": "initial" if latest_version is None else "restore" if change_reason == "restored" else "revision",
+        "previous_version_number": latest_version.version_number if latest_version else None,
+        "restored_from_version_id": str(restored_from_version_id) if restored_from_version_id else None,
+        "changed_fields": changed_fields,
+        "tag_delta": {
+            "added": added_tags,
+            "removed": removed_tags,
+        },
+        "connection_delta": {
+            "added": added_connections,
+            "removed": removed_connections,
+        },
+        "summary": {
+            "title_changed": title_changed,
+            "content_changed": content_changed,
+            "tags_changed": bool(added_tags or removed_tags),
+            "connections_changed": bool(added_connections or removed_connections),
+            "note_type_changed": note_type_changed,
+            "source_url_changed": source_url_changed,
+            "word_count": current_word_count,
+            "previous_word_count": previous_word_count,
+            "word_delta": current_word_count - previous_word_count,
+            **diff_summary,
+        },
+    }
+
+    if extra_metadata:
+        metadata.update(extra_metadata)
+
+    return metadata
+
+
 def _build_sequence_matcher_diff_segments(previous_text: str, current_text: str) -> List[Dict[str, Any]]:
     previous_tokens = _tokenize_for_diff(previous_text)
     current_tokens = _tokenize_for_diff(current_text)
@@ -367,9 +486,8 @@ async def create_note_version_snapshot(
         comparable_fields = (
             latest_version.title == note.title,
             latest_version.content == note.content,
-            list(latest_version.tags or []) == list(note.tags or []),
-            [str(connection_id) for connection_id in (latest_version.connections or [])]
-            == [str(connection_id) for connection_id in (note.connections or [])],
+            _normalize_string_list(latest_version.tags) == _normalize_string_list(note.tags),
+            _normalize_string_list(latest_version.connections) == _normalize_string_list(note.connections),
             latest_version.note_type == note.note_type,
             latest_version.source_url == note.source_url,
         )
@@ -377,6 +495,14 @@ async def create_note_version_snapshot(
             return None
 
     diff_segments = build_word_diff_segments(previous_content, note.content or "")
+    version_metadata = _build_note_version_metadata(
+        note=note,
+        latest_version=latest_version,
+        change_reason=change_reason,
+        restored_from_version_id=restored_from_version_id,
+        diff_segments=diff_segments,
+        extra_metadata=extra_metadata,
+    )
     version = NoteVersion(
         note_id=note.id,
         workspace_id=note.workspace_id,
@@ -393,7 +519,7 @@ async def create_note_version_snapshot(
         source_url=note.source_url,
         word_count=note.word_count or calculate_word_count(note.content),
         diff_segments=diff_segments,
-        version_metadata=extra_metadata or {},
+        version_metadata=version_metadata,
     )
     db.add(version)
     await db.flush()

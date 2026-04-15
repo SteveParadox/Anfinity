@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from app.config import get_ollama_request_headers, settings
 from app.core.auth import get_current_active_user
 from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser, WorkspaceSection
@@ -295,7 +295,10 @@ async def _stream_with_ollama(messages: List[dict]) -> AsyncGenerator[str, None]
     }
 
     async with _OLLAMA_STREAM_SEMAPHORE:
-        async with httpx.AsyncClient(timeout=float(settings.OLLAMA_TIMEOUT)) as client:
+        async with httpx.AsyncClient(
+            timeout=float(settings.OLLAMA_TIMEOUT),
+            headers=get_ollama_request_headers(),
+        ) as client:
             async with client.stream("POST", f"{settings.OLLAMA_BASE_URL}/api/chat", json=payload) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
