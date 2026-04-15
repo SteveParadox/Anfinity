@@ -153,15 +153,17 @@ function App() {
   const canViewGraph = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'knowledge_graph', 'view'));
   const canUseSearch = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'search', 'view'));
   const canOpenWorkspaceScopedChat = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'chat', 'create'));
+  const canViewWorkflows = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'workflows', 'view'));
   const availableViews = useMemo<View[]>(() => {
-    const views: View[] = ['dashboard', 'workspaces', 'workflows', 'pricing'];
+    const views: View[] = ['dashboard', 'workspaces', 'pricing'];
     if (canViewNotes) views.push('notes');
     if (canViewDocuments) views.push('documents');
     if (canCreateDocuments) views.push('upload');
     if (canViewGraph) views.push('graph');
     if (canUseSearch) views.push('search');
+    if (canViewWorkflows) views.push('workflows');
     return views;
-  }, [canCreateDocuments, canUseSearch, canViewDocuments, canViewGraph, canViewNotes]);
+  }, [canCreateDocuments, canUseSearch, canViewDocuments, canViewGraph, canViewNotes, canViewWorkflows]);
 
   useEffect(() => {
     if (!availableViews.includes(currentView)) {

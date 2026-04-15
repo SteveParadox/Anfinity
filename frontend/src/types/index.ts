@@ -199,7 +199,16 @@ export interface Workspace {
 }
 
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
-export type WorkspacePermissionSection = 'workspace' | 'documents' | 'notes' | 'search' | 'knowledge_graph' | 'chat';
+export type WorkspacePermissionSection =
+  | 'workspace'
+  | 'settings'
+  | 'members'
+  | 'documents'
+  | 'notes'
+  | 'search'
+  | 'knowledge_graph'
+  | 'chat'
+  | 'workflows';
 export type WorkspacePermissionAction = 'view' | 'create' | 'update' | 'delete' | 'manage';
 
 export interface WorkspacePermissionState {

@@ -68,6 +68,140 @@ function getVersionChangeLabel(version: NoteVersion): string {
   return version.changeReason;
 }
 
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function toNumber(value: unknown, fallback = 0): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+function getVersionDiffStats(version: NoteVersion) {
+  const metadata = toRecord(version.metadata);
+  const summary = toRecord(metadata.summary);
+
+  if (Object.keys(summary).length > 0) {
+    return {
+      wordsAdded: toNumber(summary.words_added),
+      wordsDeleted: toNumber(summary.words_deleted),
+      wordsUnchanged: toNumber(summary.words_unchanged),
+      addedSegments: toNumber(summary.added_segments),
+      deletedSegments: toNumber(summary.deleted_segments),
+      unchangedSegments: toNumber(summary.unchanged_segments),
+      changedSegments: toNumber(summary.changed_segments),
+      wordDelta: toNumber(summary.word_delta),
+      wordCount: toNumber(summary.word_count, version.wordCount || 0),
+      previousWordCount: toNumber(summary.previous_word_count),
+    };
+  }
+
+  return version.diffSegments.reduce(
+    (acc, segment) => {
+      if (segment.type === 'added') {
+        acc.wordsAdded += segment.wordCount;
+        acc.addedSegments += 1;
+      } else if (segment.type === 'deleted') {
+        acc.wordsDeleted += segment.wordCount;
+        acc.deletedSegments += 1;
+      } else {
+        acc.wordsUnchanged += segment.wordCount;
+        acc.unchangedSegments += 1;
+      }
+      acc.changedSegments = acc.addedSegments + acc.deletedSegments;
+      acc.wordDelta = acc.wordsAdded - acc.wordsDeleted;
+      acc.wordCount = version.wordCount || 0;
+      return acc;
+    },
+    {
+      wordsAdded: 0,
+      wordsDeleted: 0,
+      wordsUnchanged: 0,
+      addedSegments: 0,
+      deletedSegments: 0,
+      unchangedSegments: 0,
+      changedSegments: 0,
+      wordDelta: 0,
+      wordCount: version.wordCount || 0,
+      previousWordCount: 0,
+    }
+  );
+}
+
+function getVersionMetadata(version: NoteVersion) {
+  const metadata = toRecord(version.metadata);
+  return {
+    changedFields: toStringArray(metadata.changed_fields),
+    tagDelta: toRecord(metadata.tag_delta),
+    connectionDelta: toRecord(metadata.connection_delta),
+    snapshotKind: typeof metadata.snapshot_kind === 'string' ? metadata.snapshot_kind : '',
+    previousVersionNumber: toNumber(metadata.previous_version_number, -1),
+    restoredFromVersionNumber: toNumber(metadata.restored_from_version_number, -1),
+    trigger: typeof metadata.trigger === 'string' ? metadata.trigger : '',
+  };
+}
+
+function getVersionFieldLabel(field: string): string {
+  switch (field) {
+    case 'created':
+      return 'Initial snapshot';
+    case 'title':
+      return 'Title';
+    case 'content':
+      return 'Content';
+    case 'tags':
+      return 'Tags';
+    case 'connections':
+      return 'Connections';
+    case 'note_type':
+      return 'Type';
+    case 'source_url':
+      return 'Source link';
+    default:
+      return field.replace(/_/g, ' ');
+  }
+}
+
+function formatVersionSnapshotSummary(version: NoteVersion): string {
+  const metadata = getVersionMetadata(version);
+  const stats = getVersionDiffStats(version);
+
+  if (version.changeReason === 'created') {
+    return 'Initial snapshot';
+  }
+
+  if (version.changeReason === 'restored') {
+    return metadata.restoredFromVersionNumber > 0
+      ? `Restored from v${metadata.restoredFromVersionNumber}`
+      : 'Restored from history';
+  }
+
+  const parts: string[] = [];
+  if (stats.wordsAdded > 0) parts.push(`+${stats.wordsAdded} words`);
+  if (stats.wordsDeleted > 0) parts.push(`-${stats.wordsDeleted} words`);
+
+  const changedFieldLabels = metadata.changedFields
+    .filter((field) => field !== 'created')
+    .map(getVersionFieldLabel);
+  if (changedFieldLabels.length > 0) {
+    parts.push(changedFieldLabels.slice(0, 2).join(' + '));
+  }
+
+  return parts[0] ? parts.join(' · ') : 'Saved revision';
+}
+
+function formatCountLabel(count: number, singular: string, plural?: string): string {
+  return `${count} ${count === 1 ? singular : plural || `${singular}s`}`;
+}
+
 /* ─── Shared primitive components ─────────────────────────────────────── */
 
 function FieldLabel({ children }: { children: React.ReactNode }) {
@@ -516,6 +650,21 @@ export function NotesView({
     noteVersions.find((version) => version.id === selectedVersionId) ||
     noteVersions[0] ||
     null;
+  const latestVersion = noteVersions[0] || null;
+  const selectedVersionIsLatest = Boolean(selectedVersion && latestVersion && selectedVersion.id === latestVersion.id);
+  const selectedVersionStats = selectedVersion ? getVersionDiffStats(selectedVersion) : null;
+  const selectedVersionMetadata = selectedVersion ? getVersionMetadata(selectedVersion) : null;
+  const selectedVersionChangedFields = selectedVersionMetadata?.changedFields
+    ?.filter((field) => field !== 'created')
+    .map(getVersionFieldLabel) || [];
+  const selectedVersionTagDelta = {
+    added: toStringArray(selectedVersionMetadata?.tagDelta?.added),
+    removed: toStringArray(selectedVersionMetadata?.tagDelta?.removed),
+  };
+  const selectedVersionConnectionDelta = {
+    added: toStringArray(selectedVersionMetadata?.connectionDelta?.added),
+    removed: toStringArray(selectedVersionMetadata?.connectionDelta?.removed),
+  };
 
   const handleCreateNote = async () => {
     const targetWorkspaceId = newNote.workspaceId || defaultWorkspaceId;
@@ -1355,7 +1504,7 @@ export function NotesView({
                   </div>
                 </div>
                 <div style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.inkMuted }}>
-                  {noteVersions.length} version{noteVersions.length === 1 ? '' : 's'}
+                  {noteVersions.length} saved snapshot{noteVersions.length === 1 ? '' : 's'}
                 </div>
               </div>
 
@@ -1368,10 +1517,12 @@ export function NotesView({
                   No saved versions yet.
                 </div>
               ) : (
-                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 260px) minmax(0, 1fr)', gap: 14, alignItems: 'start' }}>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto', paddingRight: 4 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(240px, 280px) minmax(0, 1fr)', gap: 14, alignItems: 'start' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 520, overflowY: 'auto', paddingRight: 4 }}>
                     {noteVersions.map((version) => {
                       const active = selectedVersion?.id === version.id;
+                      const isLatestVersion = latestVersion?.id === version.id;
+                      const isRestoredVersion = version.changeReason === 'restored';
                       return (
                         <button
                           key={version.id}
@@ -1382,20 +1533,35 @@ export function NotesView({
                             background: active ? 'rgba(245,230,66,0.08)' : TT.inkRaised,
                             border: `1px solid ${active ? 'rgba(245,230,66,0.35)' : TT.inkBorder}`,
                             borderRadius: 3,
-                            padding: '10px 12px',
+                            padding: '11px 12px',
                             cursor: 'pointer',
                           }}
                         >
-                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 7 }}>
                             <span style={{ fontFamily: TT.fontMono, fontSize: 10, color: active ? TT.yolk : TT.snow }}>
                               v{version.versionNumber}
                             </span>
-                            <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
-                              {getVersionChangeLabel(version)}
-                            </span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                              <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                                {getVersionChangeLabel(version)}
+                              </span>
+                              {isLatestVersion && (
+                                <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: TT.yolk, border: '1px solid rgba(245,230,66,0.24)', borderRadius: 2, padding: '2px 5px', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+                                  Live
+                                </span>
+                              )}
+                              {isRestoredVersion && (
+                                <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: '#60A5FA', border: '1px solid rgba(96,165,250,0.22)', borderRadius: 2, padding: '2px 5px', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+                                  Restore
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <div style={{ fontSize: 10.5, color: TT.snow, marginBottom: 4, lineHeight: 1.4 }}>
+                          <div style={{ fontSize: 10.5, color: TT.snow, marginBottom: 5, lineHeight: 1.4 }}>
                             {version.title || 'Untitled snapshot'}
+                          </div>
+                          <div style={{ fontSize: 10, color: TT.inkSubtle, marginBottom: 6, lineHeight: 1.45 }}>
+                            {formatVersionSnapshotSummary(version)}
                           </div>
                           <div style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
                             {formatAbsoluteDate(version.createdAt)}
@@ -1416,26 +1582,139 @@ export function NotesView({
                             {formatAbsoluteDate(selectedVersion.createdAt)}
                           </span>
                         </div>
-                        <button
-                          onClick={() => handleRestoreVersion(selectedVersion)}
-                          disabled={restoringVersionId === selectedVersion.id || !canUpdateSelectedNote}
-                          style={{
-                            height: 34,
-                            padding: '0 12px',
-                            background: restoringVersionId === selectedVersion.id ? TT.inkMid : 'rgba(245,230,66,0.08)',
-                            border: `1px solid ${restoringVersionId === selectedVersion.id ? TT.inkBorder : 'rgba(245,230,66,0.3)'}`,
-                            borderRadius: 3,
-                            color: restoringVersionId === selectedVersion.id ? TT.inkMuted : TT.yolk,
-                            fontFamily: TT.fontMono,
-                            fontSize: 10,
-                            letterSpacing: '0.05em',
-                            textTransform: 'uppercase',
-                            cursor: restoringVersionId === selectedVersion.id || !canUpdateSelectedNote ? 'default' : 'pointer',
-                            opacity: canUpdateSelectedNote ? 1 : 0.45,
-                          }}
-                        >
-                          {restoringVersionId === selectedVersion.id ? 'Restoring...' : 'Restore As New Version'}
-                        </button>
+                        {selectedVersionIsLatest ? (
+                          <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                            This snapshot already matches the live note.
+                          </span>
+                        ) : (
+                          <button
+                            onClick={() => handleRestoreVersion(selectedVersion)}
+                            disabled={restoringVersionId === selectedVersion.id || !canUpdateSelectedNote}
+                            style={{
+                              height: 34,
+                              padding: '0 12px',
+                              background: restoringVersionId === selectedVersion.id ? TT.inkMid : 'rgba(245,230,66,0.08)',
+                              border: `1px solid ${restoringVersionId === selectedVersion.id ? TT.inkBorder : 'rgba(245,230,66,0.3)'}`,
+                              borderRadius: 3,
+                              color: restoringVersionId === selectedVersion.id ? TT.inkMuted : TT.yolk,
+                              fontFamily: TT.fontMono,
+                              fontSize: 10,
+                              letterSpacing: '0.05em',
+                              textTransform: 'uppercase',
+                              cursor: restoringVersionId === selectedVersion.id || !canUpdateSelectedNote ? 'default' : 'pointer',
+                              opacity: canUpdateSelectedNote ? 1 : 0.45,
+                            }}
+                          >
+                            {restoringVersionId === selectedVersion.id ? 'Restoring...' : 'Restore As New Version'}
+                          </button>
+                        )}
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 10 }}>
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '11px 12px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 6 }}>
+                            Words
+                          </div>
+                          <div style={{ fontSize: 16, color: TT.snow }}>{selectedVersionStats?.wordCount || 0}</div>
+                        </div>
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '11px 12px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 6 }}>
+                            Added
+                          </div>
+                          <div style={{ fontSize: 16, color: '#34D399' }}>+{selectedVersionStats?.wordsAdded || 0}</div>
+                        </div>
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '11px 12px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 6 }}>
+                            Removed
+                          </div>
+                          <div style={{ fontSize: 16, color: '#FF7A7A' }}>-{selectedVersionStats?.wordsDeleted || 0}</div>
+                        </div>
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '11px 12px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 6 }}>
+                            Changed Fields
+                          </div>
+                          <div style={{ fontSize: 16, color: TT.snow }}>
+                            {selectedVersionChangedFields.length || (selectedVersion.changeReason === 'created' ? 1 : 0)}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.2fr) minmax(260px, 0.8fr)', gap: 12 }}>
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>
+                            Change Summary
+                          </div>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                            {selectedVersion.changeReason === 'created' ? (
+                              <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.yolk, border: '1px solid rgba(245,230,66,0.2)', borderRadius: 2, padding: '3px 6px' }}>
+                                Initial snapshot
+                              </span>
+                            ) : selectedVersionChangedFields.length > 0 ? (
+                              selectedVersionChangedFields.map((field) => (
+                                <span key={`${selectedVersion.id}-${field}`} style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.snow, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, padding: '3px 6px' }}>
+                                  {field}
+                                </span>
+                              ))
+                            ) : (
+                              <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                                No field summary was saved for this version.
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ display: 'grid', gap: 8 }}>
+                            <div style={{ fontSize: 11, color: TT.inkSubtle, lineHeight: 1.6 }}>
+                              {formatVersionSnapshotSummary(selectedVersion)}
+                            </div>
+                            {(selectedVersionTagDelta.added.length > 0 || selectedVersionTagDelta.removed.length > 0) && (
+                              <div style={{ fontSize: 10.5, color: TT.inkSubtle, lineHeight: 1.6 }}>
+                                Tags:
+                                {selectedVersionTagDelta.added.length > 0 && (
+                                  <span style={{ color: '#34D399' }}> +{selectedVersionTagDelta.added.join(', ')}</span>
+                                )}
+                                {selectedVersionTagDelta.removed.length > 0 && (
+                                  <span style={{ color: '#FF7A7A' }}> -{selectedVersionTagDelta.removed.join(', ')}</span>
+                                )}
+                              </div>
+                            )}
+                            {(selectedVersionConnectionDelta.added.length > 0 || selectedVersionConnectionDelta.removed.length > 0) && (
+                              <div style={{ fontSize: 10.5, color: TT.inkSubtle, lineHeight: 1.6 }}>
+                                Connections:
+                                {selectedVersionConnectionDelta.added.length > 0 && (
+                                  <span style={{ color: '#34D399' }}> +{formatCountLabel(selectedVersionConnectionDelta.added.length, 'link')}</span>
+                                )}
+                                {selectedVersionConnectionDelta.removed.length > 0 && (
+                                  <span style={{ color: '#FF7A7A' }}> -{formatCountLabel(selectedVersionConnectionDelta.removed.length, 'link')}</span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>
+                            Timeline Context
+                          </div>
+                          <div style={{ display: 'grid', gap: 7 }}>
+                            <div style={{ fontSize: 10.5, color: TT.inkSubtle, lineHeight: 1.6 }}>
+                              Snapshot kind: <span style={{ color: TT.snow }}>{selectedVersionMetadata?.snapshotKind || 'revision'}</span>
+                            </div>
+                            {selectedVersionMetadata && selectedVersionMetadata.previousVersionNumber > 0 && (
+                              <div style={{ fontSize: 10.5, color: TT.inkSubtle, lineHeight: 1.6 }}>
+                                Based on: <span style={{ color: TT.snow }}>v{selectedVersionMetadata.previousVersionNumber}</span>
+                              </div>
+                            )}
+                            <div style={{ fontSize: 10.5, color: TT.inkSubtle, lineHeight: 1.6 }}>
+                              Word delta: <span style={{ color: selectedVersionStats && selectedVersionStats.wordDelta >= 0 ? '#34D399' : '#FF7A7A' }}>
+                                {selectedVersionStats && selectedVersionStats.wordDelta >= 0 ? '+' : ''}{selectedVersionStats?.wordDelta || 0}
+                              </span>
+                            </div>
+                            {selectedVersion.changeReason === 'restored' && selectedVersionMetadata && selectedVersionMetadata.restoredFromVersionNumber > 0 && (
+                              <div style={{ fontSize: 10.5, color: TT.inkSubtle, lineHeight: 1.6 }}>
+                                Restore source: <span style={{ color: TT.snow }}>v{selectedVersionMetadata.restoredFromVersionNumber}</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
                       </div>
 
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
@@ -1445,13 +1724,22 @@ export function NotesView({
                           </div>
                           <div style={{ fontSize: 12, color: TT.snow, marginBottom: 8 }}>{selectedVersion.title || 'Untitled snapshot'}</div>
                           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 8 }}>
-                            {selectedVersion.tags.map((tag) => (
+                            {selectedVersion.tags.length > 0 ? selectedVersion.tags.map((tag) => (
                               <span key={`version-tag-${selectedVersion.id}-${tag}`} style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, padding: '2px 6px' }}>
                                 {tag}
                               </span>
-                            ))}
+                            )) : (
+                              <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                                No tags saved in this snapshot.
+                              </span>
+                            )}
                           </div>
-                          <div style={{ fontSize: 11, lineHeight: 1.6, color: TT.inkSubtle, whiteSpace: 'pre-wrap' }}>
+                          {selectedVersionIsLatest && (
+                            <div style={{ fontSize: 10.5, color: TT.inkSubtle, lineHeight: 1.6, marginBottom: 8 }}>
+                              This snapshot is the live note state right now.
+                            </div>
+                          )}
+                          <div style={{ maxHeight: 220, overflowY: 'auto', fontSize: 11, lineHeight: 1.6, color: TT.inkSubtle, whiteSpace: 'pre-wrap' }}>
                             {selectedVersion.content || 'No content saved in this version.'}
                           </div>
                         </div>
@@ -1462,23 +1750,40 @@ export function NotesView({
                           </div>
                           <div style={{ fontSize: 12, color: TT.snow, marginBottom: 8 }}>{selectedNote.title || 'Untitled note'}</div>
                           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 8 }}>
-                            {selectedNote.tags.map((tag) => (
+                            {selectedNote.tags.length > 0 ? selectedNote.tags.map((tag) => (
                               <span key={`current-tag-${selectedNote.id}-${tag}`} style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, padding: '2px 6px' }}>
                                 {tag}
                               </span>
-                            ))}
+                            )) : (
+                              <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted }}>
+                                No current tags.
+                              </span>
+                            )}
                           </div>
-                          <div style={{ fontSize: 11, lineHeight: 1.6, color: TT.inkSubtle, whiteSpace: 'pre-wrap' }}>
+                          <div style={{ maxHeight: 220, overflowY: 'auto', fontSize: 11, lineHeight: 1.6, color: TT.inkSubtle, whiteSpace: 'pre-wrap' }}>
                             {selectedNote.content || 'No current content.'}
                           </div>
                         </div>
                       </div>
 
                       <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px' }}>
-                        <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>
-                          Inline Diff
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+                          <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted }}>
+                            Inline Diff
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: '#34D399', border: '1px solid rgba(52,211,153,0.2)', borderRadius: 2, padding: '2px 5px' }}>
+                              +{selectedVersionStats?.wordsAdded || 0}
+                            </span>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: '#FF7A7A', border: '1px solid rgba(255,122,122,0.2)', borderRadius: 2, padding: '2px 5px' }}>
+                              -{selectedVersionStats?.wordsDeleted || 0}
+                            </span>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: TT.inkMuted, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, padding: '2px 5px' }}>
+                              {formatCountLabel(selectedVersionStats?.changedSegments || 0, 'change')}
+                            </span>
+                          </div>
                         </div>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, lineHeight: 1.9 }}>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, lineHeight: 1.9, maxHeight: 220, overflowY: 'auto' }}>
                           {selectedVersion.diffSegments.length > 0 ? selectedVersion.diffSegments.map((segment, index) => (
                             <span
                               key={`${selectedVersion.id}-segment-${index}`}
