@@ -26,46 +26,71 @@ WorkspacePermissionMap = Dict[str, PermissionState]
 WORKSPACE_PERMISSION_ACTIONS: tuple[PermissionAction, ...] = ("view", "create", "update", "delete", "manage")
 WORKSPACE_PERMISSION_SECTIONS: tuple[WorkspaceSection, ...] = (
     WorkspaceSection.WORKSPACE,
+    WorkspaceSection.SETTINGS,
+    WorkspaceSection.MEMBERS,
     WorkspaceSection.DOCUMENTS,
     WorkspaceSection.NOTES,
     WorkspaceSection.SEARCH,
     WorkspaceSection.KNOWLEDGE_GRAPH,
     WorkspaceSection.CHAT,
+    WorkspaceSection.WORKFLOWS,
 )
 
-DEFAULT_PERMISSION_MATRIX: Dict[WorkspaceRole, WorkspacePermissionMap] = {
+_BASE_PERMISSION_MATRIX: Dict[WorkspaceRole, WorkspacePermissionMap] = {
     WorkspaceRole.OWNER: {
-        "workspace": {"view": True, "create": False, "update": True, "delete": True, "manage": True},
+        "settings": {"view": True, "create": False, "update": True, "delete": True, "manage": True},
+        "members": {"view": True, "create": True, "update": True, "delete": True, "manage": True},
         "documents": {"view": True, "create": True, "update": True, "delete": True, "manage": True},
         "notes": {"view": True, "create": True, "update": True, "delete": True, "manage": True},
         "search": {"view": True, "create": True, "update": False, "delete": False, "manage": True},
         "knowledge_graph": {"view": True, "create": False, "update": True, "delete": False, "manage": True},
         "chat": {"view": True, "create": True, "update": False, "delete": False, "manage": True},
+        "workflows": {"view": True, "create": True, "update": True, "delete": True, "manage": True},
     },
     WorkspaceRole.ADMIN: {
-        "workspace": {"view": True, "create": False, "update": True, "delete": False, "manage": True},
+        "settings": {"view": True, "create": False, "update": True, "delete": False, "manage": True},
+        "members": {"view": True, "create": True, "update": True, "delete": True, "manage": True},
         "documents": {"view": True, "create": True, "update": True, "delete": True, "manage": True},
         "notes": {"view": True, "create": True, "update": True, "delete": True, "manage": True},
         "search": {"view": True, "create": True, "update": False, "delete": False, "manage": True},
         "knowledge_graph": {"view": True, "create": False, "update": True, "delete": False, "manage": True},
         "chat": {"view": True, "create": True, "update": False, "delete": False, "manage": True},
+        "workflows": {"view": True, "create": True, "update": True, "delete": False, "manage": True},
     },
     WorkspaceRole.MEMBER: {
-        "workspace": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
+        "settings": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
+        "members": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
         "documents": {"view": True, "create": True, "update": True, "delete": False, "manage": False},
         "notes": {"view": True, "create": True, "update": True, "delete": True, "manage": False},
         "search": {"view": True, "create": True, "update": False, "delete": False, "manage": False},
         "knowledge_graph": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
         "chat": {"view": True, "create": True, "update": False, "delete": False, "manage": False},
+        "workflows": {"view": True, "create": True, "update": True, "delete": False, "manage": False},
     },
     WorkspaceRole.VIEWER: {
-        "workspace": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
+        "settings": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
+        "members": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
         "documents": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
         "notes": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
         "search": {"view": True, "create": True, "update": False, "delete": False, "manage": False},
         "knowledge_graph": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
         "chat": {"view": True, "create": True, "update": False, "delete": False, "manage": False},
+        "workflows": {"view": True, "create": False, "update": False, "delete": False, "manage": False},
     },
+}
+
+
+def _with_workspace_alias(permission_map: WorkspacePermissionMap) -> WorkspacePermissionMap:
+    next_permissions = deepcopy(permission_map)
+    settings_permissions = next_permissions.get("settings")
+    if settings_permissions is not None:
+        next_permissions["workspace"] = deepcopy(settings_permissions)
+    return next_permissions
+
+
+DEFAULT_PERMISSION_MATRIX: Dict[WorkspaceRole, WorkspacePermissionMap] = {
+    role: _with_workspace_alias(permissions)
+    for role, permissions in _BASE_PERMISSION_MATRIX.items()
 }
 
 
@@ -91,13 +116,22 @@ def apply_permission_overrides(
     next_permissions = deepcopy(permissions)
     for override in overrides:
         section_key = override.section.value if isinstance(override.section, WorkspaceSection) else str(override.section)
-        if section_key not in next_permissions:
+        target_sections = [section_key]
+        if section_key == "settings":
+            target_sections.append("workspace")
+        elif section_key == "workspace":
+            target_sections.append("settings")
+
+        if not any(section in next_permissions for section in target_sections):
             continue
-        next_permissions[section_key]["view"] = _apply_override_value(next_permissions[section_key]["view"], override.can_view)
-        next_permissions[section_key]["create"] = _apply_override_value(next_permissions[section_key]["create"], override.can_create)
-        next_permissions[section_key]["update"] = _apply_override_value(next_permissions[section_key]["update"], override.can_update)
-        next_permissions[section_key]["delete"] = _apply_override_value(next_permissions[section_key]["delete"], override.can_delete)
-        next_permissions[section_key]["manage"] = _apply_override_value(next_permissions[section_key]["manage"], override.can_manage)
+        for target_section in target_sections:
+            if target_section not in next_permissions:
+                continue
+            next_permissions[target_section]["view"] = _apply_override_value(next_permissions[target_section]["view"], override.can_view)
+            next_permissions[target_section]["create"] = _apply_override_value(next_permissions[target_section]["create"], override.can_create)
+            next_permissions[target_section]["update"] = _apply_override_value(next_permissions[target_section]["update"], override.can_update)
+            next_permissions[target_section]["delete"] = _apply_override_value(next_permissions[target_section]["delete"], override.can_delete)
+            next_permissions[target_section]["manage"] = _apply_override_value(next_permissions[target_section]["manage"], override.can_manage)
     return next_permissions
 
 
