@@ -1,12 +1,18 @@
 """Embedding service for generating and managing embeddings."""
-import os
 import logging
 from threading import RLock
 from typing import List, Optional
 
 import requests
+from app import config as app_config
 
 logger = logging.getLogger(__name__)
+settings = app_config.settings
+_OPENAI_EMBEDDING_DIMENSIONS = {
+    "text-embedding-ada-002": 1536,
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+}
 
 try:
     from openai import OpenAI
@@ -20,13 +26,33 @@ try:
 except ImportError:
     HAS_COHERE = False
 
+def _ai_runtime():
+    getter = getattr(app_config, "get_ai_runtime_config", None)
+    if callable(getter):
+        return getter()
 
-# STEP 3: nomic-embed-text produces 768-dim vectors, not 1536.
-OLLAMA_MODEL = "nomic-embed-text"
-OLLAMA_DIMENSION = 768
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_EMBED_BATCH_SIZE = int(os.getenv("OLLAMA_EMBED_BATCH_SIZE", "48"))
-OLLAMA_EMBED_TIMEOUT = int(os.getenv("OLLAMA_EMBED_TIMEOUT", "60"))
+    class _Namespace:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    return _Namespace(
+        openai=_Namespace(
+            api_key=getattr(settings, "OPENAI_API_KEY", None),
+            embedding_model=getattr(settings, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        ),
+        ollama=_Namespace(
+            base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
+            embedding_model=getattr(settings, "OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
+            embedding_timeout=int(getattr(settings, "OLLAMA_EMBED_TIMEOUT", getattr(settings, "OLLAMA_TIMEOUT", 60)) or 60),
+            embedding_batch_size=int(getattr(settings, "OLLAMA_EMBED_BATCH_SIZE", getattr(settings, "EMBEDDING_BATCH_SIZE", 32)) or 32),
+        ),
+        embeddings=_Namespace(
+            provider=str(getattr(settings, "EMBEDDING_PROVIDER", "ollama") or "ollama").lower(),
+            dimension=int(getattr(settings, "EMBEDDING_DIMENSION", 768) or 768),
+            cohere_api_key=getattr(settings, "COHERE_API_KEY", None),
+            cohere_model=getattr(settings, "COHERE_EMBEDDING_MODEL", "embed-english-v3.0"),
+        ),
+    )
 
 
 class EmbeddingService:
@@ -42,39 +68,41 @@ class EmbeddingService:
     silently getting useless embeddings.
     """
 
-    def __init__(self, provider: str = "openai"):
+    def __init__(self, provider: Optional[str] = None):
         """Initialize embedding service.
 
         Args:
             provider: "openai", "cohere", or "ollama"
         """
-        self.provider = provider
+        runtime = _ai_runtime()
+        self.provider = (provider or runtime.embeddings.provider or "ollama").lower()
         self.model = None
-        self.dimension = OLLAMA_DIMENSION  # safe default
+        self.dimension = runtime.embeddings.dimension
         self._http: Optional[requests.Session] = None
         self._cache = None
         self._cache_lock = RLock()
 
-        if provider == "openai" and HAS_OPENAI:
-            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            self.model = "text-embedding-3-small"
-            self.dimension = 1536  # FIXED: text-embedding-3-small is 1536D, not 768D
+        if self.provider == "openai" and HAS_OPENAI:
+            self.client = OpenAI(api_key=runtime.openai.api_key)
+            self.model = runtime.openai.embedding_model
+            self.dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(self.model, 1536)
 
-        elif provider == "cohere" and HAS_COHERE:
-            self.client = cohere.Client(api_key=os.getenv("COHERE_API_KEY"))
-            self.model = "embed-english-v3.0"
+        elif self.provider == "cohere" and HAS_COHERE:
+            self.client = cohere.Client(api_key=runtime.embeddings.cohere_api_key)
+            self.model = runtime.embeddings.cohere_model
             self.dimension = 1024
 
-        elif provider == "ollama":
+        elif self.provider == "ollama":
             # Ollama is handled via HTTP in embed_with_ollama(); no SDK client.
             self.client = None
-            self.dimension = OLLAMA_DIMENSION
+            self.model = runtime.ollama.embedding_model
+            self.dimension = runtime.embeddings.dimension
 
         else:
             # No recognised provider — do NOT silently fall back to mock data.
             # STEP 1: surface the problem immediately at construction time.
             raise ValueError(
-                f"Embedding provider '{provider}' is not available.  "
+                f"Embedding provider '{self.provider}' is not available.  "
                 "Install 'openai', 'cohere', or run Ollama locally and set "
                 "provider='ollama'."
             )
@@ -134,16 +162,21 @@ class EmbeddingService:
         if not texts:
             return []
 
+        runtime = _ai_runtime()
+        ollama_base_url = runtime.ollama.base_url.rstrip("/")
+        ollama_model = self.model or runtime.ollama.embedding_model
+        ollama_batch_size = runtime.ollama.embedding_batch_size
+        ollama_timeout = runtime.ollama.embedding_timeout
         session = self._get_http()
         embeddings: List[List[float]] = []
 
-        for start in range(0, len(texts), OLLAMA_EMBED_BATCH_SIZE):
-            batch = texts[start : start + OLLAMA_EMBED_BATCH_SIZE]
+        for start in range(0, len(texts), ollama_batch_size):
+            batch = texts[start : start + ollama_batch_size]
             try:
                 response = session.post(
-                    f"{OLLAMA_BASE_URL}/api/embed",
-                    json={"model": OLLAMA_MODEL, "input": batch},
-                    timeout=OLLAMA_EMBED_TIMEOUT,
+                    f"{ollama_base_url}/api/embed",
+                    json={"model": ollama_model, "input": batch},
+                    timeout=ollama_timeout,
                 )
                 if response.status_code == 404:
                     raise requests.HTTPError("/api/embed unsupported", response=response)
@@ -164,9 +197,9 @@ class EmbeddingService:
 
             for text in batch:
                 response = session.post(
-                    f"{OLLAMA_BASE_URL}/api/embeddings",
-                    json={"model": OLLAMA_MODEL, "prompt": text},
-                    timeout=OLLAMA_EMBED_TIMEOUT,
+                    f"{ollama_base_url}/api/embeddings",
+                    json={"model": ollama_model, "prompt": text},
+                    timeout=ollama_timeout,
                 )
                 if response.status_code != 200:
                     raise RuntimeError(
@@ -288,7 +321,7 @@ class EmbeddingService:
             if self.provider != "ollama":
                 # FIX: Check if Ollama has the same dimension as primary provider
                 # to prevent silent dimension mismatches during fallback
-                ollama_dimension = OLLAMA_DIMENSION
+                ollama_dimension = _ai_runtime().embeddings.dimension
                 if ollama_dimension != self.dimension:
                     logger.error(
                         "Cannot fall back to Ollama: dimension mismatch. "
@@ -344,7 +377,7 @@ class EmbeddingService:
 
     def get_model_name(self) -> str:
         """Return the model name for the active provider."""
-        return self.model or OLLAMA_MODEL
+        return self.model or _ai_runtime().ollama.embedding_model
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +399,7 @@ def get_embedding_service(provider: str = None) -> EmbeddingService:
     global _embedding_service
 
     if _embedding_service is None:
-        provider = provider or os.getenv("EMBEDDING_PROVIDER", "ollama")
+        provider = provider or _ai_runtime().embeddings.provider
         _embedding_service = EmbeddingService(provider)
 
     return _embedding_service

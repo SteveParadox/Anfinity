@@ -1,4 +1,5 @@
-"""LLM Integration Service - Ollama primary with async OpenAI fallback."""
+"""LLM integration service with centralized provider configuration."""
+
 import asyncio
 import logging
 import re
@@ -9,16 +10,24 @@ from typing import List, Optional, Tuple
 
 import httpx
 
-from app.config import settings
+from app import config as app_config
 
 logger = logging.getLogger(__name__)
-_OLLAMA_MAX_CONCURRENT_REQUESTS = max(1, int(getattr(settings, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2))
+settings = app_config.settings
+_OLLAMA_MAX_CONCURRENT_REQUESTS = max(
+    1,
+    int(getattr(settings, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2),
+)
 _OLLAMA_ASYNC_SEMAPHORE = asyncio.Semaphore(_OLLAMA_MAX_CONCURRENT_REQUESTS)
 
 
-# ============================================================================
-# Types
-# ============================================================================
+SUPPORTED_OLLAMA_MODELS = {
+    "phi3:mini",
+    "gpt-oss:20b-cloud",
+    "gpt-oss:120b-cloud",
+    "qwen2:0.5b",
+}
+
 
 class LLMProvider(Enum):
     OPENAI = "openai"
@@ -28,29 +37,22 @@ class LLMProvider(Enum):
 @dataclass(frozen=True)
 class LLMResponse:
     """Immutable LLM response wrapper."""
+
     answer: str
     tokens_used: int
     model: str
     provider: LLMProvider
 
 
-# ============================================================================
-# Pre-compiled patterns
-# ============================================================================
-
 _CITATION_RE = re.compile(r"\[?[Dd]ocument\s+(\d+)\]?")
-
-_TOKEN_EXHAUSTION_FRAGMENTS = frozenset({
-    "rate limit",
-    "quota exceeded",
-    "insufficient_quota",
-    "tokens_per_min_limit_exceeded",
-})
-
-
-# ============================================================================
-# Shared prompt helpers  (single source of truth)
-# ============================================================================
+_TOKEN_EXHAUSTION_FRAGMENTS = frozenset(
+    {
+        "rate limit",
+        "quota exceeded",
+        "insufficient_quota",
+        "tokens_per_min_limit_exceeded",
+    }
+)
 
 _RAG_SYSTEM_PROMPT = (
     "You are a helpful assistant that answers questions based on the provided documents.\n"
@@ -62,6 +64,39 @@ _RAG_SYSTEM_PROMPT = (
 )
 
 
+def _ai_runtime():
+    """Return centralized AI runtime config with a fallback for lightweight tests."""
+    getter = getattr(app_config, "get_ai_runtime_config", None)
+    if callable(getter):
+        return getter()
+
+    class _Namespace:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    return _Namespace(
+        ollama=_Namespace(
+            base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
+            llm_model=getattr(settings, "OLLAMA_MODEL", "phi3:mini"),
+            timeout=int(getattr(settings, "OLLAMA_TIMEOUT", 150) or 150),
+            enabled=bool(getattr(settings, "OLLAMA_ENABLED", True)),
+        ),
+        openai=_Namespace(
+            api_key=getattr(settings, "OPENAI_API_KEY", None),
+            llm_model=getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
+            timeout=int(getattr(settings, "OPENAI_TIMEOUT", 30) or 30),
+        ),
+        llm=_Namespace(
+            provider=str(getattr(settings, "LLM_PROVIDER", "ollama") or "ollama").lower(),
+            use_fallback=bool(getattr(settings, "LLM_USE_FALLBACK", True)),
+            temperature=float(getattr(settings, "LLM_TEMPERATURE", 0.3) or 0.3),
+            max_tokens=int(getattr(settings, "LLM_MAX_TOKENS", 1000) or 1000),
+            openai_model=getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
+            ollama_model=getattr(settings, "OLLAMA_MODEL", "phi3:mini"),
+        ),
+    )
+
+
 def _build_context_text(context_chunks: List[str]) -> str:
     return "\n\n".join(
         f"[Document {i + 1}]: {chunk}" for i, chunk in enumerate(context_chunks)
@@ -69,67 +104,56 @@ def _build_context_text(context_chunks: List[str]) -> str:
 
 
 def _build_messages(query: str, context_chunks: List[str]) -> List[dict]:
-    """Assemble the full messages list consumed by both OpenAI and Ollama chat APIs."""
-    user_content = f"Documents:\n{_build_context_text(context_chunks)}\n\nQuestion: {query}\n\nAnswer:"
+    """Assemble the shared message list for OpenAI and Ollama."""
+    user_content = (
+        f"Documents:\n{_build_context_text(context_chunks)}\n\n"
+        f"Question: {query}\n\nAnswer:"
+    )
     return [
         {"role": "system", "content": _RAG_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
 
 
-# ============================================================================
-# OllamaClient
-# ============================================================================
-
 class OllamaClient:
-    """
-    Thin wrapper around the `ollama` Python library.
+    """Thin wrapper around the ollama Python library with cached health checks."""
 
-    Key improvements over the original:
-    - `is_available()` uses a TTL cache so the health-check HTTP call is
-      not repeated on every generation request.
-    - `chat()` sends the structured messages list so role boundaries are
-      respected by the model.
-    - `generate()` is kept for backward compatibility.
-    - Availability check uses `httpx` (already a project dependency) instead
-      of importing `requests` inside a method.
-    """
-
-    _AVAILABILITY_TTL = 10.0  # seconds between health checks
+    _AVAILABILITY_TTL = 10.0
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
-        model: str = "phi3:mini",
-        timeout: int = 60,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: Optional[int] = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = timeout
+        runtime = _ai_runtime()
+        self.base_url = (base_url or runtime.ollama.base_url).rstrip("/")
+        self.model = model or runtime.ollama.llm_model
+        self.timeout = int(timeout or runtime.ollama.timeout)
         self.max_context_chunks = 4
-        self.max_chunk_chars = 1_200
-
+        self.max_chunk_chars = 1200
         self._available: Optional[bool] = None
-        self._availability_checked_at: float = 0.0
+        self._availability_checked_at = 0.0
 
         try:
-            import ollama as _ollama_lib
-            self._lib = _ollama_lib
-            logger.info("✓ Ollama client initialised: %s", self.base_url)
+            import ollama as ollama_lib
+
+            self._lib = ollama_lib
+            logger.info("Ollama client initialised: %s", self.base_url)
         except ImportError:
-            logger.error("ollama package not installed — Ollama backend disabled")
+            logger.error("ollama package not installed; Ollama backend disabled")
             self._lib = None
 
-    # ------------------------------------------------------------------
-    # Availability (TTL-cached)
-    # ------------------------------------------------------------------
+        if self.model not in SUPPORTED_OLLAMA_MODELS:
+            logger.warning("Unknown Ollama model configured: %s", self.model)
+
+    def set_model(self, model: str) -> None:
+        if model not in SUPPORTED_OLLAMA_MODELS:
+            logger.warning("Unknown Ollama model '%s'; continuing anyway", model)
+        self.model = model
+        logger.info("Ollama model switched to: %s", self.model)
 
     def is_available(self) -> bool:
-        """
-        Return True if the Ollama server is reachable.
-        Result is cached for `_AVAILABILITY_TTL` seconds to avoid
-        a blocking HTTP round-trip on every generation call.
-        """
         if self._lib is None:
             return False
 
@@ -139,8 +163,8 @@ class OllamaClient:
 
         try:
             with httpx.Client(timeout=3.0) as client:
-                resp = client.get(f"{self.base_url}/api/tags")
-            self._available = resp.status_code == 200
+                response = client.get(f"{self.base_url}/api/tags")
+            self._available = response.status_code == 200
         except Exception as exc:
             logger.debug("Ollama health check failed: %s", exc)
             self._available = False
@@ -148,212 +172,180 @@ class OllamaClient:
         self._availability_checked_at = now
         return bool(self._available)
 
-    # ------------------------------------------------------------------
-    # Chat (preferred — role-aware)
-    # ------------------------------------------------------------------
-
     def chat(
         self,
         messages: List[dict],
         temperature: float = 0.3,
-        num_predict: int = 1_000,
+        num_predict: int = 1000,
     ) -> Tuple[str, int]:
-        """
-        Generate a response using the Ollama chat API (role-aware).
-
-        Args:
-            messages: List of {"role": ..., "content": ...} dicts.
-            temperature: Sampling temperature.
-            num_predict: Max tokens to generate.
-
-        Returns:
-            (response_text, estimated_token_count)
-        """
         if not self._lib:
             raise RuntimeError("Ollama client not initialised")
 
-        logger.debug("Ollama chat (%s) temp=%s", self.model, temperature)
         response = self._lib.chat(
             model=self.model,
             messages=messages,
             stream=False,
             options={"temperature": temperature, "num_predict": num_predict},
         )
-        text: str = response["message"]["content"]
-        estimated_tokens = len(text) // 4
-        logger.debug("Ollama chat → ~%d tokens", estimated_tokens)
-        return text, estimated_tokens
-
-    # ------------------------------------------------------------------
-    # Generate (legacy / backward compat)
-    # ------------------------------------------------------------------
+        text = response["message"]["content"]
+        return text, len(text) // 4
 
     def generate(
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.3,
-        num_predict: int = 1_000,
+        num_predict: int = 1000,
     ) -> Tuple[str, int]:
-        """
-        Generate a response using the flat Ollama generate API.
-        Prefer `chat()` for new call sites.
-        """
         if not self._lib:
             raise RuntimeError("Ollama client not initialised")
 
         full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-        logger.debug("Ollama generate (%s) temp=%s", self.model, temperature)
         response = self._lib.generate(
             model=self.model,
             prompt=full_prompt,
             stream=False,
             options={"temperature": temperature, "num_predict": num_predict},
         )
-        text: str = response.get("response", "")
-        estimated_tokens = len(text) // 4
-        logger.debug("Ollama generate → ~%d tokens", estimated_tokens)
-        return text, estimated_tokens
+        text = response.get("response", "")
+        return text, len(text) // 4
 
-
-# ============================================================================
-# LLMService  (sync interface — wraps both backends)
-# ============================================================================
 
 class LLMService:
-    """
-    Generates answers using configurable primary + fallback LLM providers.
-
-    Both sync (`generate_answer`) and async (`async_generate_answer`) APIs
-    are exposed.  The async path uses `AsyncOpenAI` directly and offloads
-    the blocking Ollama call to a thread executor so it never stalls the
-    event loop.
-    """
+    """Synchronous and asynchronous LLM access with centralized config."""
 
     def __init__(
         self,
         openai_api_key: Optional[str] = None,
-        openai_model: str = "gpt-4o-mini",
-        ollama_base_url: str = "http://localhost:11434",
-        ollama_model: str = "phi3:mini",
-        use_fallback: bool = True,
-        primary_provider: str = "ollama",
+        openai_model: Optional[str] = None,
+        ollama_base_url: Optional[str] = None,
+        ollama_model: Optional[str] = None,
+        use_fallback: Optional[bool] = None,
+        primary_provider: Optional[str] = None,
     ) -> None:
-        self.openai_model = openai_model
-        self.use_fallback = use_fallback
-        self.primary_provider = primary_provider
+        runtime = _ai_runtime()
+        self.openai_model = openai_model or runtime.llm.openai_model
+        self.ollama_model = ollama_model or runtime.llm.ollama_model
+        self.use_fallback = runtime.llm.use_fallback if use_fallback is None else use_fallback
+        self.primary_provider = str(primary_provider or runtime.llm.provider or "ollama").lower()
+        self._openai_timeout = runtime.openai.timeout
+        self._ollama_timeout = runtime.ollama.timeout
 
-        # Sync OpenAI client (for sync path only)
         self._openai_sync = None
-        api_key = openai_api_key or settings.OPENAI_API_KEY
+        api_key = openai_api_key or runtime.openai.api_key
         if api_key:
             try:
                 from openai import OpenAI
-                self._openai_sync = OpenAI(api_key=api_key, timeout=settings.OPENAI_TIMEOUT)
-                logger.info("✓ OpenAI sync client initialised: %s", openai_model)
+
+                self._openai_sync = OpenAI(api_key=api_key, timeout=self._openai_timeout)
+                logger.info("OpenAI sync client initialised: %s", self.openai_model)
             except ImportError:
                 logger.error("openai package not installed")
 
         self.ollama_client = OllamaClient(
-            base_url=ollama_base_url,
-            model=ollama_model,
-            timeout=settings.OLLAMA_TIMEOUT,
+            base_url=ollama_base_url or runtime.ollama.base_url,
+            model=self.ollama_model,
+            timeout=self._ollama_timeout,
         )
-
-        # Provider dispatch tables — easy to extend with a third provider.
         self._sync_providers = {
-            "openai": self._sync_openai,
             "ollama": self._sync_ollama,
+            "openai": self._sync_openai,
         }
         self._async_providers = {
-            "openai": self._async_openai,
             "ollama": self._async_ollama,
+            "openai": self._async_openai,
         }
-
-    # ------------------------------------------------------------------
-    # Internal sync backends
-    # ------------------------------------------------------------------
 
     def _sync_ollama(self, messages: List[dict], temperature: float, max_tokens: int) -> LLMResponse:
         if not self.ollama_client.is_available():
             raise RuntimeError("Ollama not available")
-        text, tokens = self.ollama_client.chat(messages, temperature=temperature, num_predict=max_tokens)
-        return LLMResponse(answer=text, tokens_used=tokens, model=self.ollama_client.model, provider=LLMProvider.OLLAMA)
+        text, tokens = self.ollama_client.chat(
+            messages,
+            temperature=temperature,
+            num_predict=max_tokens,
+        )
+        return LLMResponse(
+            answer=text,
+            tokens_used=tokens,
+            model=self.ollama_client.model,
+            provider=LLMProvider.OLLAMA,
+        )
 
     def _sync_openai(self, messages: List[dict], temperature: float, max_tokens: int) -> LLMResponse:
         if not self._openai_sync:
             raise RuntimeError("OpenAI client not configured")
-        resp = self._openai_sync.chat.completions.create(
+
+        response = self._openai_sync.chat.completions.create(
             model=self.openai_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )
         return LLMResponse(
-            answer=resp.choices[0].message.content or "",
-            tokens_used=resp.usage.total_tokens,
+            answer=response.choices[0].message.content or "",
+            tokens_used=response.usage.total_tokens,
             model=self.openai_model,
             provider=LLMProvider.OPENAI,
         )
 
-    # ------------------------------------------------------------------
-    # Internal async backends
-    # ------------------------------------------------------------------
-
     async def _async_ollama(self, messages: List[dict], temperature: float, max_tokens: int) -> LLMResponse:
-        """Run blocking Ollama call in a thread executor."""
         if not self.ollama_client.is_available():
             raise RuntimeError("Ollama not available")
+
         async with _OLLAMA_ASYNC_SEMAPHORE:
             loop = asyncio.get_running_loop()
             text, tokens = await loop.run_in_executor(
                 None,
-                lambda: self.ollama_client.chat(messages, temperature=temperature, num_predict=max_tokens),
+                lambda: self.ollama_client.chat(
+                    messages,
+                    temperature=temperature,
+                    num_predict=max_tokens,
+                ),
             )
-        return LLMResponse(answer=text, tokens_used=tokens, model=self.ollama_client.model, provider=LLMProvider.OLLAMA)
+
+        return LLMResponse(
+            answer=text,
+            tokens_used=tokens,
+            model=self.ollama_client.model,
+            provider=LLMProvider.OLLAMA,
+        )
 
     async def _async_openai(self, messages: List[dict], temperature: float, max_tokens: int) -> LLMResponse:
-        """True async OpenAI call — no executor needed."""
         try:
             from openai import AsyncOpenAI
-        except ImportError:
-            raise RuntimeError("openai package not installed")
+        except ImportError as exc:
+            raise RuntimeError("openai package not installed") from exc
 
-        api_key = getattr(settings, "OPENAI_API_KEY", None)
+        runtime = _ai_runtime()
+        api_key = runtime.openai.api_key
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not configured")
 
-        client = AsyncOpenAI(api_key=api_key, timeout=getattr(settings, "OPENAI_TIMEOUT", 30.0))
-        resp = await client.chat.completions.create(
+        client = AsyncOpenAI(api_key=api_key, timeout=runtime.openai.timeout)
+        response = await client.chat.completions.create(
             model=self.openai_model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )
         return LLMResponse(
-            answer=resp.choices[0].message.content or "",
-            tokens_used=resp.usage.total_tokens,
+            answer=response.choices[0].message.content or "",
+            tokens_used=response.usage.total_tokens,
             model=self.openai_model,
             provider=LLMProvider.OPENAI,
         )
 
-    # ------------------------------------------------------------------
-    # Provider chain (generic, works for sync and async callables)
-    # ------------------------------------------------------------------
-
     def _provider_order(self, primary_override: Optional[str] = None) -> List[str]:
-        """Return [primary, fallback] provider names."""
-        primary = primary_override or self.primary_provider
+        primary = str(primary_override or self.primary_provider or "ollama").lower()
+        if primary not in {"ollama", "openai"}:
+            logger.warning("Unknown LLM provider '%s', defaulting to ollama", primary)
+            primary = "ollama"
         fallback = "openai" if primary == "ollama" else "ollama"
         return [primary] if not self.use_fallback else [primary, fallback]
 
     def _is_token_exhaustion(self, err: str) -> bool:
-        lower = err.lower()
-        return any(f in lower for f in _TOKEN_EXHAUSTION_FRAGMENTS)
-
-    # ------------------------------------------------------------------
-    # Public sync API
-    # ------------------------------------------------------------------
+        lowered = err.lower()
+        return any(fragment in lowered for fragment in _TOKEN_EXHAUSTION_FRAGMENTS)
 
     def generate_answer(
         self,
@@ -363,25 +355,20 @@ class LLMService:
         max_tokens: Optional[int] = None,
         force_ollama: bool = False,
     ) -> LLMResponse:
-        """
-        Generate an answer synchronously.
-        Tries providers in configured order; raises RuntimeError if all fail.
-        """
-        temperature = temperature or settings.LLM_TEMPERATURE
-        max_tokens = max_tokens or settings.LLM_MAX_TOKENS
+        runtime = _ai_runtime()
+        resolved_temperature = temperature if temperature is not None else runtime.llm.temperature
+        resolved_max_tokens = max_tokens if max_tokens is not None else runtime.llm.max_tokens
         messages = _build_messages(query, context_chunks)
-        last_exc: Optional[Exception] = None
         primary_override = "ollama" if force_ollama else None
+        last_exc: Optional[Exception] = None
 
         for provider_name in self._provider_order(primary_override=primary_override):
-            fn = self._sync_providers.get(provider_name)
-            if fn is None:
+            provider = self._sync_providers.get(provider_name)
+            if provider is None:
                 continue
             try:
                 logger.info("Trying sync provider: %s", provider_name)
-                result = fn(messages, temperature, max_tokens)
-                logger.info("✓ %s answered (%d tokens)", provider_name, result.tokens_used)
-                return result
+                return provider(messages, resolved_temperature, resolved_max_tokens)
             except Exception as exc:
                 logger.warning("%s failed: %s", provider_name, exc)
                 if self._is_token_exhaustion(str(exc)):
@@ -389,10 +376,6 @@ class LLMService:
                 last_exc = exc
 
         raise RuntimeError(f"All LLM providers failed. Last error: {last_exc}")
-
-    # ------------------------------------------------------------------
-    # Public async API
-    # ------------------------------------------------------------------
 
     async def async_generate_answer(
         self,
@@ -402,25 +385,20 @@ class LLMService:
         max_tokens: Optional[int] = None,
         force_ollama: bool = False,
     ) -> LLMResponse:
-        """
-        Generate an answer asynchronously.
-        Tries providers in configured order without blocking the event loop.
-        """
-        temperature = temperature or settings.LLM_TEMPERATURE
-        max_tokens = max_tokens or settings.LLM_MAX_TOKENS
+        runtime = _ai_runtime()
+        resolved_temperature = temperature if temperature is not None else runtime.llm.temperature
+        resolved_max_tokens = max_tokens if max_tokens is not None else runtime.llm.max_tokens
         messages = _build_messages(query, context_chunks)
-        last_exc: Optional[Exception] = None
         primary_override = "ollama" if force_ollama else None
+        last_exc: Optional[Exception] = None
 
         for provider_name in self._provider_order(primary_override=primary_override):
-            fn = self._async_providers.get(provider_name)
-            if fn is None:
+            provider = self._async_providers.get(provider_name)
+            if provider is None:
                 continue
             try:
                 logger.info("Trying async provider: %s", provider_name)
-                result = await fn(messages, temperature, max_tokens)
-                logger.info("✓ %s answered (%d tokens)", provider_name, result.tokens_used)
-                return result
+                return await provider(messages, resolved_temperature, resolved_max_tokens)
             except Exception as exc:
                 logger.warning("%s failed: %s", provider_name, exc)
                 if self._is_token_exhaustion(str(exc)):
@@ -429,13 +407,8 @@ class LLMService:
 
         raise RuntimeError(f"All LLM providers failed. Last error: {last_exc}")
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
     def extract_citations(self, text: str) -> List[int]:
-        """Extract sorted, deduplicated [Document N] citations from answer text."""
-        return sorted({int(m.group(1)) for m in _CITATION_RE.finditer(text)})
+        return sorted({int(match.group(1)) for match in _CITATION_RE.finditer(text)})
 
     def get_status(self) -> dict:
         return {
@@ -448,10 +421,6 @@ class LLMService:
         }
 
 
-# ============================================================================
-# Singleton
-# ============================================================================
-
 _llm_service: Optional[LLMService] = None
 
 
@@ -462,53 +431,35 @@ def get_llm_service(
     primary_provider: Optional[str] = None,
     use_fallback: Optional[bool] = None,
 ) -> LLMService:
-    """
-    Return the application-wide LLMService singleton.
-
-    Configuration is sourced entirely from `settings` so there is no
-    ambiguity about which values take effect — callers cannot accidentally
-    override the singleton with a different config mid-process.
-    Override arguments create a transient service instead of mutating the
-    shared singleton.
-    """
+    """Return the application-wide LLM service singleton."""
+    runtime = _ai_runtime()
     has_overrides = any(
         value is not None
         for value in (model, openai_model, primary_provider, use_fallback)
     )
     if has_overrides:
-        resolved_primary = primary_provider or settings.LLM_PROVIDER
-        resolved_fallback = settings.LLM_USE_FALLBACK if use_fallback is None else use_fallback
-        resolved_ollama_model = model or settings.OLLAMA_MODEL
-        resolved_openai_model = openai_model or settings.OPENAI_MODEL
-        logger.debug(
-            "Creating transient LLMService with overrides: primary=%s fallback=%s ollama_model=%s openai_model=%s",
-            resolved_primary,
-            resolved_fallback,
-            resolved_ollama_model,
-            resolved_openai_model,
-        )
         return LLMService(
-            openai_api_key=settings.OPENAI_API_KEY,
-            openai_model=resolved_openai_model,
-            ollama_base_url=settings.OLLAMA_BASE_URL,
-            ollama_model=resolved_ollama_model,
-            use_fallback=resolved_fallback,
-            primary_provider=resolved_primary,
+            openai_api_key=runtime.openai.api_key,
+            openai_model=openai_model or runtime.llm.openai_model,
+            ollama_base_url=runtime.ollama.base_url,
+            ollama_model=model or runtime.llm.ollama_model,
+            use_fallback=runtime.llm.use_fallback if use_fallback is None else use_fallback,
+            primary_provider=primary_provider or runtime.llm.provider,
         )
 
     global _llm_service
     if _llm_service is None:
         _llm_service = LLMService(
-            openai_api_key=settings.OPENAI_API_KEY,
-            openai_model=settings.OPENAI_MODEL,
-            ollama_base_url=settings.OLLAMA_BASE_URL,
-            ollama_model=settings.OLLAMA_MODEL,
-            use_fallback=settings.LLM_USE_FALLBACK,
-            primary_provider=settings.LLM_PROVIDER,
+            openai_api_key=runtime.openai.api_key,
+            openai_model=runtime.llm.openai_model,
+            ollama_base_url=runtime.ollama.base_url,
+            ollama_model=runtime.llm.ollama_model,
+            use_fallback=runtime.llm.use_fallback,
+            primary_provider=runtime.llm.provider,
         )
         logger.info(
-            "LLMService singleton created — primary=%s fallback=%s",
-            settings.LLM_PROVIDER,
-            settings.LLM_USE_FALLBACK,
+            "LLMService singleton created - primary=%s fallback=%s",
+            runtime.llm.provider,
+            runtime.llm.use_fallback,
         )
     return _llm_service

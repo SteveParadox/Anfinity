@@ -17,10 +17,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from app.config import settings
+from app import config as app_config
 from app.services.retrieval_cross_checker import RetrievalCrossChecker, RetrievalValidation
 
 logger = logging.getLogger(__name__)
+settings = app_config.settings
+
+
+def _ai_runtime():
+    getter = getattr(app_config, "get_ai_runtime_config", None)
+    return getter() if callable(getter) else getattr(settings, "ai_runtime", None)
 
 
 @dataclass
@@ -120,15 +126,33 @@ class AnswerGenerator:
         detect_conflicts: bool = True,
         ollama_timeout: Optional[int] = None,
     ):
-        self.model = model or settings.OLLAMA_MODEL
-        self.openai_model = openai_model or settings.OPENAI_MODEL
-        self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
-        self.max_tokens = max_tokens or settings.LLM_MAX_TOKENS
-        self.ollama_base_url = (ollama_base_url or settings.OLLAMA_BASE_URL).rstrip("/")
+        runtime = _ai_runtime()
+        llm_runtime = getattr(runtime, "llm", None)
+        ollama_runtime = getattr(runtime, "ollama", None)
+
+        self.model = model or getattr(llm_runtime, "ollama_model", getattr(settings, "OLLAMA_MODEL", "phi3:mini"))
+        self.openai_model = openai_model or getattr(
+            llm_runtime,
+            "openai_model",
+            getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
+        )
+        self.temperature = temperature if temperature is not None else getattr(
+            llm_runtime,
+            "temperature",
+            getattr(settings, "LLM_TEMPERATURE", 0.3),
+        )
+        self.max_tokens = max_tokens or getattr(llm_runtime, "max_tokens", getattr(settings, "LLM_MAX_TOKENS", 1000))
+        self.ollama_base_url = (
+            ollama_base_url or getattr(ollama_runtime, "base_url", getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"))
+        ).rstrip("/")
         self.similarity_threshold = similarity_threshold
         self.min_unique_documents = min_unique_documents
         self.detect_conflicts = detect_conflicts
-        self.ollama_timeout = ollama_timeout or settings.OLLAMA_TIMEOUT
+        self.ollama_timeout = ollama_timeout or getattr(
+            ollama_runtime,
+            "timeout",
+            getattr(settings, "OLLAMA_TIMEOUT", 150),
+        )
         self.max_context_chunks = min(4, max(2, getattr(settings, "RAG_MAX_CONTEXT_CHUNKS", 4)))
         self.max_chunk_chars = max(600, getattr(settings, "RAG_MAX_CHUNK_CHARS", 1200))
         self.min_answer_confidence = float(getattr(settings, "RAG_MIN_ANSWER_CONFIDENCE", 45.0))
