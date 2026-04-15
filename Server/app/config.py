@@ -1,8 +1,144 @@
 """Application configuration using Pydantic Settings."""
 import secrets
+from dataclasses import dataclass
 from typing import Optional
-from pydantic_settings import BaseSettings
+
 from pydantic import Field
+from pydantic_settings import BaseSettings
+
+
+_DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+_DEFAULT_OLLAMA_LLM_MODEL = "phi3:mini"
+_DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
+_DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+
+
+@dataclass(frozen=True)
+class OllamaRuntimeConfig:
+    enabled: bool
+    base_url: str
+    llm_model: str
+    embedding_model: str
+    timeout: int
+    embedding_timeout: int
+    embedding_batch_size: int
+
+
+@dataclass(frozen=True)
+class OpenAIRuntimeConfig:
+    api_key: Optional[str]
+    llm_model: str
+    embedding_model: str
+    timeout: int
+
+
+@dataclass(frozen=True)
+class EmbeddingRuntimeConfig:
+    provider: str
+    dimension: int
+    batch_size: int
+    fallback_enabled: bool
+    fallback_max_retries: int
+    cohere_api_key: Optional[str]
+    cohere_model: str
+    bge_model: str
+
+
+@dataclass(frozen=True)
+class LLMRuntimeConfig:
+    provider: str
+    use_fallback: bool
+    temperature: float
+    max_tokens: int
+    openai_model: str
+    ollama_model: str
+
+
+@dataclass(frozen=True)
+class AIRuntimeConfig:
+    ollama: OllamaRuntimeConfig
+    openai: OpenAIRuntimeConfig
+    embeddings: EmbeddingRuntimeConfig
+    llm: LLMRuntimeConfig
+
+
+def _normalize_provider(value: Optional[str], *, allowed: set[str], default: str) -> str:
+    provider = (value or default).strip().lower()
+    return provider if provider in allowed else default
+
+
+def _normalize_ollama_base_url(value: Optional[str]) -> str:
+    base_url = (value or _DEFAULT_OLLAMA_BASE_URL).strip().rstrip("/")
+    if not base_url or base_url == "https://ollama.com":
+        return _DEFAULT_OLLAMA_BASE_URL
+    return base_url
+
+
+def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
+    """Build a normalized AI runtime view from a settings-like object."""
+    llm_provider = _normalize_provider(
+        getattr(source, "LLM_PROVIDER", "ollama"),
+        allowed={"ollama", "openai"},
+        default="ollama",
+    )
+    embedding_provider = _normalize_provider(
+        getattr(source, "EMBEDDING_PROVIDER", "ollama"),
+        allowed={"ollama", "openai", "cohere", "bge"},
+        default="ollama",
+    )
+    ollama_base_url = _normalize_ollama_base_url(getattr(source, "OLLAMA_BASE_URL", _DEFAULT_OLLAMA_BASE_URL))
+    ollama_llm_model = getattr(source, "OLLAMA_MODEL", _DEFAULT_OLLAMA_LLM_MODEL) or _DEFAULT_OLLAMA_LLM_MODEL
+    ollama_embedding_model = (
+        getattr(source, "OLLAMA_EMBEDDING_MODEL", _DEFAULT_OLLAMA_EMBEDDING_MODEL)
+        or _DEFAULT_OLLAMA_EMBEDDING_MODEL
+    )
+    openai_llm_model = getattr(source, "OPENAI_MODEL", _DEFAULT_OPENAI_MODEL) or _DEFAULT_OPENAI_MODEL
+    openai_embedding_model = (
+        getattr(source, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        or "text-embedding-3-small"
+    )
+
+    ollama = OllamaRuntimeConfig(
+        enabled=bool(getattr(source, "OLLAMA_ENABLED", True)),
+        base_url=ollama_base_url,
+        llm_model=ollama_llm_model,
+        embedding_model=ollama_embedding_model,
+        timeout=int(getattr(source, "OLLAMA_TIMEOUT", 150) or 150),
+        embedding_timeout=int(getattr(source, "OLLAMA_EMBED_TIMEOUT", getattr(source, "OLLAMA_TIMEOUT", 150)) or 150),
+        embedding_batch_size=int(
+            getattr(source, "OLLAMA_EMBED_BATCH_SIZE", getattr(source, "EMBEDDING_BATCH_SIZE", 32)) or 32
+        ),
+    )
+    openai = OpenAIRuntimeConfig(
+        api_key=getattr(source, "OPENAI_API_KEY", None),
+        llm_model=openai_llm_model,
+        embedding_model=openai_embedding_model,
+        timeout=int(getattr(source, "OPENAI_TIMEOUT", 30) or 30),
+    )
+    embeddings = EmbeddingRuntimeConfig(
+        provider=embedding_provider,
+        dimension=int(getattr(source, "EMBEDDING_DIMENSION", 768) or 768),
+        batch_size=int(getattr(source, "EMBEDDING_BATCH_SIZE", 32) or 32),
+        fallback_enabled=bool(getattr(source, "EMBEDDING_FALLBACK_ENABLED", True)),
+        fallback_max_retries=int(getattr(source, "EMBEDDING_FALLBACK_MAX_RETRIES", 2) or 2),
+        cohere_api_key=getattr(source, "COHERE_API_KEY", None),
+        cohere_model=getattr(source, "COHERE_EMBEDDING_MODEL", "embed-english-v3.0") or "embed-english-v3.0",
+        bge_model=getattr(source, "BGE_MODEL_NAME", "BAAI/bge-small-en-v1.5") or "BAAI/bge-small-en-v1.5",
+    )
+    llm = LLMRuntimeConfig(
+        provider=llm_provider,
+        use_fallback=bool(getattr(source, "LLM_USE_FALLBACK", True)),
+        temperature=float(getattr(source, "LLM_TEMPERATURE", 0.3) or 0.3),
+        max_tokens=int(getattr(source, "LLM_MAX_TOKENS", 1000) or 1000),
+        openai_model=openai_llm_model,
+        ollama_model=ollama_llm_model,
+    )
+    return AIRuntimeConfig(
+        ollama=ollama,
+        openai=openai,
+        embeddings=embeddings,
+        llm=llm,
+    )
 
 
 class Settings(BaseSettings):
@@ -141,6 +277,16 @@ class Settings(BaseSettings):
                 "Please update your .env or environment variable to make this permanent."
             )
 
+    @property
+    def ai_runtime(self) -> AIRuntimeConfig:
+        """Normalized AI runtime config used by provider-backed services."""
+        return build_ai_runtime_config(self)
+
 
 # Global settings instance
 settings = Settings()
+
+
+def get_ai_runtime_config() -> AIRuntimeConfig:
+    """Return the centralized AI runtime configuration for the current process."""
+    return settings.ai_runtime
