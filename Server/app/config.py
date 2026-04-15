@@ -3,12 +3,12 @@ import secrets
 from dataclasses import dataclass
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
 _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
-_DEFAULT_OLLAMA_LLM_MODEL = "phi3:mini"
+_DEFAULT_OLLAMA_LLM_MODEL = "gpt-oss:20b-cloud"
 _DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 _DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 
@@ -17,11 +17,13 @@ _DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 class OllamaRuntimeConfig:
     enabled: bool
     base_url: str
+    api_key: Optional[str]
     llm_model: str
     embedding_model: str
     timeout: int
     embedding_timeout: int
     embedding_batch_size: int
+    max_concurrent_requests: int
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,37 @@ def _normalize_ollama_base_url(value: Optional[str]) -> str:
     return base_url
 
 
+def _normalize_secret(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    secret = str(value).strip()
+    if not secret:
+        return None
+
+    lowered = secret.lower()
+    placeholder_markers = (
+        "...",
+        "your-",
+        "placeholder",
+        "example",
+        "set your",
+        "changeme",
+        "replace-me",
+    )
+    if any(marker in lowered for marker in placeholder_markers):
+        return None
+    return secret
+
+
+def _build_ollama_headers(api_key: Optional[str], *, include_content_type: bool = True) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if include_content_type:
+        headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
     """Build a normalized AI runtime view from a settings-like object."""
     llm_provider = _normalize_provider(
@@ -101,6 +134,7 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
     ollama = OllamaRuntimeConfig(
         enabled=bool(getattr(source, "OLLAMA_ENABLED", True)),
         base_url=ollama_base_url,
+        api_key=_normalize_secret(getattr(source, "OLLAMA_API_KEY", None)),
         llm_model=ollama_llm_model,
         embedding_model=ollama_embedding_model,
         timeout=int(getattr(source, "OLLAMA_TIMEOUT", 150) or 150),
@@ -108,9 +142,10 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         embedding_batch_size=int(
             getattr(source, "OLLAMA_EMBED_BATCH_SIZE", getattr(source, "EMBEDDING_BATCH_SIZE", 32)) or 32
         ),
+        max_concurrent_requests=int(getattr(source, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2),
     )
     openai = OpenAIRuntimeConfig(
-        api_key=getattr(source, "OPENAI_API_KEY", None),
+        api_key=_normalize_secret(getattr(source, "OPENAI_API_KEY", None)),
         llm_model=openai_llm_model,
         embedding_model=openai_embedding_model,
         timeout=int(getattr(source, "OPENAI_TIMEOUT", 30) or 30),
@@ -121,7 +156,7 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         batch_size=int(getattr(source, "EMBEDDING_BATCH_SIZE", 32) or 32),
         fallback_enabled=bool(getattr(source, "EMBEDDING_FALLBACK_ENABLED", True)),
         fallback_max_retries=int(getattr(source, "EMBEDDING_FALLBACK_MAX_RETRIES", 2) or 2),
-        cohere_api_key=getattr(source, "COHERE_API_KEY", None),
+        cohere_api_key=_normalize_secret(getattr(source, "COHERE_API_KEY", None)),
         cohere_model=getattr(source, "COHERE_EMBEDDING_MODEL", "embed-english-v3.0") or "embed-english-v3.0",
         bge_model=getattr(source, "BGE_MODEL_NAME", "BAAI/bge-small-en-v1.5") or "BAAI/bge-small-en-v1.5",
     )
@@ -197,8 +232,12 @@ class Settings(BaseSettings):
     # LLM - Ollama (Primary)
     OLLAMA_ENABLED: bool = Field(default=True)  # Enable Ollama
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434")  # Ollama server URL
-    OLLAMA_MODEL: str = Field(default="phi3:mini")  # Default Ollama model (phi3 better than qwen2:0.5b for RAG)
+    OLLAMA_API_KEY: Optional[str] = None
+    OLLAMA_MODEL: str = Field(default=_DEFAULT_OLLAMA_LLM_MODEL)
     OLLAMA_TIMEOUT: int = 150  # 120-180s for phi3 with context (was 60s, causing timeouts)
+    OLLAMA_EMBED_TIMEOUT: int = 150
+    OLLAMA_EMBED_BATCH_SIZE: int = 48
+    OLLAMA_MAX_CONCURRENT_REQUESTS: int = 2
     
     # LLM Settings
     LLM_TEMPERATURE: float = 0.3
@@ -253,6 +292,19 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def _normalize_debug(cls, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production", "off", "no", "false", "0"}:
+                return False
+            if normalized in {"dev", "debug", "development", "on", "yes", "true", "1"}:
+                return True
+        return value
     
     def __init__(self, **data):
         """Initialize settings and validate/fix OLLAMA_BASE_URL."""
@@ -290,3 +342,18 @@ settings = Settings()
 def get_ai_runtime_config() -> AIRuntimeConfig:
     """Return the centralized AI runtime configuration for the current process."""
     return settings.ai_runtime
+
+
+def build_ollama_request_headers(
+    source: object,
+    *,
+    include_content_type: bool = True,
+) -> dict[str, str]:
+    """Build normalized Ollama HTTP headers from a settings-like object."""
+    runtime = build_ai_runtime_config(source)
+    return _build_ollama_headers(runtime.ollama.api_key, include_content_type=include_content_type)
+
+
+def get_ollama_request_headers(*, include_content_type: bool = True) -> dict[str, str]:
+    """Return centralized Ollama headers for the current process."""
+    return build_ollama_request_headers(settings, include_content_type=include_content_type)

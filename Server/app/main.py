@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
-from app.config import settings
+from app.config import get_ollama_request_headers, settings
 from app.database.session import init_db
 from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat
 from app.events import websocket_router
@@ -45,7 +45,10 @@ async def lifespan(app: FastAPI):
             logger.info(f"🚀 Preloading Ollama model '{settings.OLLAMA_MODEL}' from {settings.OLLAMA_BASE_URL}...")
             preload_start = time.time()
             # FIX: Use OLLAMA_TIMEOUT (150s) instead of hardcoded 60s to allow cold start
-            async with httpx.AsyncClient(timeout=float(settings.OLLAMA_TIMEOUT)) as client:
+            async with httpx.AsyncClient(
+                timeout=float(settings.OLLAMA_TIMEOUT),
+                headers=get_ollama_request_headers(),
+            ) as client:
                 try:
                     response = await client.post(
                         f"{settings.OLLAMA_BASE_URL}/api/generate",
