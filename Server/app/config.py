@@ -19,8 +19,13 @@ class OllamaRuntimeConfig:
     base_url: str
     api_key: Optional[str]
     llm_model: str
+    fallback_model: Optional[str]
     embedding_model: str
     timeout: int
+    connect_timeout: int
+    read_timeout: int
+    write_timeout: int
+    pool_timeout: int
     embedding_timeout: int
     embedding_batch_size: int
     max_concurrent_requests: int
@@ -146,8 +151,15 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         base_url=ollama_base_url,
         api_key=_normalize_secret(getattr(source, "OLLAMA_API_KEY", None)),
         llm_model=ollama_llm_model,
+        fallback_model=getattr(source, "OLLAMA_FALLBACK_MODEL", None) or None,
         embedding_model=ollama_embedding_model,
         timeout=int(getattr(source, "OLLAMA_TIMEOUT", 150) or 150),
+        connect_timeout=int(getattr(source, "OLLAMA_CONNECT_TIMEOUT", 10) or 10),
+        read_timeout=int(
+            getattr(source, "OLLAMA_READ_TIMEOUT", getattr(source, "OLLAMA_TIMEOUT", 150)) or 150
+        ),
+        write_timeout=int(getattr(source, "OLLAMA_WRITE_TIMEOUT", 30) or 30),
+        pool_timeout=int(getattr(source, "OLLAMA_POOL_TIMEOUT", 30) or 30),
         embedding_timeout=int(getattr(source, "OLLAMA_EMBED_TIMEOUT", getattr(source, "OLLAMA_TIMEOUT", 150)) or 150),
         embedding_batch_size=int(
             getattr(source, "OLLAMA_EMBED_BATCH_SIZE", getattr(source, "EMBEDDING_BATCH_SIZE", 32)) or 32
@@ -244,7 +256,12 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434")  # Ollama server URL
     OLLAMA_API_KEY: Optional[str] = None
     OLLAMA_MODEL: str = Field(default=_DEFAULT_OLLAMA_LLM_MODEL)
+    OLLAMA_FALLBACK_MODEL: Optional[str] = None
     OLLAMA_TIMEOUT: int = 150  # 120-180s for phi3 with context (was 60s, causing timeouts)
+    OLLAMA_CONNECT_TIMEOUT: int = 10
+    OLLAMA_READ_TIMEOUT: int = 150
+    OLLAMA_WRITE_TIMEOUT: int = 30
+    OLLAMA_POOL_TIMEOUT: int = 30
     OLLAMA_EMBED_TIMEOUT: int = 150
     OLLAMA_EMBED_BATCH_SIZE: int = 48
     OLLAMA_MAX_CONCURRENT_REQUESTS: int = 2
@@ -274,6 +291,10 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 100
     CHUNK_MAX_TOKENS: int = 800
+    RAG_MAX_CONTEXT_CHUNKS: int = 4
+    RAG_MAX_CHUNK_CHARS: int = 1200
+    RAG_MAX_TOTAL_CONTEXT_CHARS: int = 4500
+    RAG_COMPACT_CONTEXT_CHARS: int = 2200
     
     # Connectors
     SLACK_CLIENT_ID: Optional[str] = None
