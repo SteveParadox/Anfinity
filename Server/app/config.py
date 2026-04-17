@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings
 
 
 _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
-_DEFAULT_OLLAMA_LLM_MODEL = "gpt-oss:20b-cloud"
+_DEFAULT_OLLAMA_LLM_MODEL = "phi3:mini"
 _DEFAULT_OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
 _DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 
@@ -68,13 +68,23 @@ def _normalize_provider(value: Optional[str], *, allowed: set[str], default: str
     provider = (value or default).strip().lower()
     return provider if provider in allowed else default
 
-
+"""
 def _normalize_ollama_base_url(value: Optional[str]) -> str:
     base_url = (value or _DEFAULT_OLLAMA_BASE_URL).strip().rstrip("/")
     if not base_url or base_url == "https://ollama.com":
         return _DEFAULT_OLLAMA_BASE_URL
     return base_url
+"""
+def _normalize_ollama_base_url(value: Optional[str]) -> str:
+    base_url = (value or _DEFAULT_OLLAMA_BASE_URL).strip().rstrip("/")
+    if not base_url:
+        return _DEFAULT_OLLAMA_BASE_URL
 
+    # Accept valid local or cloud endpoints
+    if base_url in {"https://ollama.com", "https://ollama.com/api"}:
+        return "https://ollama.com/api"
+
+    return base_url
 
 def _normalize_secret(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -316,6 +326,7 @@ class Settings(BaseSettings):
             self.JWT_SECRET = secrets.token_urlsafe(64)
         
         # Fix common misconfiguration: OLLAMA_BASE_URL pointing to public website
+        """
         if self.OLLAMA_BASE_URL == "https://ollama.com":
             import logging
             logger = logging.getLogger(__name__)
@@ -328,6 +339,9 @@ class Settings(BaseSettings):
                 "✓ Fixed OLLAMA_BASE_URL to 'http://localhost:11434'. "
                 "Please update your .env or environment variable to make this permanent."
             )
+        """
+        if self.OLLAMA_BASE_URL.rstrip("/") == "https://ollama.com":
+            self.OLLAMA_BASE_URL = "https://ollama.com/api"
 
     @property
     def ai_runtime(self) -> AIRuntimeConfig:
