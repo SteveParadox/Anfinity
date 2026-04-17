@@ -124,19 +124,20 @@ def generate_note_embedding(
         note.embedding = json.dumps(embedding_vector)
         note.updated_at = datetime.now(timezone.utc)
         try:
-            db.execute(
-                text(
-                    f"""
-                    UPDATE notes
-                    SET embedding_vector = CAST(:embedding AS vector({len(embedding_vector)}))
-                    WHERE id = :note_id
-                    """
-                ),
-                {
-                    "embedding": f"[{','.join(map(str, embedding_vector))}]",
-                    "note_id": note.id,
-                },
-            )
+            with db.begin_nested():
+                db.execute(
+                    text(
+                        f"""
+                        UPDATE notes
+                        SET embedding_vector = CAST(:embedding AS vector({len(embedding_vector)}))
+                        WHERE id = :note_id
+                        """
+                    ),
+                    {
+                        "embedding": f"[{','.join(map(str, embedding_vector))}]",
+                        "note_id": note.id,
+                    },
+                )
         except Exception as exc:
             logger.warning(
                 "Skipping embedding_vector sync for note %s (dim=%d): %s",

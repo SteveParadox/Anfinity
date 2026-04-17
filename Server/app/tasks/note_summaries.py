@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 # Minimum content length for summary generation.
 MIN_CONTENT_LENGTH = 100
+SUMMARY_CONTEXT_CHAR_LIMIT = 1500
+SUMMARY_CONTEXT_HEAD_CHARS = 1200
+SUMMARY_CONTEXT_TAIL_CHARS = 250
+SUMMARY_TIMEOUT_RETRY_BASE_SECONDS = 90
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +73,26 @@ def _build_summary_prompt(content_length: int) -> str:
     return (
         "Provide a 3-4 sentence summary of this note, highlighting the most important points. "
         "Organise as bullet points if there are multiple distinct topics."
+    )
+
+
+def _build_summary_context(content: str) -> str:
+    """Bound the amount of text sent to local summary generation.
+
+    Smaller local models are much more likely to stall on full-note payloads.
+    Keep the start and end of long notes so the model still sees the main topic
+    and the closing context.
+    """
+    normalized = (content or "").strip()
+    if len(normalized) <= SUMMARY_CONTEXT_CHAR_LIMIT:
+        return normalized
+
+    head = normalized[:SUMMARY_CONTEXT_HEAD_CHARS].rstrip()
+    tail = normalized[-SUMMARY_CONTEXT_TAIL_CHARS:].lstrip()
+    return (
+        f"{head}\n\n"
+        "[... middle omitted for summary generation due to note length ...]\n\n"
+        f"{tail}"
     )
 
 
@@ -144,14 +168,15 @@ def generate_note_summary(
         llm_service = get_llm_service(
             model=model,
             primary_provider="ollama",
+            use_fallback=False,
         )
         prompt = _build_summary_prompt(content_length)
 
         llm_response = llm_service.generate_answer(
             query=prompt,
-            context_chunks=[note.content],
+            context_chunks=[_build_summary_context(note.content)],
             temperature=0.3,
-            max_tokens=200,
+            max_tokens=160,
         )
 
         summary_text = llm_response.answer.strip()
@@ -185,7 +210,10 @@ def generate_note_summary(
             exc_info=True,
         )
         if self.request.retries < self.max_retries:
-            raise self.retry(exc=exc, countdown=300 * (2 ** self.request.retries))
+            countdown = 300 * (2 ** self.request.retries)
+            if "timed out" in str(exc).lower():
+                countdown = SUMMARY_TIMEOUT_RETRY_BASE_SECONDS * (2 ** self.request.retries)
+            raise self.retry(exc=exc, countdown=countdown)
 
         logger.error("Max retries exceeded for note %s", note_id)
         return {
