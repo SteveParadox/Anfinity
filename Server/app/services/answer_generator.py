@@ -860,17 +860,32 @@ class AnswerGenerator:
             metadata=dict(chunk.metadata or {}),
         )
 
+    def _display_source_title(self, chunk: RetrievedChunk) -> str:
+        title = (chunk.document_title or "").strip()
+        if title:
+            return title
+        if str(chunk.source_type or "").lower() == "note":
+            return "Untitled Note"
+        return "Untitled Document"
+
+    def _display_source_kind(self, chunk: RetrievedChunk) -> str:
+        source_type = str(chunk.source_type or "").lower()
+        if source_type == "note":
+            return "Note"
+        return "Document"
+
     def _build_context(self, chunks: List[RetrievedChunk], include_citations: bool) -> str:
         context_parts: List[str] = []
-        for i, chunk in enumerate(chunks, 1):
-            doc_ref = f"[Document {i}: {chunk.document_title}]"
+        for chunk in chunks:
+            doc_ref = f"[Source Title: {self._display_source_title(chunk)}]"
             metadata_str = f" (Relevance: {chunk.similarity:.1%})" if include_citations else ""
+            source_kind = self._display_source_kind(chunk)
             chunk_text = chunk.text
             if chunk.context_before:
                 chunk_text = f"...{chunk.context_before}\n\n{chunk_text}"
             if chunk.context_after:
                 chunk_text = f"{chunk_text}\n\n{chunk.context_after}..."
-            context_parts.append(f"{doc_ref}{metadata_str}\n{chunk_text}\n")
+            context_parts.append(f"{doc_ref}{metadata_str}\nSource Type: {source_kind}\n{chunk_text}\n")
         return "\n".join(context_parts)
 
     def _build_system_prompt(self, citation_style: str) -> str:
@@ -882,7 +897,8 @@ class AnswerGenerator:
             "2. Do NOT invent page numbers, sections, or document structure\n"
             "3. If asked about something not in the context, say: 'I cannot find this information in the provided documents'\n"
             "4. Never speculate or use outside knowledge\n"
-            "5. Reference sources by document title only"
+            "5. Reference sources by their exact saved title only\n"
+            "6. Do NOT refer to sources as 'Document 1', 'Document 2', or similar numbered placeholders"
         )
 
     def _build_user_prompt(self, query: str, context: str, chunks: List[RetrievedChunk]) -> str:
@@ -909,7 +925,7 @@ ANSWER:"""
             if chunk.document_id in seen_docs:
                 continue
             seen_docs.add(chunk.document_id)
-            sources.append(f"- {chunk.document_title}")
+            sources.append(f"- {self._display_source_title(chunk)} ({self._display_source_kind(chunk)})")
         return "\n".join(sources)
 
     def _extract_citations(self, chunks: List[RetrievedChunk], answer_text: str) -> List[Citation]:
