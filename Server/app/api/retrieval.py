@@ -31,6 +31,7 @@ class RetrievedChunkPayload(BaseModel):
     document_id: str
     similarity: float = Field(..., ge=0.0, le=1.0)
     text: str
+    source_kind: str
     source_type: str
     chunk_index: int = Field(..., ge=0)
     document_title: str
@@ -92,6 +93,7 @@ def _as_payloads(result: Any) -> List[RetrievedChunkPayload]:
             document_id=str(chunk.document_id),
             similarity=float(chunk.similarity),
             text=chunk.text,
+            source_kind="document",
             source_type=chunk.source_type,
             chunk_index=int(chunk.chunk_index),
             document_title=chunk.document_title,

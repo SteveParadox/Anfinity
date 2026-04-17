@@ -178,7 +178,7 @@ async def create_workspace(
         role=WorkspaceRole.OWNER
     )
     db.add(member)
-    await db.commit()
+    await db.flush()
     await db.refresh(workspace)
     
     # Initialize vector storage after the response so Qdrant latency/outages do
@@ -468,7 +468,7 @@ async def update_workspace(
     if workspace_data.description is not None:
         workspace.description = workspace_data.description
     
-    await db.commit()
+    await db.flush()
     await db.refresh(workspace)
     
     # Log audit event
@@ -556,7 +556,7 @@ async def upsert_workspace_permission_override(
     override.can_delete = override_data.can_delete
     override.can_manage = override_data.can_manage
 
-    await db.commit()
+    await db.flush()
     await db.refresh(override)
 
     logger = AuditLogger(db, context.user.id).with_request(request)
@@ -654,7 +654,7 @@ async def invite_member(
         role=invite_data.role
     )
     db.add(member)
-    await db.commit()
+    await db.flush()
     
     # Log audit event
     logger = AuditLogger(db, context.user.id).with_request(request)
@@ -767,7 +767,7 @@ async def remove_member(
         )
     
     await db.delete(member)
-    await db.commit()
+    await db.flush()
     
     # Log audit event
     logger = AuditLogger(db, context.user.id).with_request(request)
@@ -818,18 +818,22 @@ async def delete_workspace(
     except Exception:
         logger.warning("Workspace %s deleted but vector collection cleanup failed", workspace_id, exc_info=True)
     
-    # Delete workspace (cascades to members, documents, etc.)
-    await db.delete(workspace)
-    await db.commit()
-    
-    # Log audit event
+    # Audit with workspace_id=None so the audit row survives workspace deletion
+    # without depending on a soon-to-be-removed foreign key target.
     logger = AuditLogger(db, context.user.id).with_request(request)
     await logger.log(
         action=AuditAction.WORKSPACE_DELETED,
-        workspace_id=workspace_id,
+        workspace_id=None,
         entity_type=EntityType.WORKSPACE,
         entity_id=workspace_id,
-        metadata={"name": workspace.name}
+        metadata={
+            "name": workspace.name,
+            "deleted_workspace_id": str(workspace_id),
+        }
     )
+
+    # Delete workspace (cascades to members, documents, etc.)
+    await db.delete(workspace)
+    await db.flush()
     
     return {"message": "Workspace deleted successfully"}

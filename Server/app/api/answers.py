@@ -301,6 +301,7 @@ async def generate_answer(
             "document_title": chunk.document_title,
             "chunk_index": int(chunk.chunk_index),
             "similarity": round(float(chunk.similarity), 3),
+            "source_kind": str((chunk.metadata or {}).get("source_kind", "document")),
             "source_type": chunk.source_type,
         }
         for chunk in filtered_chunks

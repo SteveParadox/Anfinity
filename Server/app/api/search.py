@@ -65,6 +65,8 @@ class SemanticSearchResultPayload(BaseModel):
     document_id: str
     document_title: str
     content: str
+    source_kind: str
+    tags: List[str] = Field(default_factory=list)
     source_type: str
     chunk_index: int
     created_at: str
@@ -291,7 +293,7 @@ async def log_search_click(
         user=current_user,
         db=db,
         section=WorkspaceSection.SEARCH,
-        action="update",
+        action="create",
         context=workspace_ctx,
     )
 

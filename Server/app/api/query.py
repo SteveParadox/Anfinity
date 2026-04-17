@@ -16,8 +16,11 @@ from app.core.audit import AuditAction, AuditLogger, EntityType
 from app.core.auth import get_current_active_user, get_workspace_context
 from app.database.models import Answer, Chunk, Document, Feedback, Query, User as DBUser
 from app.database.session import get_db
-from app.services.llm_service import get_llm_service
+from app.services.answer_generator import RetrievedChunk as AnswerRetrievedChunk
+from app.services.answer_generator import get_answer_generator
 from app.services.rag_retriever import get_rag_retriever
+from app.services.retrieval_relevance import analyze_query_intent, summarize_relevance
+from app.services.semantic_search import get_semantic_search_service
 from app.tasks.embeddings import queue_embedding_task
 
 logger = logging.getLogger(__name__)
@@ -122,6 +125,7 @@ class Source(BaseModel):
     chunk_id: str
     document_id: str
     document_title: str
+    source_kind: str
     text: str
     similarity: float
 
@@ -166,6 +170,52 @@ def _confidence_factors_from_rag(rag_result) -> Dict[str, float]:
     }
 
 
+def _rounded_metric(value: Any) -> float:
+    return round(float(value or 0.0), 3)
+
+
+def _count_source_kinds(chunks: List[AnswerRetrievedChunk]) -> Dict[str, int]:
+    counts: Dict[str, int] = {"document": 0, "note": 0}
+    for chunk in chunks:
+        source_kind = str((chunk.metadata or {}).get("source_kind", "document")).lower()
+        if source_kind not in counts:
+            counts[source_kind] = 0
+        counts[source_kind] += 1
+    return counts
+
+
+def _confidence_factors_from_chunks(
+    chunks: List[AnswerRetrievedChunk],
+    confidence: float,
+    query: str = "",
+) -> Dict[str, float]:
+    similarities = [float(chunk.similarity or 0.0) for chunk in chunks]
+    unique_documents = len({str(chunk.document_id) for chunk in chunks})
+    average_similarity = sum(similarities) / len(similarities) if similarities else 0.0
+    evidence_summary = summarize_relevance(
+        query,
+        [
+            {
+                "text": chunk.text,
+                "title": chunk.document_title,
+                "metadata": chunk.metadata or {},
+                "source_type": chunk.source_type,
+            }
+            for chunk in chunks
+        ],
+    )
+    return {
+        "similarity_avg": round(average_similarity, 3),
+        "lexical_support": round(float(evidence_summary["avg_lexical_overlap"]), 3),
+        "domain_alignment": round(float(evidence_summary["avg_domain_alignment"]), 3),
+        "evidence_quality": round(float(evidence_summary["avg_evidence_score"]), 3),
+        "document_diversity": float(unique_documents),
+        "source_coverage": round(float(confidence or 0.0), 3),
+        "chunks_retrieved": float(len(chunks)),
+        "unique_documents": float(unique_documents),
+    }
+
+
 async def _hydrate_sources(
     db: AsyncSession,
     rag_chunks: List[Any],
@@ -201,11 +251,143 @@ async def _hydrate_sources(
                     chunk_id=str(chunk.id),
                     document_id=str(doc.id),
                     document_title=doc.title,
+                    source_kind="document",
                     text=preview,
                     similarity=round(float(retrieved.similarity), 3),
                 )
             )
     return sources, llm_chunks
+
+
+def _dedupe_source_records(records: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        key = (str(record.get("chunk_id", "")), str(record.get("document_id", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _merge_answer_chunks(
+    primary: List[AnswerRetrievedChunk],
+    secondary: List[AnswerRetrievedChunk],
+    limit: int,
+) -> List[AnswerRetrievedChunk]:
+    merged: List[AnswerRetrievedChunk] = []
+    seen: set[tuple[str, str]] = set()
+    for chunk in sorted([*primary, *secondary], key=lambda item: float(item.similarity or 0.0), reverse=True):
+        key = (str(chunk.chunk_id), str(chunk.document_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(chunk)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _semantic_results_to_answer_chunks(results: List[Any]) -> tuple[List[AnswerRetrievedChunk], List[Source]]:
+    answer_chunks: List[AnswerRetrievedChunk] = []
+    sources: List[Source] = []
+
+    for result in results:
+        text = (getattr(result, "content", "") or "").strip()
+        if not text:
+            continue
+
+        similarity = float(
+            getattr(result, "final_score", 0.0)
+            or getattr(result, "similarity_score", 0.0)
+            or 0.0
+        )
+        preview = (
+            getattr(result, "highlight", "")
+            or text[:400] + ("..." if len(text) > 400 else "")
+        )
+        metadata = {
+            "semantic_result": True,
+            "source_kind": str(getattr(result, "source_kind", "note")),
+            "tags": list(getattr(result, "tags", []) or []),
+            "created_at": getattr(result, "created_at", None).isoformat()
+            if getattr(result, "created_at", None)
+            else None,
+            "final_score": float(getattr(result, "final_score", 0.0) or 0.0),
+        }
+
+        answer_chunks.append(
+            AnswerRetrievedChunk(
+                chunk_id=str(getattr(result, "chunk_id")),
+                document_id=str(getattr(result, "document_id")),
+                similarity=similarity,
+                text=text,
+                source_type=str(getattr(result, "source_type", "note")),
+                chunk_index=int(getattr(result, "chunk_index", 0) or 0),
+                document_title=str(getattr(result, "document_title", "") or "Untitled"),
+                token_count=max(len(text.split()), 0),
+                metadata=metadata,
+            )
+        )
+        sources.append(
+            Source(
+                chunk_id=str(getattr(result, "chunk_id")),
+                document_id=str(getattr(result, "document_id")),
+                document_title=str(getattr(result, "document_title", "") or "Untitled"),
+                source_kind=str(getattr(result, "source_kind", "note")),
+                text=preview,
+                similarity=round(similarity, 3),
+            )
+        )
+
+    return answer_chunks, sources
+
+
+def _source_models_to_payload(sources: List[Source]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "chunk_id": source.chunk_id,
+            "document_id": source.document_id,
+            "document_title": source.document_title,
+            "source_kind": source.source_kind,
+            "similarity": source.similarity,
+            "text": source.text,
+        }
+        for source in sources
+    ]
+
+
+def _is_reliable_evidence(query: str, chunks: List[AnswerRetrievedChunk]) -> tuple[bool, Dict[str, float]]:
+    intent = analyze_query_intent(query)
+    summary = summarize_relevance(
+        query,
+        [
+            {
+                "text": chunk.text,
+                "title": chunk.document_title,
+                "metadata": chunk.metadata or {},
+                "source_type": chunk.source_type,
+            }
+            for chunk in chunks
+        ],
+    )
+
+    reliable = bool(chunks)
+    if summary["off_topic_ratio"] > 0.0:
+        reliable = False
+    elif intent.is_domain_specific:
+        reliable = (
+            summary["top_evidence_score"] >= 0.24
+            and summary["avg_domain_alignment"] >= 0.14
+            and summary["avg_evidence_score"] >= 0.18
+        )
+    else:
+        reliable = summary["top_evidence_score"] >= 0.18 and summary["avg_evidence_score"] >= 0.14
+
+    return reliable, summary
 
 
 @router.post("", response_model=QueryResponse)
@@ -241,7 +423,7 @@ async def query(
 
     try:
         vec_start = time.time()
-        retriever = get_rag_retriever(similarity_threshold=0.5, top_k=query_request.top_k)
+        retriever = get_rag_retriever(similarity_threshold=0.45, top_k=query_request.top_k)
         rag_result = await asyncio.to_thread(
             retriever.retrieve,
             query=query_request.query,
@@ -250,72 +432,180 @@ async def query(
         )
         step_times["vector_search"] = (time.time() - vec_start) * 1000
 
+        # Log the similarity scores of retrieved chunks for debugging
+        if rag_result.chunks:
+            chunk_scores = [
+                {"index": i, "similarity": round(float(chunk.similarity or 0.0), 3), "title": chunk.document_title}
+                for i, chunk in enumerate(rag_result.chunks[:10])
+            ]
+            logger.info(f"Query {query_record.id}: Retrieved {len(rag_result.chunks)} chunks, top 10 similarities: {chunk_scores}")
+            logger.info(f"Query {query_record.id}: Confidence: {rag_result.confidence}, Avg similarity: {round(sum(float(c.similarity or 0) for c in rag_result.chunks) / len(rag_result.chunks), 3) if rag_result.chunks else 0}")
+
         confidence = float(rag_result.confidence or 0.0)
-        factors = _confidence_factors_from_rag(rag_result)
         answer_text = NO_EVIDENCE_MESSAGE
         tokens_used = 0
         model_used = query_request.model or settings.OLLAMA_MODEL
-        sources, llm_chunks = await _hydrate_sources(db, rag_result.chunks, query_request.include_sources)
+        sources, _ = await _hydrate_sources(db, rag_result.chunks, query_request.include_sources)
+        evidence_summary: Dict[str, float] = {}
+        reliable_evidence = False
+        note_search_strategy: Optional[str] = None
+        candidate_chunk_count = 0
+        candidate_source_kind_counts: Dict[str, int] = {"document": 0, "note": 0}
 
-        # FIX: Minimum confidence cutoff - if confidence too low, return NO_ANSWER state with empty sources
-        MIN_CONFIDENCE_THRESHOLD = 0.35  # 35% minimum to trust retrieval
-        retrieval_is_reliable = bool(rag_result.chunks) and confidence >= MIN_CONFIDENCE_THRESHOLD and llm_chunks
-        if retrieval_is_reliable:
-            llm_service = get_llm_service(
+        answer_chunks = [
+            AnswerRetrievedChunk(
+                chunk_id=str(chunk.chunk_id),
+                document_id=str(chunk.document_id),
+                similarity=float(chunk.similarity or 0.0),
+                text=chunk.text,
+                source_type=chunk.source_type,
+                chunk_index=int(chunk.chunk_index or 0),
+                document_title=chunk.document_title or "Untitled Document",
+                token_count=int(getattr(chunk, "token_count", 0) or 0),
+                context_before=getattr(chunk, "context_before", None),
+                context_after=getattr(chunk, "context_after", None),
+                metadata={
+                    **(getattr(chunk, "metadata", None) or {}),
+                    "source_kind": "document",
+                },
+            )
+            for chunk in rag_result.chunks
+            if (chunk.text or "").strip()
+        ]
+
+        if query_request.top_k > 0:
+            semantic_start = time.time()
+            try:
+                semantic_execution = await get_semantic_search_service().search(
+                    workspace_id=query_request.workspace_id,
+                    user_id=current_user.id,
+                    query=query_request.query,
+                    limit=query_request.top_k,
+                    db=db,
+                    log_execution=False,
+                    include_postgresql=True,
+                    include_retriever=False,
+                )
+                note_search_strategy = semantic_execution.strategy
+                semantic_chunks, semantic_sources = _semantic_results_to_answer_chunks(semantic_execution.results)
+                if semantic_chunks:
+                    answer_chunks = _merge_answer_chunks(answer_chunks, semantic_chunks, query_request.top_k)
+                    merged_source_payloads = _dedupe_source_records(
+                        [
+                            *_source_models_to_payload(sources),
+                            *_source_models_to_payload(semantic_sources),
+                        ],
+                        query_request.top_k,
+                    )
+                    if query_request.include_sources:
+                        sources = [Source(**payload) for payload in merged_source_payloads]
+                    if semantic_execution.results:
+                        top_semantic_scores = [
+                            float(
+                                getattr(result, "final_score", 0.0)
+                                or getattr(result, "similarity_score", 0.0)
+                                or 0.0
+                            )
+                            for result in semantic_execution.results[:3]
+                        ]
+                        if top_semantic_scores:
+                            confidence = max(confidence, sum(top_semantic_scores) / len(top_semantic_scores))
+            except Exception as exc:
+                logger.warning("Query %s: semantic fallback unavailable: %s", query_record.id, exc)
+            finally:
+                step_times["semantic_fallback"] = (time.time() - semantic_start) * 1000
+
+        candidate_chunk_count = len(answer_chunks)
+        candidate_source_kind_counts = _count_source_kinds(answer_chunks)
+        reliable_evidence, evidence_summary = _is_reliable_evidence(query_request.query, answer_chunks)
+        if not reliable_evidence:
+            answer_chunks = []
+            sources = []
+            confidence = min(confidence, evidence_summary.get("top_evidence_score", 0.0) * 0.4)
+
+        factors = _confidence_factors_from_chunks(answer_chunks, confidence, query_request.query)
+
+        final_sources = []
+        source_kind_by_chunk_id = {
+            str(chunk.chunk_id): str((chunk.metadata or {}).get("source_kind", "document"))
+            for chunk in answer_chunks
+        }
+        if answer_chunks:
+            answer_generator = get_answer_generator(
                 model=query_request.model,
-                primary_provider="ollama",
+                similarity_threshold=0.45,
+                min_unique_documents=1,
+                detect_conflicts=True,
+                ollama_timeout=int(float(getattr(settings, "OLLAMA_TIMEOUT", 180) or 180)),
             )
             llm_start = time.time()
             try:
-                llm_response = await asyncio.wait_for(
-                    llm_service.async_generate_answer(
-                        query=query_request.query,
-                        context_chunks=llm_chunks[:4],
-                        temperature=settings.LLM_TEMPERATURE,
-                        max_tokens=min(settings.LLM_MAX_TOKENS, 700),
-                    ),
-                    timeout=float(getattr(settings, "OLLAMA_TIMEOUT", 180) or 180),
+                generated_answer = await answer_generator.generate(
+                    query=query_request.query,
+                    chunks=answer_chunks,
+                    include_citations=query_request.include_sources,
+                    citation_style="inline",
+                    top_k=query_request.top_k,
                 )
-                answer_text = llm_response.answer.strip() or NO_EVIDENCE_MESSAGE
-                tokens_used = int(llm_response.tokens_used or 0)
-                model_used = llm_response.model or model_used
-            except asyncio.TimeoutError:
-                logger.warning("Query %s: LLM timed out", query_record.id)
-                answer_text = "I found relevant documents, but the response generator timed out before it could finish."
-                confidence = min(confidence, 0.2)
+                answer_text = generated_answer.answer_text.strip() or NO_EVIDENCE_MESSAGE
+                tokens_used = int(generated_answer.tokens_used or 0)
+                model_used = generated_answer.model_used or model_used
+                confidence = max(0.0, min(float(generated_answer.confidence_score or 0.0) / 100.0, 1.0))
+
+                if query_request.include_sources:
+                    if generated_answer.citations:
+                        final_sources = [
+                            {
+                                "chunk_id": citation.chunk_id,
+                                "document_id": citation.document_id,
+                                "document_title": citation.document_title,
+                                "source_kind": source_kind_by_chunk_id.get(str(citation.chunk_id), "document"),
+                                "similarity": round(float(citation.similarity), 3),
+                                "text": citation.text_snippet,
+                            }
+                            for citation in generated_answer.citations
+                        ]
+                    else:
+                        final_sources = [
+                            {
+                                "chunk_id": source.chunk_id,
+                                "document_id": source.document_id,
+                                "document_title": source.document_title,
+                                "source_kind": source.source_kind,
+                                "similarity": source.similarity,
+                                "text": source.text,
+                            }
+                            for source in sources
+                        ]
             except Exception as exc:
-                logger.error("Query %s: LLM error: %s", query_record.id, exc, exc_info=True)
+                logger.error("Query %s: answer generation error: %s", query_record.id, exc, exc_info=True)
                 answer_text = "I found relevant documents, but I couldn't generate a grounded answer from them."
-                confidence = min(confidence, 0.2)
+                confidence = min(max(confidence, 0.1), 0.4)
+                final_sources = [
+                    {
+                        "chunk_id": source.chunk_id,
+                        "document_id": source.document_id,
+                        "document_title": source.document_title,
+                        "source_kind": source.source_kind,
+                        "similarity": source.similarity,
+                        "text": source.text,
+                    }
+                    for source in sources
+                ] if query_request.include_sources else []
             finally:
                 step_times["llm_response"] = (time.time() - llm_start) * 1000
-        else:
-            confidence = 0.0 if not rag_result.chunks else min(confidence, 0.25)
 
-        # FIX: NO ANSWER state - if confidence too low, return no sources
-        # This prevents showing unreliable chunks that might contain incorrect info
-        final_sources = []
-        if confidence >= MIN_CONFIDENCE_THRESHOLD and retrieval_is_reliable:
-            final_sources = [
-                {
-                    "chunk_id": source.chunk_id,
-                    "document_id": source.document_id,
-                    "document_title": source.document_title,
-                    "similarity": source.similarity,
-                }
-                for source in sources
-            ]
-        else:
-            # Low confidence: return empty sources and reset answer to generic message
-            confidence = 0.0
-            answer_text = NO_EVIDENCE_MESSAGE
-
-        # RULE 1: Kill confidence when no answer
-        # If we're returning NO_EVIDENCE_MESSAGE, ALWAYS force confidence to 0.0 and sources to []
-        # No negotiation. No debate.
         if answer_text == NO_EVIDENCE_MESSAGE:
-            confidence = 0.0
-            final_sources = []
+            if reliable_evidence and query_request.include_sources and sources:
+                answer_text = (
+                    "I found relevant source material, but I couldn't produce a confident grounded "
+                    "synthesis. Review the cited sources below."
+                )
+                confidence = min(max(confidence, 0.15), 0.35)
+                final_sources = _source_models_to_payload(sources)
+            else:
+                confidence = 0.0
+                final_sources = []
 
         answer = Answer(
             query_id=query_record.id,
@@ -339,8 +629,18 @@ async def query(
             metadata={
                 "query": query_request.query[:500],
                 "answer_id": str(answer.id),
-                "confidence": round(confidence, 3),
+                "confidence": _rounded_metric(confidence),
                 "chunks_retrieved": len(rag_result.chunks),
+                "candidate_chunks_considered": candidate_chunk_count,
+                "candidate_source_kinds": candidate_source_kind_counts,
+                "note_search_strategy": note_search_strategy,
+                "reliable_evidence": reliable_evidence,
+                "avg_lexical_overlap": _rounded_metric(evidence_summary.get("avg_lexical_overlap")),
+                "avg_domain_alignment": _rounded_metric(evidence_summary.get("avg_domain_alignment")),
+                "avg_evidence_score": _rounded_metric(evidence_summary.get("avg_evidence_score")),
+                "top_evidence_score": _rounded_metric(evidence_summary.get("top_evidence_score")),
+                "off_topic_ratio": _rounded_metric(evidence_summary.get("off_topic_ratio")),
+                "sources_returned": len(final_sources),
                 "timings_ms": {k: round(v, 1) for k, v in step_times.items()},
                 "client_ip": request.client.host if request.client else None,
             },

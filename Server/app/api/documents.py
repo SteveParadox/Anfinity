@@ -15,6 +15,7 @@ from app.database.models import Document, Chunk, DocumentStatus, SourceType, Emb
 from app.core.auth import get_current_active_user
 from app.core.audit import AuditLogger, AuditAction, EntityType
 from app.core.permissions import ensure_workspace_permission
+from app.services.graph_service import get_graph_service
 from app.storage.s3 import s3_client
 from app.tasks.worker import process_document, delete_document_vectors
 
@@ -163,7 +164,7 @@ async def upload_document(
     )
 
     db.add(document)
-    await db.commit()
+    await db.flush()
     await db.refresh(document)
     logger.info(f"📋 [DOCUMENT CREATED] Document {document.id} created in workspace {workspace_id}")
 
@@ -194,8 +195,7 @@ async def upload_document(
             ),
         )
     except Exception as exc:
-        await db.delete(document)
-        await db.commit()
+        await db.rollback()
         logger.error(
             "S3 upload failed for document %s: %s", document.id, exc, exc_info=True
         )
@@ -225,6 +225,8 @@ async def upload_document(
         )
     except Exception as exc:
         logger.warning("Audit log failed for document %s: %s", document.id, exc)
+
+    await db.commit()
 
     storage_url = s3_client.generate_presigned_url(storage_path, expiration=3600)
 
@@ -272,9 +274,11 @@ async def list_documents(
     if status_filter:
         query = query.where(Document.status == status_filter)
 
-    count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
-    )
+    count_query = select(func.count(Document.id)).where(Document.workspace_id == workspace_id)
+    if status_filter:
+        count_query = count_query.where(Document.status == status_filter)
+
+    count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
 
     query = (
@@ -474,6 +478,7 @@ async def delete_document(
         await db.execute(delete(Embedding).where(Embedding.chunk_id.in_(chunk_ids)))
 
     await db.execute(delete(IngestionLog).where(IngestionLog.document_id == document.id))
+    await get_graph_service().remove_document_from_graph(db, document.workspace_id, document.id)
     await db.execute(delete(Chunk).where(Chunk.document_id == document.id))
     await db.delete(document)
     await db.commit()

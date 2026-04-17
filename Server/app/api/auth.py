@@ -190,7 +190,7 @@ async def register(
         role=WorkspaceRole.OWNER
     )
     db.add(owner_member)
-    await db.commit()
+    await db.flush()
     await db.refresh(user)
     await db.refresh(default_workspace)
 
@@ -422,7 +422,7 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc)
         ) from exc
-    await db.commit()
+    await db.flush()
     
     # Log audit event
     await log_audit_event(
@@ -534,7 +534,7 @@ async def invite_member(
             role=role
         )
         db.add(member)
-        await db.commit()
+        await db.flush()
         
         return {
             "message": f"User invited to workspace",

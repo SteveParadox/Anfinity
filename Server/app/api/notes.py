@@ -587,9 +587,9 @@ async def sync_note_search_index_by_id(note_id: UUID) -> None:
 async def sync_note_graph(db: AsyncSession, note: Note) -> None:
     """Best-effort graph sync that never blocks note persistence."""
     try:
-        await get_graph_service().sync_note_to_graph(db, note)
+        async with db.begin_nested():
+            await get_graph_service().sync_note_to_graph(db, note)
     except Exception as exc:
-        await db.rollback()
         logger.warning("Skipping graph sync for note %s in workspace %s: %s", note.id, note.workspace_id, exc)
 
 
@@ -611,9 +611,9 @@ async def sync_note_graph_by_id(note_id: UUID) -> None:
 async def remove_note_graph(db: AsyncSession, workspace_id: UUID, note_id: UUID) -> None:
     """Best-effort graph cleanup that never blocks note deletion."""
     try:
-        await get_graph_service().remove_note_from_graph(db, workspace_id, note_id)
+        async with db.begin_nested():
+            await get_graph_service().remove_note_from_graph(db, workspace_id, note_id)
     except Exception as exc:
-        await db.rollback()
         logger.warning("Skipping graph cleanup for note %s in workspace %s: %s", note_id, workspace_id, exc)
 
 
@@ -664,7 +664,6 @@ async def safe_log_note_audit(
             db=db,
         )
     except Exception as exc:
-        await db.rollback()
         logger.warning("Skipping audit log for note %s action %s: %s", note_id, action.value, exc)
 
 
@@ -732,40 +731,35 @@ async def create_note(
     
     db.add(new_note)
     await db.flush()
-    
-    await db.commit()
-    persisted_note_result = await db.execute(
-        select(Note).where(Note.id == new_note.id)
-    )
-    persisted_note = persisted_note_result.scalar_one_or_none() or new_note
+    await db.refresh(new_note)
     created_version = await create_note_version_snapshot(
         db,
-        note=persisted_note,
+        note=new_note,
         user_id=current_user.id,
         change_reason="created",
         extra_metadata={"trigger": "create_note"},
     )
-    if created_version is not None:
-        await db.commit()
     await safe_log_note_audit(
         db,
         current_user_id=current_user.id,
         workspace_id=workspace_id,
-        note_id=persisted_note.id,
+        note_id=new_note.id,
         action=AuditAction.NOTE_CREATED,
     )
+    await db.commit()
+    await db.refresh(new_note)
 
     # Queue post-create enrichment after the response so the control-plane note
     # save stays fast and a downstream service issue does not fail note creation.
-    background_tasks.add_task(sync_note_graph_by_id, persisted_note.id)
-    background_tasks.add_task(sync_note_search_index_by_id, persisted_note.id)
-    background_tasks.add_task(queue_note_embedding, str(persisted_note.id))
-    background_tasks.add_task(queue_note_connection_suggestions, str(persisted_note.id))
+    background_tasks.add_task(sync_note_graph_by_id, new_note.id)
+    background_tasks.add_task(sync_note_search_index_by_id, new_note.id)
+    background_tasks.add_task(queue_note_embedding, str(new_note.id))
+    background_tasks.add_task(queue_note_connection_suggestions, str(new_note.id))
 
     if len(note_data.content.split()) > 20:
-        background_tasks.add_task(queue_note_summary, str(persisted_note.id))
+        background_tasks.add_task(queue_note_summary, str(new_note.id))
     
-    return serialize_note(persisted_note)
+    return serialize_note(new_note)
 
 
 @router.get("", response_model=NoteListResponse)
@@ -971,9 +965,7 @@ async def restore_note_version(
     note.word_count = version.word_count or calculate_word_count(version.content)
     note.updated_at = datetime.now(timezone.utc)
 
-    await db.commit()
-    refreshed_result = await db.execute(select(Note).where(Note.id == note.id))
-    note = refreshed_result.scalar_one_or_none() or note
+    await db.flush()
 
     restored_snapshot = await create_note_version_snapshot(
         db,
@@ -986,8 +978,6 @@ async def restore_note_version(
             "restored_from_version_number": version.version_number,
         },
     )
-    if restored_snapshot is not None:
-        await db.commit()
 
     await safe_log_note_audit(
         db,
@@ -996,6 +986,8 @@ async def restore_note_version(
         note_id=note.id,
         action=AuditAction.NOTE_UPDATED,
     )
+    await db.commit()
+    await db.refresh(note)
     background_tasks.add_task(sync_note_graph_by_id, note.id)
     background_tasks.add_task(sync_note_search_index_by_id, note.id)
     background_tasks.add_task(queue_note_embedding, str(note.id))
@@ -1072,9 +1064,7 @@ async def update_note(
 
     note.updated_at = datetime.now(timezone.utc)
     
-    await db.commit()
-    refreshed_result = await db.execute(select(Note).where(Note.id == note.id))
-    note = refreshed_result.scalar_one_or_none() or note
+    await db.flush()
     created_version = await create_note_version_snapshot(
         db,
         note=note,
@@ -1082,8 +1072,6 @@ async def update_note(
         change_reason="updated",
         extra_metadata={"trigger": "update_note"},
     )
-    if created_version is not None:
-        await db.commit()
     await safe_log_note_audit(
         db,
         current_user_id=current_user.id,
@@ -1091,6 +1079,8 @@ async def update_note(
         note_id=note.id,
         action=AuditAction.NOTE_UPDATED,
     )
+    await db.commit()
+    await db.refresh(note)
     background_tasks.add_task(sync_note_graph_by_id, note.id)
     
     # Queue background tasks if content changed
@@ -1138,9 +1128,10 @@ async def delete_note(
     
     workspace_id = note.workspace_id
     await db.delete(note)
-    await db.commit()
+    await db.flush()
     if workspace_id:
         await remove_note_graph(db, workspace_id, note.id)
+    await db.commit()
 
 
 @router.get("/{note_id}/connection-suggestions", response_model=List[ConnectionSuggestionResponse])
@@ -1179,6 +1170,7 @@ async def list_connection_suggestions(
 async def confirm_connection_suggestion(
     note_id: str,
     suggestion_id: str,
+    background_tasks: BackgroundTasks,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1238,11 +1230,12 @@ async def confirm_connection_suggestion(
         reverse_suggestion.responded_by = current_user.id
         reverse_suggestion.responded_at = datetime.utcnow()
 
-    await db.commit()
+    await db.flush()
     await sync_note_graph(db, source_note)
     await sync_note_graph(db, target_note)
-    queue_note_connection_suggestions(str(source_note.id))
-    queue_note_connection_suggestions(str(target_note.id))
+    await db.commit()
+    background_tasks.add_task(queue_note_connection_suggestions, str(source_note.id))
+    background_tasks.add_task(queue_note_connection_suggestions, str(target_note.id))
 
     return ConnectionSuggestionActionResponse(
         success=True,
@@ -1289,6 +1282,7 @@ async def dismiss_connection_suggestion(
     suggestion.status = "dismissed"
     suggestion.responded_by = current_user.id
     suggestion.responded_at = datetime.utcnow()
+    await db.flush()
     await db.commit()
 
     return ConnectionSuggestionActionResponse(
