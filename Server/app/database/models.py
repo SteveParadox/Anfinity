@@ -15,6 +15,11 @@ from sqlalchemy.sql import func
 Base = declarative_base()
 
 
+def _enum_values(enum_cls):
+    """Persist enum values in PostgreSQL instead of Python enum member names."""
+    return [member.value for member in enum_cls]
+
+
 class DocumentStatus(str, PyEnum):
     """Document processing status."""
     PENDING = "pending"
@@ -68,6 +73,7 @@ class GraphNodeType(str, PyEnum):
 
     WORKSPACE = "workspace"
     NOTE = "note"
+    DOCUMENT = "document"
     ENTITY = "entity"
     TAG = "tag"
 
@@ -76,12 +82,30 @@ class GraphEdgeType(str, PyEnum):
     """Knowledge graph edge types."""
 
     WORKSPACE_CONTAINS_NOTE = "workspace_contains_note"
+    WORKSPACE_CONTAINS_DOCUMENT = "workspace_contains_document"
     NOTE_MENTIONS_ENTITY = "note_mentions_entity"
     NOTE_HAS_TAG = "note_has_tag"
     NOTE_LINKS_NOTE = "note_links_note"
     NOTE_RELATED_NOTE = "note_related_note"
+    DOCUMENT_MENTIONS_ENTITY = "document_mentions_entity"
+    DOCUMENT_HAS_TAG = "document_has_tag"
     ENTITY_CO_OCCURS_WITH_ENTITY = "entity_co_occurs_with_entity"
     TAG_CO_OCCURS_WITH_TAG = "tag_co_occurs_with_tag"
+
+
+graph_node_type_enum = Enum(
+    GraphNodeType,
+    name="graphnodetype",
+    values_callable=_enum_values,
+    validate_strings=True,
+)
+
+graph_edge_type_enum = Enum(
+    GraphEdgeType,
+    name="graphedgetype",
+    values_callable=_enum_values,
+    validate_strings=True,
+)
 
 
 class Workspace(Base):
@@ -604,7 +628,7 @@ class GraphNode(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
-    node_type = Column(Enum(GraphNodeType), nullable=False, index=True)
+    node_type = Column(graph_node_type_enum, nullable=False, index=True)
     external_id = Column(String(255), nullable=False)
     label = Column(String(500), nullable=False)
     normalized_label = Column(String(500), nullable=False, index=True)
@@ -627,7 +651,7 @@ class GraphEdge(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
-    edge_type = Column(Enum(GraphEdgeType), nullable=False, index=True)
+    edge_type = Column(graph_edge_type_enum, nullable=False, index=True)
     source_node_id = Column(UUID(as_uuid=True), ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
     target_node_id = Column(UUID(as_uuid=True), ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
     weight = Column(Float, nullable=False, default=1.0)

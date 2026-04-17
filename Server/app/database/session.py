@@ -68,6 +68,13 @@ SyncSessionLocal = sessionmaker(
 SessionLocal = SyncSessionLocal
 
 
+def get_session_info(db: AsyncSession | Session) -> dict:
+    """Return the mutable session info store for async or sync sessions."""
+    if isinstance(db, AsyncSession):
+        return db.sync_session.info
+    return db.info
+
+
 @event.listens_for(Session, "after_begin")
 def _apply_session_security_context(session: Session, transaction, connection) -> None:
     current_user_id = session.info.get("app_current_user_id")
@@ -85,23 +92,16 @@ def _apply_session_security_context(session: Session, transaction, connection) -
 
 
 def bind_db_user_context(db: AsyncSession | Session, user_id) -> None:
-    if isinstance(db, AsyncSession):
-        db.sync_session.info["app_current_user_id"] = str(user_id)
-        db.sync_session.info["app_rls_bypass"] = False
-        return
-    db.info["app_current_user_id"] = str(user_id)
-    db.info["app_rls_bypass"] = False
+    session_info = get_session_info(db)
+    session_info["app_current_user_id"] = str(user_id)
+    session_info["app_rls_bypass"] = False
 
 
 def bind_db_rls_bypass(db: AsyncSession | Session, enabled: bool = True) -> None:
-    if isinstance(db, AsyncSession):
-        db.sync_session.info["app_rls_bypass"] = enabled
-        if enabled:
-            db.sync_session.info.pop("app_current_user_id", None)
-        return
-    db.info["app_rls_bypass"] = enabled
+    session_info = get_session_info(db)
+    session_info["app_rls_bypass"] = enabled
     if enabled:
-        db.info.pop("app_current_user_id", None)
+        session_info.pop("app_current_user_id", None)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
