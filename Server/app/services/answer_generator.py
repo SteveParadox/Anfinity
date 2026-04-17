@@ -153,6 +153,14 @@ class AnswerGenerator:
         self.ollama_base_url = (
             ollama_base_url or getattr(ollama_runtime, "base_url", getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"))
         ).rstrip("/")
+        configured_fallback_model = (
+            getattr(ollama_runtime, "fallback_model", None)
+            or getattr(settings, "OLLAMA_FALLBACK_MODEL", None)
+            or None
+        )
+        self.ollama_fallback_model = configured_fallback_model or (
+            "phi3:mini" if self.model != "phi3:mini" else self.model
+        )
         self.similarity_threshold = similarity_threshold
         self.min_unique_documents = min_unique_documents
         self.detect_conflicts = detect_conflicts
@@ -161,8 +169,29 @@ class AnswerGenerator:
             "timeout",
             getattr(settings, "OLLAMA_TIMEOUT", 150),
         )
+        self.ollama_connect_timeout = float(
+            getattr(ollama_runtime, "connect_timeout", getattr(settings, "OLLAMA_CONNECT_TIMEOUT", 10)) or 10
+        )
+        self.ollama_read_timeout = float(
+            getattr(ollama_runtime, "read_timeout", getattr(settings, "OLLAMA_READ_TIMEOUT", self.ollama_timeout))
+            or self.ollama_timeout
+        )
+        self.ollama_write_timeout = float(
+            getattr(ollama_runtime, "write_timeout", getattr(settings, "OLLAMA_WRITE_TIMEOUT", 30)) or 30
+        )
+        self.ollama_pool_timeout = float(
+            getattr(ollama_runtime, "pool_timeout", getattr(settings, "OLLAMA_POOL_TIMEOUT", 30)) or 30
+        )
         self.max_context_chunks = min(4, max(2, getattr(settings, "RAG_MAX_CONTEXT_CHUNKS", 4)))
         self.max_chunk_chars = max(600, getattr(settings, "RAG_MAX_CHUNK_CHARS", 1200))
+        self.max_total_context_chars = max(
+            self.max_chunk_chars,
+            int(getattr(settings, "RAG_MAX_TOTAL_CONTEXT_CHARS", self.max_context_chunks * self.max_chunk_chars) or (self.max_context_chunks * self.max_chunk_chars)),
+        )
+        self.compact_context_chars = max(
+            max(1200, self.max_chunk_chars),
+            int(getattr(settings, "RAG_COMPACT_CONTEXT_CHARS", max(2200, self.max_total_context_chars // 2)) or max(2200, self.max_total_context_chars // 2)),
+        )
         self.min_answer_confidence = float(getattr(settings, "RAG_MIN_ANSWER_CONFIDENCE", 45.0))
 
         self.cross_checker = RetrievalCrossChecker(
@@ -172,10 +201,14 @@ class AnswerGenerator:
         )
 
         logger.info(
-            "AnswerGenerator initialized: model=%s url=%s timeout=%ss threshold=%.2f",
+            "AnswerGenerator initialized: model=%s fallback_model=%s url=%s timeouts(connect=%.1fs, read=%.1fs, write=%.1fs, pool=%.1fs) threshold=%.2f",
             self.model,
+            self.ollama_fallback_model,
             self.ollama_base_url,
-            self.ollama_timeout,
+            self.ollama_connect_timeout,
+            self.ollama_read_timeout,
+            self.ollama_write_timeout,
+            self.ollama_pool_timeout,
             self.similarity_threshold,
         )
 
@@ -220,7 +253,7 @@ class AnswerGenerator:
                     quality_check=quality_check,
                 )
 
-        filtered_chunks = self._trim_chunks_for_context(filtered_chunks)
+        filtered_chunks = self._select_chunks_for_generation(query, filtered_chunks)
 
         if not filtered_chunks:
             generation_time_ms = (time.time() - start_time) * 1000
@@ -235,7 +268,40 @@ class AnswerGenerator:
         system_prompt = self._build_system_prompt(citation_style)
         user_prompt = self._build_user_prompt(query, context, filtered_chunks)
 
-        answer_text, tokens_used, model_used = await self._call_llm(system_prompt, user_prompt)
+        try:
+            answer_text, tokens_used, model_used = await self._call_llm(system_prompt, user_prompt)
+        except Exception as exc:
+            logger.warning("Primary Ollama generation failed, retrying with compact context: %s", exc)
+            compact_chunks = self._select_chunks_for_generation(query, filtered_chunks, compact=True)
+            compact_context = self._build_context(compact_chunks, include_citations)
+            compact_user_prompt = self._build_user_prompt(query, compact_context, compact_chunks)
+            try:
+                answer_text, tokens_used, model_used = await self._call_llm(
+                    system_prompt,
+                    compact_user_prompt,
+                    model_override=self.ollama_fallback_model,
+                    max_tokens_override=max(250, int(self.max_tokens * 0.6)),
+                    num_ctx_override=max(1536, self.max_context_chunks * 768),
+                )
+                filtered_chunks = compact_chunks
+                quality_check.filtered_chunks = compact_chunks
+                quality_check.high_quality_chunks = len(compact_chunks)
+                quality_check.low_quality_chunks = max(0, len(chunks) - len(compact_chunks))
+                quality_check.fallback_used = True
+                quality_check.fallback_reason = "compact_llm_retry"
+            except Exception as retry_exc:
+                logger.warning(
+                    "Compact Ollama retry failed, using extractive grounded fallback: %s",
+                    retry_exc,
+                )
+                return self._build_extractive_grounded_answer(
+                    query=query,
+                    chunks=filtered_chunks,
+                    quality_check=quality_check,
+                    top_k=top_k,
+                    include_citations=include_citations,
+                    llm_error=retry_exc,
+                )
 
         citations = self._extract_citations(filtered_chunks, answer_text) if include_citations else []
         cross_doc_agreement_score = self._calculate_cross_doc_agreement(filtered_chunks, quality_check)
@@ -263,6 +329,7 @@ class AnswerGenerator:
             "model": model_used,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "context_chars": len(context),
             "quality_issues_found": len(quality_check.quality_issues),
             "has_conflicts": quality_check.has_conflicts,
             "diversity_score": round(quality_check.diversity_score, 3),
@@ -289,26 +356,53 @@ class AnswerGenerator:
             top_k=top_k,
         )
 
-    async def _call_llm(self, system_prompt: str, user_prompt: str) -> Tuple[str, int, str]:
+    async def _call_llm(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        model_override: Optional[str] = None,
+        max_tokens_override: Optional[int] = None,
+        num_ctx_override: Optional[int] = None,
+    ) -> Tuple[str, int, str]:
+        model_name = model_override or self.model
         logger.info(
-            "Calling Ollama model=%s url=%s timeout=%ss",
-            self.model,
+            "Calling Ollama model=%s url=%s timeouts(connect=%.1fs, read=%.1fs, write=%.1fs, pool=%.1fs)",
+            model_name,
             self.ollama_base_url,
-            self.ollama_timeout,
+            self.ollama_connect_timeout,
+            self.ollama_read_timeout,
+            self.ollama_write_timeout,
+            self.ollama_pool_timeout,
         )
         try:
-            answer_text = await self._ollama_generate(system_prompt, user_prompt)
-            return answer_text, 0, self.model
+            answer_text = await self._ollama_generate(
+                system_prompt,
+                user_prompt,
+                model_override=model_override,
+                max_tokens_override=max_tokens_override,
+                num_ctx_override=num_ctx_override,
+            )
+            return answer_text, 0, model_name
         except Exception as exc:
             logger.error("Ollama inference failed: %s", exc, exc_info=True)
             raise RuntimeError(
                 f"Ollama inference failed (exclusive mode, no fallback). Error: {type(exc).__name__}: {exc}"
             ) from exc
 
-    async def _ollama_generate(self, system_prompt: str, user_prompt: str) -> str:
+    async def _ollama_generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        model_override: Optional[str] = None,
+        max_tokens_override: Optional[int] = None,
+        num_ctx_override: Optional[int] = None,
+    ) -> str:
         url = f"{self.ollama_base_url}/api/chat"
+        model_name = model_override or self.model
         payload = {
-            "model": self.model,
+            "model": model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -317,17 +411,184 @@ class AnswerGenerator:
             "keep_alive": "10m",
             "options": {
                 "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-                "num_ctx": max(2048, self.max_context_chunks * 1024),
+                "num_predict": max_tokens_override or self.max_tokens,
+                "num_ctx": num_ctx_override or max(2048, self.max_context_chunks * 1024),
             },
         }
 
-        async with httpx.AsyncClient(timeout=float(self.ollama_timeout), headers=_ollama_headers()) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
+        timeout = httpx.Timeout(
+            connect=self.ollama_connect_timeout,
+            read=self.ollama_read_timeout,
+            write=self.ollama_write_timeout,
+            pool=self.ollama_pool_timeout,
+        )
+        request_started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=timeout, headers=_ollama_headers()) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+        finally:
+            elapsed_ms = (time.perf_counter() - request_started) * 1000
+            logger.info(
+                "Ollama request finished: model=%s elapsed_ms=%.1f payload_chars=%s",
+                model_name,
+                elapsed_ms,
+                len(system_prompt) + len(user_prompt),
+            )
 
         data = response.json()
         return data["message"]["content"]
+
+    def _split_sentences(self, text: str) -> List[str]:
+        parts = re.split(r"(?<=[.!?])\s+|\n+", (text or "").strip())
+        return [
+            re.sub(r"\s+", " ", part).strip()
+            for part in parts
+            if len(re.sub(r"\s+", " ", part).strip()) >= 30
+        ]
+
+    def _build_extractive_grounded_answer(
+        self,
+        *,
+        query: str,
+        chunks: List[RetrievedChunk],
+        quality_check: Optional[RetrievalCrossCheck],
+        top_k: int,
+        include_citations: bool,
+        llm_error: Exception,
+    ) -> GeneratedAnswer:
+        if quality_check:
+            quality_check.fallback_used = True
+            quality_check.fallback_reason = "extractive_grounded_fallback"
+
+        query_terms = set(self._query_terms(query))
+        candidates: List[Tuple[float, RetrievedChunk, str]] = []
+
+        for chunk in chunks:
+            sentences = self._split_sentences(chunk.text or "") or [(chunk.text or "").strip()]
+            for sentence_index, sentence in enumerate(sentences[:4]):
+                sentence_terms = set(self._query_terms(sentence))
+                lexical_overlap = (
+                    len(query_terms & sentence_terms) / max(len(query_terms), 1)
+                    if query_terms else 0.0
+                )
+                relevance = analyze_chunk_relevance(
+                    query,
+                    sentence,
+                    title=chunk.document_title,
+                    tags=(chunk.metadata or {}).get("tags"),
+                    metadata=chunk.metadata,
+                    source_type=chunk.source_type,
+                )
+                evidence_score = max(
+                    float((chunk.metadata or {}).get("generator_evidence_score", 0.0) or 0.0),
+                    relevance.evidence_score,
+                )
+                score = (
+                    lexical_overlap * 0.35
+                    + evidence_score * 0.25
+                    + float(chunk.similarity or 0.0) * 0.25
+                    + relevance.domain_alignment * 0.10
+                    + (0.05 if sentence_index == 0 else 0.0)
+                )
+                candidates.append((score, chunk, sentence))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        selected: List[Tuple[RetrievedChunk, str]] = []
+        seen_docs: set[str] = set()
+        seen_sentences: set[str] = set()
+        max_sentences = 2 if len({str(chunk.document_id) for chunk in chunks}) <= 2 else 3
+
+        for _, chunk, sentence in candidates:
+            normalized_sentence = sentence.strip().lower()
+            if not normalized_sentence or normalized_sentence in seen_sentences:
+                continue
+            doc_key = str(chunk.document_id)
+            if doc_key in seen_docs and len(selected) >= max_sentences:
+                continue
+            selected.append((chunk, sentence.strip()))
+            seen_docs.add(doc_key)
+            seen_sentences.add(normalized_sentence)
+            if len(selected) >= max_sentences:
+                break
+
+        if not selected and chunks:
+            selected = [(chunks[0], (chunks[0].text or "").strip()[:240])]
+
+        answer_parts: List[str] = []
+        citations: List[Citation] = []
+        for chunk, sentence in selected:
+            cleaned = sentence.rstrip().rstrip(".!?")
+            if include_citations and chunk.document_title:
+                cleaned = f"{cleaned} [Source: {chunk.document_title}]"
+            if cleaned:
+                cleaned = f"{cleaned}."
+            answer_parts.append(cleaned)
+            if include_citations:
+                citations.append(
+                    Citation(
+                        chunk_id=chunk.chunk_id,
+                        document_id=chunk.document_id,
+                        document_title=chunk.document_title,
+                        chunk_index=chunk.chunk_index,
+                        similarity=chunk.similarity,
+                        text_snippet=sentence[:200],
+                    )
+                )
+
+        answer_text = " ".join(part for part in answer_parts if part).strip()
+        if not answer_text:
+            return self._build_no_answer(
+                reason="extractive_fallback_empty",
+                query=query,
+                generation_time_ms=0.0,
+                quality_check=quality_check,
+            )
+
+        cross_doc_agreement_score = self._calculate_cross_doc_agreement(chunks, quality_check)
+        confidence = self._calculate_confidence_step5(
+            chunks,
+            quality_check,
+            top_k,
+            cross_doc_agreement_score,
+        )
+        confidence = max(0.0, min(round(confidence * 0.72, 1), 58.0))
+
+        metadata = {
+            "query_length": len(query),
+            "chunks_used": len(chunks),
+            "chunks_filtered": 0,
+            "unique_documents": len({str(chunk.document_id) for chunk in chunks}),
+            "response_length": len(answer_text),
+            "citations_count": len(citations),
+            "model": "extractive-grounded-fallback",
+            "quality_issues_found": len(quality_check.quality_issues) if quality_check else 0,
+            "has_conflicts": quality_check.has_conflicts if quality_check else False,
+            "diversity_score": round(quality_check.diversity_score, 3) if quality_check else 0.0,
+            "high_quality_chunks": quality_check.high_quality_chunks if quality_check else len(chunks),
+            "low_quality_chunks": quality_check.low_quality_chunks if quality_check else 0,
+            "cross_doc_agreement_score": round(cross_doc_agreement_score, 3),
+            "top_k_used": top_k,
+            "fallback_used": True,
+            "fallback_reason": "extractive_grounded_fallback",
+            "llm_error": type(llm_error).__name__,
+        }
+
+        return GeneratedAnswer(
+            answer_text=answer_text,
+            citations=citations,
+            confidence_score=confidence,
+            model_used="extractive-grounded-fallback",
+            tokens_used=0,
+            generation_time_ms=0.0,
+            average_similarity=round(sum(c.similarity for c in chunks) / len(chunks), 3) if chunks else 0.0,
+            unique_documents=len({str(chunk.document_id) for chunk in chunks}),
+            metadata=metadata,
+            quality_check=quality_check,
+            cross_doc_agreement_score=round(cross_doc_agreement_score, 3),
+            top_k=top_k,
+        )
 
     def _perform_cross_check(self, query: str, chunks: List[RetrievedChunk]) -> RetrievalCrossCheck:
         quality_issues: List[ChunkQualityIssue] = []
@@ -496,28 +757,108 @@ class AnswerGenerator:
         rescued = [chunk for score, chunk in scored[:3] if chunk.similarity >= max(0.40, self.similarity_threshold - 0.08)]
         return rescued
 
-    def _trim_chunks_for_context(self, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
-        trimmed: List[RetrievedChunk] = []
-        for chunk in chunks[: self.max_context_chunks]:
-            text = (chunk.text or "").strip()
-            if len(text) > self.max_chunk_chars:
-                text = text[: self.max_chunk_chars].rstrip() + " ..."
-            trimmed.append(
-                RetrievedChunk(
-                    chunk_id=chunk.chunk_id,
-                    document_id=chunk.document_id,
-                    similarity=chunk.similarity,
-                    text=text,
-                    source_type=chunk.source_type,
-                    chunk_index=chunk.chunk_index,
-                    document_title=chunk.document_title,
-                    token_count=chunk.token_count,
-                    context_before=chunk.context_before[:250] if chunk.context_before else None,
-                    context_after=chunk.context_after[:250] if chunk.context_after else None,
-                    metadata=dict(chunk.metadata or {}),
-                )
-            )
-        return trimmed
+    def _score_chunk_for_generation(self, chunk: RetrievedChunk) -> float:
+        metadata = chunk.metadata or {}
+        evidence_score = float(metadata.get("generator_evidence_score", 0.0) or 0.0)
+        domain_alignment = float(metadata.get("generator_domain_alignment", 0.0) or 0.0)
+        lexical_overlap = float(metadata.get("generator_lexical_overlap", 0.0) or 0.0)
+        off_topic_penalty = 0.35 if metadata.get("generator_off_topic") else 0.0
+        return (
+            float(chunk.similarity or 0.0) * 0.45
+            + evidence_score * 0.25
+            + domain_alignment * 0.20
+            + lexical_overlap * 0.10
+            - off_topic_penalty
+        )
+
+    def _select_chunks_for_generation(
+        self,
+        query: str,
+        chunks: List[RetrievedChunk],
+        *,
+        compact: bool = False,
+    ) -> List[RetrievedChunk]:
+        del query  # relevance has already been attached during cross-check
+        if not chunks:
+            return []
+
+        max_chunks = max(1, min(2, self.max_context_chunks)) if compact else self.max_context_chunks
+        max_total_chars = self.compact_context_chars if compact else self.max_total_context_chars
+        per_chunk_chars = max(500, min(self.max_chunk_chars, max_total_chars)) if compact else self.max_chunk_chars
+
+        ranked = sorted(chunks, key=self._score_chunk_for_generation, reverse=True)
+        selected: List[RetrievedChunk] = []
+        seen_docs: set[str] = set()
+        total_chars = 0
+
+        # First pass prefers source diversity so we don't waste the prompt budget on near-duplicates.
+        for chunk in ranked:
+            doc_key = str(chunk.document_id)
+            if doc_key in seen_docs:
+                continue
+            prepared = self._prepare_chunk_for_context(chunk, per_chunk_chars, max_total_chars - total_chars)
+            if prepared is None:
+                continue
+            selected.append(prepared)
+            seen_docs.add(doc_key)
+            total_chars += len(prepared.text)
+            if len(selected) >= max_chunks or total_chars >= max_total_chars:
+                break
+
+        # Second pass fills remaining budget with the strongest leftovers.
+        if len(selected) < max_chunks and total_chars < max_total_chars:
+            selected_keys = {str(item.chunk_id) for item in selected}
+            for chunk in ranked:
+                if str(chunk.chunk_id) in selected_keys:
+                    continue
+                prepared = self._prepare_chunk_for_context(chunk, per_chunk_chars, max_total_chars - total_chars)
+                if prepared is None:
+                    continue
+                selected.append(prepared)
+                total_chars += len(prepared.text)
+                if len(selected) >= max_chunks or total_chars >= max_total_chars:
+                    break
+
+        return selected
+
+    def _prepare_chunk_for_context(
+        self,
+        chunk: RetrievedChunk,
+        per_chunk_chars: int,
+        remaining_chars: int,
+    ) -> Optional[RetrievedChunk]:
+        if remaining_chars <= 180:
+            return None
+
+        text = (chunk.text or "").strip()
+        if not text:
+            return None
+
+        char_budget = min(per_chunk_chars, remaining_chars)
+        if len(text) > char_budget:
+            text = text[: max(160, char_budget - 4)].rstrip() + " ..."
+
+        context_before = (chunk.context_before or "")[:120].strip() or None
+        context_after = (chunk.context_after or "")[:120].strip() or None
+        total_payload_chars = len(text) + len(context_before or "") + len(context_after or "")
+        if total_payload_chars > remaining_chars:
+            overflow = total_payload_chars - remaining_chars
+            if overflow > 0 and len(text) > 180:
+                text = text[: max(160, len(text) - overflow - 4)].rstrip() + " ..."
+
+        return RetrievedChunk(
+            chunk_id=chunk.chunk_id,
+            document_id=chunk.document_id,
+            similarity=chunk.similarity,
+            text=text,
+            source_type=chunk.source_type,
+            chunk_index=chunk.chunk_index,
+            document_title=chunk.document_title,
+            token_count=chunk.token_count,
+            context_before=context_before,
+            context_after=context_after,
+            metadata=dict(chunk.metadata or {}),
+        )
 
     def _build_context(self, chunks: List[RetrievedChunk], include_citations: bool) -> str:
         context_parts: List[str] = []
