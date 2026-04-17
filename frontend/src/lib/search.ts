@@ -15,6 +15,7 @@ export interface SemanticSearchResult {
   document_id: string;
   document_title: string;
   content: string;
+  tags: string[];
   source_type: string;
   chunk_index: number;
   created_at: string;

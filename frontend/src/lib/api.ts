@@ -128,6 +128,7 @@ export interface SearchResult {
   document_title: string;
   content: string;
   highlight: string;
+  tags: string[];
   source_type: string;
   chunk_index: number;
   created_at: string;
@@ -1075,6 +1076,7 @@ class ApiClient {
       chunk_id: string;
       document_id: string;
       document_title: string;
+      text: string;
       similarity: number;
     }>;
     confidence: number;
