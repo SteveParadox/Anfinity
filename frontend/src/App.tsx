@@ -15,24 +15,25 @@
  *    the single source of truth in one place
  */
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { lazy, Suspense, useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from './contexts/AuthContext';
 import { Sidebar } from './components/Sidebar';
 import { WorkspaceSwitcher } from './components/WorkspaceSwitcher';
-import { Dashboard } from './sections/Dashboard';
-import { KnowledgeGraphView } from './sections/KnowledgeGraphView';
-import { NotesView } from './sections/NotesView';
-import { SearchView } from './sections/SearchView';
-import { WorkspacesView } from './sections/WorkspacesView';
-import { WorkflowsView } from './sections/WorkflowsView';
-import { PricingView } from './sections/PricingView';
-import { DocumentUploadView } from './sections/UploadView';
-import { DocumentsView } from './sections/DocumentsView';
-import { AIInsightsPanel } from './components/AIInsightsPanel';
-import { AskPastSelf } from './components/chat/AskPastSelf';
 import { Sparkles, Menu, LogOut, AlertCircle, MessageCircle } from 'lucide-react';
 import type { User } from './types';
+
+const Dashboard = lazy(() => import('./sections/Dashboard').then((module) => ({ default: module.Dashboard })));
+const KnowledgeGraphView = lazy(() => import('./sections/KnowledgeGraphView').then((module) => ({ default: module.KnowledgeGraphView })));
+const NotesView = lazy(() => import('./sections/NotesView').then((module) => ({ default: module.NotesView })));
+const SearchView = lazy(() => import('./sections/SearchView').then((module) => ({ default: module.SearchView })));
+const WorkspacesView = lazy(() => import('./sections/WorkspacesView').then((module) => ({ default: module.WorkspacesView })));
+const WorkflowsView = lazy(() => import('./sections/WorkflowsView').then((module) => ({ default: module.WorkflowsView })));
+const PricingView = lazy(() => import('./sections/PricingView').then((module) => ({ default: module.PricingView })));
+const DocumentUploadView = lazy(() => import('./sections/UploadView').then((module) => ({ default: module.DocumentUploadView })));
+const DocumentsView = lazy(() => import('./sections/DocumentsView').then((module) => ({ default: module.DocumentsView })));
+const AIInsightsPanel = lazy(() => import('./components/AIInsightsPanel').then((module) => ({ default: module.AIInsightsPanel })));
+const AskPastSelf = lazy(() => import('./components/chat/AskPastSelf').then((module) => ({ default: module.AskPastSelf })));
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -68,6 +69,32 @@ const TT = {
 
 const SIDEBAR_EXPANDED  = 240;
 const SIDEBAR_COLLAPSED = 64;
+
+function ViewLoadingFallback({ label = 'Loading view' }: { label?: string }) {
+  return (
+    <div
+      style={{
+        minHeight: '100%',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '48px 24px',
+      }}
+    >
+      <span
+        style={{
+          fontFamily: TT.fontMono,
+          fontSize: 11,
+          letterSpacing: '0.1em',
+          textTransform: 'uppercase',
+          color: TT.inkSubtle,
+        }}
+      >
+        {label}
+      </span>
+    </div>
+  );
+}
 
 // ─── Responsive helper hook ───────────────────────────────────────────────────
 
@@ -588,7 +615,9 @@ function App() {
           id="main-content"
           style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}
         >
-          {viewRegistry[currentView] ?? null}
+          <Suspense fallback={<ViewLoadingFallback />}>
+            {viewRegistry[currentView] ?? null}
+          </Suspense>
         </main>
 
         {/* ── Status bar ────────────────────────────────────────── */}
@@ -659,11 +688,15 @@ function App() {
       </div>
 
       {/* ── AI Insights panel ─────────────────────────────────────── */}
-      <AIInsightsPanel
-        insights={[]}
-        isOpen={insightsOpen}
-        onClose={() => setInsightsOpen(false)}
-      />
+      {insightsOpen && (
+        <Suspense fallback={null}>
+          <AIInsightsPanel
+            insights={[]}
+            isOpen={insightsOpen}
+            onClose={() => setInsightsOpen(false)}
+          />
+        </Suspense>
+      )}
 
       {/* ── Ask Your Past Self Chat Modal ─────────────────────────── */}
       {chatOpen && contextUser && (
@@ -702,10 +735,12 @@ function App() {
               overflow: 'hidden',
             }}
           >
-            <AskPastSelf
-              workspaceId={currentWorkspaceId || ''}
-              onClose={() => setChatOpen(false)}
-            />
+            <Suspense fallback={<ViewLoadingFallback label="Loading chat" />}>
+              <AskPastSelf
+                workspaceId={currentWorkspaceId || ''}
+                onClose={() => setChatOpen(false)}
+              />
+            </Suspense>
           </div>
         </>
       )}

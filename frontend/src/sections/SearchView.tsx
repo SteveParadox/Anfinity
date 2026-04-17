@@ -23,6 +23,7 @@ interface QueryResult {
     chunk_id: string;
     document_id: string;
     document_title: string;
+    text: string;
     similarity: number;
   }>;
   model_used: string;
@@ -36,6 +37,7 @@ interface SemanticResult {
   document_title: string;
   content: string;
   highlight: string;
+  tags: string[];
   source_type: string;
   chunk_index: number;
   created_at: string;
@@ -177,7 +179,7 @@ export function SearchView() {
         title: result.document_title,
         content: result.content,
         summary: result.highlight || result.content.substring(0, 150),
-        tags: [] as string[],
+        tags: result.tags || [],
         connections: [] as string[],
         userId: '',
         workspaceId: workspaceId || '',
@@ -203,6 +205,25 @@ export function SearchView() {
       })
     );
   }, [displayResults, activeFilters]);
+
+  const searchConfidence = useMemo(() => {
+    if (!filteredResults.length) return null;
+    const topScores = filteredResults
+      .slice(0, 3)
+      .map((result) => Number(result.score))
+      .filter((score) => Number.isFinite(score) && score >= 0);
+
+    if (!topScores.length) return null;
+    return Math.round((topScores.reduce((sum, score) => sum + score, 0) / topScores.length) * 100);
+  }, [filteredResults]);
+
+  const hasGroundedAnswer = Boolean(
+    queryResults
+    && queryResults.confidence > 0
+    && queryResults.sources.length > 0
+    && queryResults.answer.trim()
+    && !queryResults.answer.toLowerCase().includes("couldn't find enough reliable information")
+  );
 
   const allTags = useMemo(() => {
     const s = new Set<string>();
@@ -764,9 +785,27 @@ export function SearchView() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
               <span style={{ fontSize: 10.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: TT.inkMuted }}>
                 <span style={{ color: TT.snow }}>{filteredResults.length}</span> results
-                {queryResults && ` • Confidence: ${Math.round(queryResults.confidence * 100)}%`}
+                {searchConfidence !== null && ` • Search confidence: ${searchConfidence}%`}
               </span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {queryResults && (
+                  <span
+                    style={{
+                      fontSize: 9,
+                      letterSpacing: '0.05em',
+                      textTransform: 'uppercase',
+                      color: hasGroundedAnswer ? TT.snow : TT.inkMuted,
+                      padding: '2px 7px',
+                      borderRadius: 999,
+                      border: `1px solid ${hasGroundedAnswer ? 'rgba(245,230,66,0.2)' : TT.inkBorder}`,
+                      background: hasGroundedAnswer ? 'rgba(245,230,66,0.07)' : TT.inkRaised,
+                    }}
+                  >
+                    {hasGroundedAnswer
+                      ? `Answer confidence ${Math.round(queryResults.confidence * 100)}%`
+                      : 'No grounded answer'}
+                  </span>
+                )}
                 <Brain size={11} color={TT.yolk} />
                 <span style={{ fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk }}>AI-Enhanced</span>
               </div>
@@ -909,7 +948,7 @@ export function SearchView() {
               </div>
 
               {/* STEP 7: Answer Summary (if displayed from search results) */}
-              {queryResults && (
+              {queryResults && hasGroundedAnswer && (
                 <div style={{ background: 'rgba(245,230,66,0.04)', border: `1px solid rgba(245,230,66,0.15)`, borderRadius: 3, padding: '12px 14px', marginBottom: 16 }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
                     <span style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk }}>AI-Generated Answer</span>
@@ -978,7 +1017,7 @@ export function SearchView() {
                 <span style={{ fontSize: 9.5, color: TT.inkMid, letterSpacing: '0.04em' }}>
                   Semantic match from RAG index
                 </span>
-                {queryResults?.confidence && (
+                {queryResults?.confidence && hasGroundedAnswer && (
                   <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 9.5, color: TT.yolk }}>
                     <Brain size={10} /> {Math.round(queryResults.confidence * 100)}% confidence
                   </span>

@@ -72,6 +72,21 @@ function getEdgeConfidence(edge: KnowledgeGraphEdge): number {
   const metadataConfidence = typeof edge.metadata?.confidence === 'number' ? edge.metadata.confidence : null;
   return Math.max(0, Math.min(1, metadataConfidence ?? edge.weight ?? 0));
 }
+function hasActiveGraphFilters(filters: KnowledgeGraphFilters, activeClusterKey: string | null, focusNodeId: string | null): boolean {
+  return Boolean(
+    filters.nodeTypes.length ||
+    filters.edgeTypes.length ||
+    filters.search.trim() ||
+    filters.minWeight > 0 ||
+    !filters.includeIsolated ||
+    filters.dateFrom ||
+    filters.dateTo ||
+    filters.clusterIds.length ||
+    filters.confidenceThreshold > 0 ||
+    activeClusterKey ||
+    focusNodeId
+  );
+}
 function applyFilters(
   graph: KnowledgeGraph,
   filters: KnowledgeGraphFilters,
@@ -158,6 +173,7 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
   const [selectedNotePreviews, setSelectedNotePreviews] = useState<Note[]>([]);
   const [loadingSelectedNotes, setLoadingSelectedNotes] = useState(false);
   const [debouncedSearch, setDebouncedSearch] = useState(filters.search.trim());
+  const [graphLoadError, setGraphLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
@@ -183,6 +199,7 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
 
   useEffect(() => {
     if (!workspaceId || !canViewGraph) {
+      setGraphLoadError(null);
       setRawGraphData(generateKnowledgeGraph(notes));
       return undefined;
     }
@@ -193,13 +210,15 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
     const loadGraph = async () => {
       try {
         setIsLoading(true);
+        setGraphLoadError(null);
         const response = await api.getKnowledgeGraph(workspaceId, undefined, { signal: abortController.signal, retries: false });
         if (isMounted) setRawGraphData(response);
       } catch (error) {
         if (abortController.signal.aborted) return;
         console.error('Failed to load knowledge graph:', error);
         if (isMounted) {
-          setRawGraphData((current) => current.nodes.length ? current : generateKnowledgeGraph(notes));
+          setGraphLoadError('Knowledge graph is temporarily unavailable. The workspace data could not be loaded.');
+          setRawGraphData((current) => current.nodes.length ? current : EMPTY_GRAPH);
         }
       } finally {
         if (isMounted && !abortController.signal.aborted) setIsLoading(false);
@@ -215,11 +234,13 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
 
   useEffect(() => {
     if (workspaceId && canViewGraph) return;
+    setGraphLoadError(null);
     setRawGraphData(generateKnowledgeGraph(notes));
   }, [canViewGraph, workspaceId, notes]);
 
   useEffect(() => {
     resetKnowledgeGraphFilters();
+    setGraphLoadError(null);
     setActiveClusterKey(null);
     setFocusNodeId(null);
     setSelectedNode(null);
@@ -507,6 +528,16 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
   const zoomMode: ZoomMode = zoom >= ZOOM_PRESETS.micro ? 'micro' : zoom >= ZOOM_PRESETS.meso ? 'meso' : 'macro';
   const isMicroZoom = zoomMode === 'micro';
   const totalNodeCount = rawGraphData.nodes.length;
+  const activeFiltersApplied = useMemo(
+    () => hasActiveGraphFilters(filters, activeClusterKey, focusNodeId),
+    [filters, activeClusterKey, focusNodeId]
+  );
+  const emptyStateMessage = useMemo(() => {
+    if (graphLoadError) return 'Knowledge graph data is unavailable right now.';
+    if (totalNodeCount === 0) return 'No knowledge graph data exists for this workspace yet.';
+    if (activeFiltersApplied) return 'No graph nodes match the current workspace and filters.';
+    return 'No graph nodes are available to display right now.';
+  }, [graphLoadError, totalNodeCount, activeFiltersApplied]);
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -575,6 +606,8 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
         </div>
       </div>
 
+      {graphLoadError && <div style={{ marginBottom: 16, background: TT.inkDeep, border: '1px solid rgba(255,69,69,0.25)', borderLeft: `3px solid ${TT.error}`, borderRadius: 3, padding: '12px 16px', color: TT.snow, fontSize: 11, letterSpacing: '0.03em' }}>{graphLoadError}</div>}
+
       <div style={{ display: 'grid', gridTemplateColumns: '2.1fr 1fr', gap: 12, marginBottom: 20 }}>
         <div style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: 16 }}>
           <div style={{ fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 12 }}>Graph Controls</div>
@@ -640,7 +673,7 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
 
       <div ref={viewportRef} style={{ position: 'relative', background: `radial-gradient(circle at 20% 20%, rgba(245,230,66,0.08), transparent 26%), linear-gradient(135deg, ${TT.inkDeep}, #171717 60%, #101010)`, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, overflow: 'hidden', height: 560 }}>
         {isLoading && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(10,10,10,0.6)', zIndex: 20, fontFamily: TT.fontMono, fontSize: 11, letterSpacing: '0.1em', textTransform: 'uppercase', color: TT.inkMuted }}>Loading graph...</div>}
-        {!isLoading && !renderedNodes.length && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10, color: TT.inkMuted, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase' }}>No graph nodes match the current workspace and filters</div>}
+        {!isLoading && !renderedNodes.length && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10, color: TT.inkMuted, fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', textAlign: 'center', padding: '0 24px' }}>{emptyStateMessage}</div>}
         <div style={{ position: 'absolute', top: 12, right: 12, display: 'flex', flexDirection: 'column', gap: 4, zIndex: 10 }}>
           <IconBtn onClick={() => applyZoomTransform(zoomIdentity.translate(zoomTransform.x, zoomTransform.y).scale(Math.min(zoom * 1.2, 2.8)))} title="Zoom in"><ZoomIn size={14} /></IconBtn>
           <IconBtn onClick={() => applyZoomTransform(zoomIdentity.translate(zoomTransform.x, zoomTransform.y).scale(Math.max(zoom / 1.2, 0.35)))} title="Zoom out"><ZoomOut size={14} /></IconBtn>
