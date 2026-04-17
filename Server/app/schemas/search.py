@@ -23,6 +23,7 @@ class SearchResult(BaseModel):
     text: str
     text_preview: str
     chunk_index: int
+    source_kind: str
     source_type: str
     metadata: Dict[str, Any]
     created_at: str
