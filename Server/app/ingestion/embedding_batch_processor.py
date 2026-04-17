@@ -1,4 +1,5 @@
 """Batch embedding processor for efficient vectorization of document chunks."""
+from collections import defaultdict
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -106,29 +107,21 @@ class BatchEmbeddingProcessor:
                     "errors": List[str]
                 }
         """
-        import time
-        start_time = time.time()
-        
-        result = {
-            "success": True,
-            "total_chunks": 0,
-            "processed_chunks": 0,
-            "failed_chunks": 0,
-            "vector_ids": [],
-            "errors": [],
-        }
-        
         try:
-            # Get document and its chunks using async session
             doc_res = await self.db.execute(select(Document).where(Document.id == document_id))
             document = doc_res.scalars().first()
 
             if not document:
-                result["success"] = False
-                result["errors"].append(f"Document {document_id} not found")
-                return result
+                return {
+                    "success": False,
+                    "total_chunks": 0,
+                    "processed_chunks": 0,
+                    "failed_chunks": 0,
+                    "vector_ids": [],
+                    "errors": [f"Document {document_id} not found"],
+                    "duration_ms": 0.0,
+                }
 
-            # Fetch only chunks that do not already have an embedding record.
             chunks_res = await self.db.execute(
                 select(Chunk)
                 .outerjoin(Embedding, Embedding.chunk_id == Chunk.id)
@@ -139,65 +132,14 @@ class BatchEmbeddingProcessor:
                 .order_by(Chunk.chunk_index)
             )
             chunks = chunks_res.scalars().all()
-
-            if not chunks:
-                logger.info("No pending chunks left to embed for document %s", document_id)
-                result["total_chunks"] = 0
-                document.status = DocumentStatus.INDEXED
-                document.processed_at = datetime.utcnow()
-                try:
-                    await self.db.commit()
-                except Exception:
-                    await self.db.rollback()
-                return result
-
-            result["total_chunks"] = len(chunks)
-            
-            # Ensure vector collection exists for workspace
-            collection_name = str(workspace_id)
-            self.vector_db.create_collection(collection_name, embedding_dim=self.embedding_provider.dimension)
-            
-            # Process chunks in batches
-            for batch_start in range(0, len(chunks), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(chunks))
-                batch_chunks = chunks[batch_start:batch_end]
-                
-                logger.info(
-                    f"Processing chunk batch {batch_start // self.batch_size + 1} "
-                    f"({batch_start}-{batch_end}) for document {document_id}"
-                )
-                
-                # Process this batch
-                batch_result = await self._process_batch(
-                    batch_chunks,
-                    document,
-                    workspace_id,
-                    collection_name
-                )
-                
-                result["processed_chunks"] += batch_result["processed"]
-                result["failed_chunks"] += batch_result["failed"]
-                result["vector_ids"].extend(batch_result["vector_ids"])
-                result["errors"].extend(batch_result["errors"])
-            
-            # Update document status
-            document.status = DocumentStatus.INDEXED
-            document.processed_at = datetime.utcnow()
-            try:
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-            
-            logger.info(
-                f"Successfully processed {result['processed_chunks']}/{result['total_chunks']} "
-                f"chunks for document {document_id}"
+            return await self._process_loaded_document_chunks(
+                document=document,
+                workspace_id=workspace_id,
+                chunks=chunks,
             )
             
         except Exception as e:
             logger.error(f"Error processing document chunks: {e}", exc_info=True)
-            result["success"] = False
-            result["errors"].append(str(e))
-            # Mark document as failed
             try:
                 doc_res = await self.db.execute(select(Document).where(Document.id == document_id))
                 document = doc_res.scalars().first()
@@ -206,10 +148,101 @@ class BatchEmbeddingProcessor:
                     await self.db.commit()
             except Exception:
                 pass
-        
-        finally:
-            result["duration_ms"] = (time.time() - start_time) * 1000
-        
+            return {
+                "success": False,
+                "total_chunks": 0,
+                "processed_chunks": 0,
+                "failed_chunks": 0,
+                "vector_ids": [],
+                "errors": [str(e)],
+                "duration_ms": 0.0,
+            }
+
+    async def _process_loaded_document_chunks(
+        self,
+        *,
+        document: Document,
+        workspace_id: UUID,
+        chunks: List[Chunk],
+    ) -> Dict[str, Any]:
+        """Process a document when the caller already has the pending chunks."""
+        import time
+
+        start_time = time.time()
+        result = {
+            "success": True,
+            "total_chunks": len(chunks),
+            "processed_chunks": 0,
+            "failed_chunks": 0,
+            "vector_ids": [],
+            "errors": [],
+        }
+
+        try:
+            if not chunks:
+                logger.info("No pending chunks left to embed for document %s", document.id)
+                document.status = DocumentStatus.INDEXED
+                document.processed_at = datetime.utcnow()
+                try:
+                    await self.db.commit()
+                except Exception:
+                    await self.db.rollback()
+                return {**result, "duration_ms": (time.time() - start_time) * 1000}
+
+            collection_name = str(workspace_id)
+            self.vector_db.create_collection(
+                collection_name,
+                embedding_dim=self.embedding_provider.dimension,
+            )
+
+            for batch_start in range(0, len(chunks), self.batch_size):
+                batch_end = min(batch_start + self.batch_size, len(chunks))
+                batch_chunks = chunks[batch_start:batch_end]
+
+                logger.info(
+                    "Processing chunk batch %d (%d-%d) for document %s",
+                    batch_start // self.batch_size + 1,
+                    batch_start,
+                    batch_end,
+                    document.id,
+                )
+
+                batch_result = await self._process_batch(
+                    batch_chunks,
+                    document,
+                    workspace_id,
+                    collection_name,
+                )
+
+                result["processed_chunks"] += batch_result["processed"]
+                result["failed_chunks"] += batch_result["failed"]
+                result["vector_ids"].extend(batch_result["vector_ids"])
+                result["errors"].extend(batch_result["errors"])
+
+            document.status = DocumentStatus.INDEXED
+            document.processed_at = datetime.utcnow()
+            try:
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+
+            logger.info(
+                "Successfully processed %d/%d chunks for document %s",
+                result["processed_chunks"],
+                result["total_chunks"],
+                document.id,
+            )
+        except Exception as e:
+            logger.error(f"Error processing document chunks: {e}", exc_info=True)
+            result["success"] = False
+            result["errors"].append(str(e))
+            try:
+                document.status = DocumentStatus.FAILED
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+
+        result["duration_ms"] = (time.time() - start_time) * 1000
         return result
     
     async def _process_batch(
@@ -432,10 +465,31 @@ class BatchEmbeddingProcessor:
             documents = docs_res.scalars().all()
             result["total_documents"] = len(documents)
 
+            if not documents:
+                return result
+
+            document_ids = [document.id for document in documents]
+            chunks_res = await self.db.execute(
+                select(Chunk)
+                .outerjoin(Embedding, Embedding.chunk_id == Chunk.id)
+                .where(
+                    Chunk.document_id.in_(document_ids),
+                    Embedding.id.is_(None),
+                )
+                .order_by(Chunk.document_id, Chunk.chunk_index)
+            )
+            chunks_by_document: Dict[UUID, List[Chunk]] = defaultdict(list)
+            for chunk in chunks_res.scalars().all():
+                chunks_by_document[chunk.document_id].append(chunk)
+
             for document in documents:
                 logger.info(f"Processing document {document.id}: {document.title}")
 
-                doc_result = await self.process_document_chunks(document.id, workspace_id)
+                doc_result = await self._process_loaded_document_chunks(
+                    document=document,
+                    workspace_id=workspace_id,
+                    chunks=chunks_by_document.get(document.id, []),
+                )
 
                 if doc_result["success"]:
                     result["processed_documents"] += 1
