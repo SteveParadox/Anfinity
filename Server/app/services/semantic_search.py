@@ -17,6 +17,7 @@ from app.database.models import Note, SearchLog, SearchQuery
 from app.services.embeddings import get_embedding_service
 from app.services.postgresql_search import get_postgresql_search_service
 from app.services.rag_retriever import RAGRetriever, RetrievedChunk, get_rag_retriever
+from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class SemanticSearchResult:
         document_id: UUID,
         document_title: str,
         content: str,
+        source_kind: str,
         source_type: str,
         chunk_index: int,
         created_at: datetime,
@@ -47,6 +49,7 @@ class SemanticSearchResult:
         self.document_id = document_id
         self.document_title = document_title
         self.content = content
+        self.source_kind = source_kind
         self.source_type = source_type
         self.chunk_index = chunk_index
         self.created_at = created_at
@@ -66,6 +69,7 @@ class SemanticSearchResult:
             "document_id": str(self.document_id),
             "document_title": self.document_title,
             "content": self.content,
+            "source_kind": self.source_kind,
             "source_type": self.source_type,
             "chunk_index": self.chunk_index,
             "created_at": self.created_at.isoformat(),
@@ -94,6 +98,7 @@ class SemanticSearchResult:
             document_id=UUID(str(data["document_id"])),
             document_title=data.get("document_title", ""),
             content=data.get("content", ""),
+            source_kind=data.get("source_kind", "note"),
             source_type=data.get("source_type", "note"),
             chunk_index=int(data.get("chunk_index", 0)),
             created_at=created_at,
@@ -144,8 +149,11 @@ class SemanticSearchService:
         limit: int = 10,
         filters: Optional[Dict[str, Any]] = None,
         db: Optional[AsyncSession] = None,
+        log_execution: bool = True,
+        include_postgresql: bool = True,
+        include_retriever: bool = True,
     ) -> SemanticSearchExecution:
-        """Perform semantic search with PostgreSQL first and retriever fallback."""
+        """Perform semantic search across notes and document chunks."""
         query = (query or "").strip()
         filters = self._normalize_filters(filters)
         limit = self._normalize_limit(limit)
@@ -154,19 +162,21 @@ class SemanticSearchService:
 
         logger.info("Starting semantic search: workspace=%s query=%s", workspace_id, query)
         search_started = datetime.now(timezone.utc)
-        strategy = "retriever_fallback"
+        strategy = "no_results"
         ranked_results: List[SemanticSearchResult] = []
+        postgres_results: List[SemanticSearchResult] = []
+        fallback_results: List[SemanticSearchResult] = []
 
-        if db is not None:
+        if include_postgresql and db is not None:
             try:
-                ranked_results = await self._search_postgresql(
-                    db=db,
-                    workspace_id=workspace_id,
-                    query=query,
-                    limit=limit,
-                    filters=filters,
-                )
-                strategy = "postgresql_hybrid"
+                async with db.begin_nested():
+                    postgres_results = await self._search_postgresql(
+                        db=db,
+                        workspace_id=workspace_id,
+                        query=query,
+                        limit=limit,
+                        filters=filters,
+                    )
             except Exception as exc:
                 logger.warning(
                     "PostgreSQL hybrid search unavailable for workspace=%s; falling back: %s",
@@ -174,8 +184,8 @@ class SemanticSearchService:
                     exc,
                 )
 
-        if not ranked_results:
-            ranked_results = await self._search_retriever_fallback(
+        if include_retriever:
+            fallback_results = await self._search_retriever_fallback(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 query=query,
@@ -183,12 +193,21 @@ class SemanticSearchService:
                 filters=filters,
                 db=db,
             )
-            if ranked_results:
-                strategy = "retriever_fallback"
+
+        if postgres_results and fallback_results:
+            ranked_results = self._rerank(self._dedupe_results([*postgres_results, *fallback_results]), query=query)
+            strategy = "postgresql_hybrid_plus_retriever"
+        elif postgres_results:
+            ranked_results = self._rerank(postgres_results, query=query)
+            strategy = "postgresql_hybrid"
+        elif fallback_results:
+            ranked_results = fallback_results
+            ranked_results = self._rerank(ranked_results, query=query)
+            strategy = "retriever_fallback"
 
         took_ms = int((datetime.now(timezone.utc) - search_started).total_seconds() * 1000)
         search_log_id = None
-        if db is not None:
+        if db is not None and log_execution:
             search_log_id = await self.log_search_execution(
                 db=db,
                 user_id=user_id,
@@ -235,6 +254,7 @@ class SemanticSearchService:
                     document_id=UUID(str(row["note_id"])),
                     document_title=row.get("title", ""),
                     content=row.get("content", ""),
+                    source_kind="note",
                     source_type=row.get("note_type", "note"),
                     chunk_index=0,
                     created_at=created_at,
@@ -251,7 +271,7 @@ class SemanticSearchService:
 
         await self._hydrate_result_tags(db, normalized)
         filtered = self._apply_result_filters(normalized, filters)
-        return self._rerank(self._dedupe_results(filtered))
+        return self._rerank(self._dedupe_results(filtered), query=query)
 
     async def _search_retriever_fallback(
         self,
@@ -282,7 +302,7 @@ class SemanticSearchService:
             db,
         )
         filtered = self._apply_result_filters(enriched_results, filters)
-        return self._rerank(filtered)
+        return self._rerank(filtered, query=query)
 
     async def _enrich_results(
         self,
@@ -307,6 +327,7 @@ class SemanticSearchService:
                         document_id=chunk.document_id,
                         document_title=chunk.document_title or metadata.get("document_title", ""),
                         content=chunk.text,
+                        source_kind="document",
                         source_type=chunk.source_type,
                         chunk_index=chunk.chunk_index,
                         created_at=created_at,
@@ -325,7 +346,10 @@ class SemanticSearchService:
             await self._hydrate_result_tags(db, enriched)
         return enriched
 
-    def _rerank(self, results: List[SemanticSearchResult]) -> List[SemanticSearchResult]:
+    def _rerank(self, results: List[SemanticSearchResult], query: str = "") -> List[SemanticSearchResult]:
+        intent = analyze_query_intent(query)
+        filtered_results: List[SemanticSearchResult] = []
+
         for result in results:
             semantic_score = self._calculate_semantic_score(
                 result.vector_score or result.similarity_score,
@@ -339,14 +363,41 @@ class SemanticSearchService:
             if semantic_score < 0.5:
                 result.recency_score *= 0.3
 
+            relevance = analyze_chunk_relevance(
+                query,
+                result.content,
+                title=result.document_title,
+                tags=result.tags,
+                metadata=None,
+                source_type=result.source_type,
+            )
+
             result.final_score = self._calculate_final_score(
                 semantic_score,
                 result.recency_score,
                 result.usage_score,
             )
+            result.final_score = max(
+                0.0,
+                min(
+                    result.final_score * 0.72
+                    + relevance.evidence_score * 0.20
+                    + relevance.domain_alignment * 0.08
+                    - (0.35 if relevance.off_topic else 0.0),
+                    1.0,
+                ),
+            )
 
-        results.sort(key=lambda item: item.final_score, reverse=True)
-        return results
+            if intent.is_domain_specific:
+                if relevance.off_topic:
+                    continue
+                if relevance.evidence_score < 0.12 and result.final_score < 0.45:
+                    continue
+
+            filtered_results.append(result)
+
+        filtered_results.sort(key=lambda item: item.final_score, reverse=True)
+        return filtered_results
 
     def _calculate_recency_score(self, created_at: datetime) -> float:
         now = datetime.now(timezone.utc)
@@ -520,40 +571,39 @@ class SemanticSearchService:
         search_duration_ms: Optional[int] = None,
     ) -> Optional[str]:
         try:
-            query_embedding = None
-            try:
-                query_embedding = self.embedding_service.embed_query(query)
-            except Exception as exc:
-                logger.warning("Failed to generate query embedding for analytics: %s", exc)
+            async with db.begin_nested():
+                query_embedding = None
+                try:
+                    query_embedding = self.embedding_service.embed_query(query)
+                except Exception as exc:
+                    logger.warning("Failed to generate query embedding for analytics: %s", exc)
 
-            search_query = SearchQuery(
-                user_id=user_id,
-                workspace_id=workspace_id,
-                query_text=query,
-                query_embedding=json.dumps(query_embedding) if query_embedding else None,
-            )
-            db.add(search_query)
-            await db.flush()
+                search_query = SearchQuery(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    query_text=query,
+                    query_embedding=json.dumps(query_embedding) if query_embedding else None,
+                )
+                db.add(search_query)
+                await db.flush()
 
-            if query_embedding:
-                await self._sync_query_embedding_vector(db, search_query.id, query_embedding)
+                if query_embedding:
+                    await self._sync_query_embedding_vector(db, search_query.id, query_embedding)
 
-            search_log = SearchLog(
-                user_id=user_id,
-                workspace_id=workspace_id,
-                query_text=query,
-                result_chunk_ids=[str(result.chunk_id) for result in results],
-                result_count=len(results),
-                clicked_count=0,
-                search_duration_ms=search_duration_ms,
-                created_at=datetime.now(timezone.utc),
-            )
-            db.add(search_log)
-            await db.flush()
-            await db.commit()
-            return str(search_log.id)
+                search_log = SearchLog(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    query_text=query,
+                    result_chunk_ids=[str(result.chunk_id) for result in results],
+                    result_count=len(results),
+                    clicked_count=0,
+                    search_duration_ms=search_duration_ms,
+                    created_at=datetime.now(timezone.utc),
+                )
+                db.add(search_log)
+                await db.flush()
+                return str(search_log.id)
         except Exception as exc:
-            await db.rollback()
             logger.warning("Failed to persist semantic-search analytics: %s", exc)
             return None
 
@@ -565,19 +615,20 @@ class SemanticSearchService:
     ) -> None:
         try:
             dim = len(query_embedding)
-            await db.execute(
-                text(
-                    f"""
-                    UPDATE search_queries
-                    SET query_embedding_vector = CAST(:embedding AS vector({dim}))
-                    WHERE id = :query_id
-                    """
-                ),
-                {
-                    "embedding": self._embedding_to_pg(query_embedding),
-                    "query_id": query_id,
-                },
-            )
+            async with db.begin_nested():
+                await db.execute(
+                    text(
+                        f"""
+                        UPDATE search_queries
+                        SET query_embedding_vector = CAST(:embedding AS vector({dim}))
+                        WHERE id = :query_id
+                        """
+                    ),
+                    {
+                        "embedding": self._embedding_to_pg(query_embedding),
+                        "query_id": query_id,
+                    },
+                )
         except Exception as exc:
             logger.warning("Query embedding vector sync skipped: %s", exc)
 

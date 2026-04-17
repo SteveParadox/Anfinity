@@ -69,11 +69,12 @@ class FeedbackHandler:
                 f"status={feedback_status}, user={user_id}"
             )
             
+            # Determine if feedback indicates correct answer
+            is_correct = feedback_status == "verified"
+            
             # Extract chunks from answer sources
             chunks_updated = []
             if answer.sources:
-                is_correct = feedback_status == "verified"
-                
                 for source in answer.sources:
                     chunk_update = await self._update_chunk_weight(
                         chunk_id=source.get("chunk_id"),

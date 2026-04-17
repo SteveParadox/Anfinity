@@ -42,6 +42,7 @@ def _ai_runtime():
         ),
         ollama=_Namespace(
             base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
+            api_key=getattr(settings, "OLLAMA_API_KEY", None),
             embedding_model=getattr(settings, "OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
             embedding_timeout=int(getattr(settings, "OLLAMA_EMBED_TIMEOUT", getattr(settings, "OLLAMA_TIMEOUT", 60)) or 60),
             embedding_batch_size=int(getattr(settings, "OLLAMA_EMBED_BATCH_SIZE", getattr(settings, "EMBEDDING_BATCH_SIZE", 32)) or 32),
@@ -67,6 +68,11 @@ class EmbeddingService:
     fails a RuntimeError is raised so callers know the truth instead of
     silently getting useless embeddings.
     """
+
+    MAX_SINGLE_EMBED_TEXT_CHARS = 6000
+    LONG_TEXT_CHUNK_CHARS = 5000
+    LONG_TEXT_CHUNK_OVERLAP_CHARS = 500
+    MAX_LONG_TEXT_CHUNKS = 8
 
     def __init__(self, provider: Optional[str] = None):
         """Initialize embedding service.
@@ -131,7 +137,11 @@ class EmbeddingService:
         """Create a reusable HTTP session for embedding calls."""
         if self._http is None:
             session = requests.Session()
-            session.headers.update({"Content-Type": "application/json"})
+            getter = getattr(app_config, "get_ollama_request_headers", None)
+            if callable(getter):
+                session.headers.update(getter())
+            else:
+                session.headers.update({"Content-Type": "application/json"})
             self._http = session
         return self._http
 
@@ -234,6 +244,56 @@ class EmbeddingService:
 
         return True
 
+    def _split_long_text_for_embedding(self, text: str) -> List[str]:
+        """Split a long text into overlapping windows safe for local embedders."""
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return []
+        if len(cleaned) <= self.MAX_SINGLE_EMBED_TEXT_CHARS:
+            return [cleaned]
+
+        chunk_size = self.LONG_TEXT_CHUNK_CHARS
+        overlap = min(self.LONG_TEXT_CHUNK_OVERLAP_CHARS, max(chunk_size // 4, 1))
+        step = max(chunk_size - overlap, 1)
+
+        chunks: List[str] = []
+        start = 0
+        while start < len(cleaned) and len(chunks) < self.MAX_LONG_TEXT_CHUNKS:
+            end = min(start + chunk_size, len(cleaned))
+            window = cleaned[start:end].strip()
+            if window:
+                chunks.append(window)
+            if end >= len(cleaned):
+                break
+            start += step
+
+        return chunks or [cleaned[: self.MAX_SINGLE_EMBED_TEXT_CHARS]]
+
+    def _pool_embeddings(
+        self,
+        embeddings: List[List[float]],
+        weights: Optional[List[float]] = None,
+    ) -> List[float]:
+        """Combine multiple chunk embeddings into a single vector."""
+        if not embeddings:
+            return []
+        if len(embeddings) == 1:
+            return embeddings[0]
+
+        dimension = len(embeddings[0])
+        if weights is None or len(weights) != len(embeddings):
+            weights = [1.0] * len(embeddings)
+
+        total_weight = sum(max(float(weight), 0.0) for weight in weights) or float(len(embeddings))
+        pooled = [0.0] * dimension
+
+        for embedding, weight in zip(embeddings, weights):
+            scaled_weight = max(float(weight), 0.0)
+            for index, value in enumerate(embedding):
+                pooled[index] += float(value) * scaled_weight
+
+        return [value / total_weight for value in pooled]
+
     def embed_text(self, text: str) -> List[float]:
         """Embed a single text string.
 
@@ -257,8 +317,22 @@ class EmbeddingService:
             if cached is not None:
                 return cached
 
-        result = self.embed_batch([cleaned])
-        embedding = result[0] if result else []
+        embed_inputs = self._split_long_text_for_embedding(cleaned)
+        if len(embed_inputs) > 1:
+            logger.info(
+                "Long embedding input detected for model=%s; splitting into %d windows (chars=%d)",
+                cache_model,
+                len(embed_inputs),
+                len(cleaned),
+            )
+
+        result = self.embed_batch(embed_inputs)
+        if len(result) == len(embed_inputs) and len(result) > 1:
+            weights = [len(chunk) for chunk in embed_inputs]
+            embedding = self._pool_embeddings(result, weights=weights)
+        else:
+            embedding = result[0] if result else []
+
         if embedding and cache is not None:
             cache.set(cleaned, self.get_model_name(), embedding)
         return embedding

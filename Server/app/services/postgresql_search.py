@@ -6,6 +6,7 @@ native capabilities (pgvector + full-text search).
 """
 
 import logging
+import time
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 
@@ -41,6 +42,9 @@ class PostgreSQLHybridSearchService:
 
     def __init__(self, embedding_service=None) -> None:
         self.embedding_service = embedding_service or get_embedding_service()
+        self._hybrid_search_available: bool = True
+        self._hybrid_search_disable_reason: Optional[str] = None
+        self._hybrid_search_retry_after: float = 0.0
 
     # ------------------------------------------------------------------
     # Embedding validation (defence-in-depth after the service hardening)
@@ -80,6 +84,20 @@ class PostgreSQLHybridSearchService:
         """Serialise a float list to the PostgreSQL vector literal format."""
         return f"[{','.join(map(str, vec))}]"
 
+    @staticmethod
+    def _is_pgvector_unavailable(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            'type "vector" does not exist' in message
+            or "function hybrid_search" in message
+            or "function vector_search_only" in message
+            or "embedding_vector does not exist" in message
+            or "query_embedding_vector" in message
+            or "content_tsv" in message
+            or "note_interactions" in message
+            or "undefinedcolumnerror" in message
+        )
+
     # ------------------------------------------------------------------
     # Public search methods
     # ------------------------------------------------------------------
@@ -116,6 +134,12 @@ class PostgreSQLHybridSearchService:
             logger.warning("hybrid_search called with empty query — returning []")
             return []
 
+        if not self._hybrid_search_available and time.monotonic() < self._hybrid_search_retry_after:
+            raise RuntimeError(self._hybrid_search_disable_reason or "PostgreSQL hybrid search is disabled")
+
+        self._hybrid_search_available = True
+        self._hybrid_search_disable_reason = None
+
         # 1. Generate and validate query embedding
         log_tag = query[:50]
         logger.info("Embedding query: %s", log_tag)
@@ -146,7 +170,7 @@ class PostgreSQLHybridSearchService:
                 COALESCE(highlight, SUBSTRING(content, 1, 150)) AS highlight
             FROM hybrid_search(
                 :query_text,
-                :query_embedding::vector({dim}),
+                CAST(:query_embedding AS vector({dim})),
                 :workspace_id,
                 :limit,
                 :sim_weight,
@@ -156,16 +180,27 @@ class PostgreSQLHybridSearchService:
         """)
 
         logger.debug("Executing hybrid_search SQL (limit=%d, threshold=%.2f)", limit, similarity_threshold)
-        result = await db.execute(sql, {
-            "query_text": query,
-            "query_embedding": embedding_str,
-            "workspace_id": workspace_id,   # SQLAlchemy handles UUID natively
-            "limit": limit,
-            "sim_weight": self.SIMILARITY_WEIGHT,
-            "rec_weight": self.RECENCY_WEIGHT,
-            "usage_weight": self.USAGE_WEIGHT,
-        })
-        rows = result.fetchall()
+        try:
+            result = await db.execute(sql, {
+                "query_text": query,
+                "query_embedding": embedding_str,
+                "workspace_id": workspace_id,   # SQLAlchemy handles UUID natively
+                "limit": limit,
+                "sim_weight": self.SIMILARITY_WEIGHT,
+                "rec_weight": self.RECENCY_WEIGHT,
+                "usage_weight": self.USAGE_WEIGHT,
+            })
+            rows = result.fetchall()
+        except Exception as exc:
+            if self._is_pgvector_unavailable(exc):
+                self._hybrid_search_available = False
+                self._hybrid_search_retry_after = time.monotonic() + 30.0
+                self._hybrid_search_disable_reason = (
+                    "PostgreSQL hybrid search is unavailable because pgvector schema support is missing "
+                    "(for example notes.embedding_vector, notes.content_tsv, note_interactions, "
+                    "search_queries.query_embedding_vector, or the hybrid_search SQL function)"
+                )
+            raise
         logger.info("Retrieved %d rows from hybrid_search", len(rows))
 
         # 4. Serialise rows

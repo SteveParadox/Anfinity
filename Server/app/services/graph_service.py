@@ -13,10 +13,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from uuid import UUID
 
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import (
+    Chunk,
+    Document,
+    DocumentStatus,
     GraphCluster,
     GraphClusterMembership,
     GraphEdge,
@@ -142,8 +146,76 @@ def extract_tags_from_note(note: Note) -> List[str]:
     return _dedupe([*explicit_tags, *inline_tags])[:25]
 
 
+def extract_tags_from_document(document: Document, combined_text: str) -> List[str]:
+    source_metadata = document.source_metadata or {}
+    explicit_tags = [
+        str(tag).strip()
+        for tag in (
+            source_metadata.get("tags")
+            or source_metadata.get("classified_topics")
+            or source_metadata.get("topics")
+            or []
+        )
+        if str(tag).strip()
+    ]
+    inline_tags = [match.strip() for match in INLINE_TAG_PATTERN.findall(combined_text or "")]
+    source_type = getattr(document.source_type, "value", str(document.source_type or "")).strip()
+    source_type_tags = [source_type] if source_type else []
+    return _dedupe([*explicit_tags, *inline_tags, *source_type_tags])[:25]
+
+
 class GraphService:
     """Persisted graph builder, clustering service, and note sync helper."""
+
+    async def ensure_workspace_graph_seeded(self, db: AsyncSession, workspace_id: UUID) -> None:
+        """Seed graph rows from existing notes and indexed documents."""
+        existing_nodes_result = await db.execute(
+            select(GraphNode.node_type, GraphNode.external_id).where(GraphNode.workspace_id == workspace_id)
+        )
+        existing_ids_by_type: dict[GraphNodeType, set[str]] = defaultdict(set)
+        for node_type, external_id in existing_nodes_result.all():
+            existing_ids_by_type[node_type].add(str(external_id))
+
+        note_result = await db.execute(
+            select(Note)
+            .where(Note.workspace_id == workspace_id)
+            .order_by(Note.updated_at.desc(), Note.created_at.desc())
+        )
+        notes = list(note_result.scalars().all())
+        missing_notes = [
+            note for note in notes
+            if str(note.id) not in existing_ids_by_type[GraphNodeType.NOTE]
+        ]
+
+        document_result = await db.execute(
+            select(Document)
+            .where(
+                Document.workspace_id == workspace_id,
+                Document.status == DocumentStatus.INDEXED,
+            )
+            .order_by(Document.updated_at.desc(), Document.created_at.desc())
+        )
+        documents = list(document_result.scalars().all())
+        missing_documents = [
+            document for document in documents
+            if str(document.id) not in existing_ids_by_type[GraphNodeType.DOCUMENT]
+        ]
+
+        if not missing_notes and not missing_documents:
+            return
+
+        logger.info(
+            "Backfilling knowledge graph for workspace %s from %d notes and %d documents",
+            workspace_id,
+            len(missing_notes),
+            len(missing_documents),
+        )
+        for note in missing_notes:
+            await self.sync_note_to_graph(db, note)
+        for document in missing_documents:
+            await self.sync_document_to_graph(db, document)
+
+        await db.flush()
 
     async def build_graph_data(
         self,
@@ -151,6 +223,7 @@ class GraphService:
         workspace_id: UUID,
         filters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        await self.ensure_workspace_graph_seeded(db, workspace_id)
         filters = filters or {}
         node_types = set(filters.get("node_types") or [])
         edge_types = set(filters.get("edge_types") or [])
@@ -194,15 +267,22 @@ class GraphService:
         edges = list(edge_result.scalars().all())
 
         note_ids_by_node: dict[UUID, set[str]] = defaultdict(set)
+        document_ids_by_node: dict[UUID, set[str]] = defaultdict(set)
         for edge in edges:
             source_node = node_map.get(edge.source_node_id)
             target_node = node_map.get(edge.target_node_id)
             if source_node and source_node.node_type == GraphNodeType.NOTE:
                 note_ids_by_node[source_node.id].add(str(source_node.external_id))
                 note_ids_by_node[edge.target_node_id].add(str(source_node.external_id))
+            if source_node and source_node.node_type == GraphNodeType.DOCUMENT:
+                document_ids_by_node[source_node.id].add(str(source_node.external_id))
+                document_ids_by_node[edge.target_node_id].add(str(source_node.external_id))
             if target_node and target_node.node_type == GraphNodeType.NOTE:
                 note_ids_by_node[target_node.id].add(str(target_node.external_id))
                 note_ids_by_node[edge.source_node_id].add(str(target_node.external_id))
+            if target_node and target_node.node_type == GraphNodeType.DOCUMENT:
+                document_ids_by_node[target_node.id].add(str(target_node.external_id))
+                document_ids_by_node[edge.source_node_id].add(str(target_node.external_id))
 
         if not include_isolated:
             connected_node_ids = {edge.source_node_id for edge in edges} | {edge.target_node_id for edge in edges}
@@ -224,6 +304,7 @@ class GraphService:
                     "metadata": {
                         **(node.node_metadata or {}),
                         "note_ids": sorted(note_ids_by_node.get(node.id, set())),
+                        "document_ids": sorted(document_ids_by_node.get(node.id, set())),
                         **cluster_payload["node_metadata"].get(node.id, {}),
                     },
                 }
@@ -324,6 +405,21 @@ class GraphService:
         clusters: Sequence[Dict[str, Any]],
         algorithm_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        node_result = await db.execute(select(GraphNode).where(GraphNode.workspace_id == workspace_id))
+        node_map = {str(node.id): node for node in node_result.scalars().all()}
+        prepared_clusters = self._prepare_clusters_for_sync(node_map=node_map, clusters=clusters)
+
+        if clusters and not prepared_clusters:
+            logger.warning(
+                "Skipping cluster replacement for workspace %s because the payload had no valid cluster members",
+                workspace_id,
+            )
+            return {
+                "workspace_id": str(workspace_id),
+                "clusters_saved": 0,
+                "nodes_clustered": 0,
+            }
+
         existing_cluster_ids = (
             select(GraphCluster.id).where(GraphCluster.workspace_id == workspace_id).subquery()
         )
@@ -333,28 +429,17 @@ class GraphService:
         await db.execute(delete(GraphCluster).where(GraphCluster.workspace_id == workspace_id))
         await db.flush()
 
-        node_result = await db.execute(select(GraphNode).where(GraphNode.workspace_id == workspace_id))
-        node_map = {str(node.id): node for node in node_result.scalars().all()}
         created_clusters = []
 
-        for index, cluster in enumerate(clusters):
-            members = []
-            for member in cluster.get("members") or []:
-                node = node_map.get(str(member.get("node_id") or ""))
-                if node is None:
-                    continue
-                members.append(
-                    {
-                        "node": node,
-                        "score": float(member.get("score") or 0.0),
-                        "rank": int(member.get("rank") or 0),
-                    }
-                )
-
-            if not members:
-                continue
-
-            summary = self._build_cluster_summary(index=index, members=members, cluster=cluster, algorithm_metadata=algorithm_metadata or {})
+        for index, prepared_cluster in enumerate(prepared_clusters):
+            cluster = prepared_cluster["cluster"]
+            members = prepared_cluster["members"]
+            summary = self._build_cluster_summary(
+                index=index,
+                members=members,
+                cluster=cluster,
+                algorithm_metadata=algorithm_metadata or {},
+            )
             label, description, label_model = await self._generate_cluster_copy(summary)
             cluster_metadata = {
                 **(cluster.get("metadata") or {}),
@@ -395,11 +480,11 @@ class GraphService:
 
             created_clusters.append(graph_cluster)
 
-        await db.commit()
+        await db.flush()
         return {
             "workspace_id": str(workspace_id),
             "clusters_saved": len(created_clusters),
-            "nodes_clustered": sum(len(cluster.get("members") or []) for cluster in clusters),
+            "nodes_clustered": sum(len(cluster["members"]) for cluster in prepared_clusters),
         }
 
     async def sync_note_to_graph(self, db: AsyncSession, note: Note) -> None:
@@ -538,7 +623,122 @@ class GraphService:
         )
         await self._sync_related_note_edges(db, workspace_id, note, note_node.id, entity_nodes, tag_nodes)
         await self._cleanup_orphan_nodes(db, workspace_id)
-        await db.commit()
+        await db.flush()
+
+    async def sync_document_to_graph(self, db: AsyncSession, document: Document) -> None:
+        if not document.workspace_id or document.status != DocumentStatus.INDEXED:
+            return
+
+        workspace_id = document.workspace_id
+        workspace_node = await self._upsert_node(
+            db,
+            workspace_id=workspace_id,
+            node_type=GraphNodeType.WORKSPACE,
+            external_id=str(workspace_id),
+            label="Workspace",
+            weight=5.0,
+            metadata={"workspace_id": str(workspace_id)},
+        )
+
+        chunks_result = await db.execute(
+            select(Chunk)
+            .where(Chunk.document_id == document.id)
+            .order_by(Chunk.chunk_index.asc())
+            .limit(12)
+        )
+        chunks = list(chunks_result.scalars().all())
+        combined_text = "\n\n".join(
+            (chunk.text or "").strip()
+            for chunk in chunks
+            if (chunk.text or "").strip()
+        )[:12000]
+
+        document_node = await self._upsert_node(
+            db,
+            workspace_id=workspace_id,
+            node_type=GraphNodeType.DOCUMENT,
+            external_id=str(document.id),
+            label=document.title or "Untitled Document",
+            weight=max(2.0, 1.0 + min((document.chunk_count or 0) / 2.0, 8.0)),
+            metadata={
+                "document_id": str(document.id),
+                "source_type": getattr(document.source_type, "value", str(document.source_type or "")),
+                "status": getattr(document.status, "value", str(document.status or "")),
+                "chunk_count": int(document.chunk_count or 0),
+                "token_count": int(document.token_count or 0),
+                "updated_at": document.updated_at.isoformat() if document.updated_at else None,
+            },
+        )
+
+        await self._delete_document_derived_edges(db, workspace_id, document_node.id)
+        await self._upsert_edge(
+            db,
+            workspace_id=workspace_id,
+            edge_type=GraphEdgeType.WORKSPACE_CONTAINS_DOCUMENT,
+            source_node_id=workspace_node.id,
+            target_node_id=document_node.id,
+            weight=1.0,
+            metadata={},
+        )
+
+        entity_nodes = []
+        for entity in extract_entities_from_note(document.title, combined_text):
+            entity_node = await self._upsert_node(
+                db,
+                workspace_id=workspace_id,
+                node_type=GraphNodeType.ENTITY,
+                external_id=_normalize_label(entity),
+                label=entity,
+                weight=1.0,
+                metadata={"entity_type": "extracted"},
+            )
+            entity_nodes.append(entity_node)
+            await self._upsert_edge(
+                db,
+                workspace_id=workspace_id,
+                edge_type=GraphEdgeType.DOCUMENT_MENTIONS_ENTITY,
+                source_node_id=document_node.id,
+                target_node_id=entity_node.id,
+                weight=1.0,
+                metadata={},
+            )
+
+        tag_nodes = []
+        for tag in extract_tags_from_document(document, combined_text):
+            tag_node = await self._upsert_node(
+                db,
+                workspace_id=workspace_id,
+                node_type=GraphNodeType.TAG,
+                external_id=_normalize_label(tag),
+                label=tag,
+                weight=1.0,
+                metadata={"tag_source": "document"},
+            )
+            tag_nodes.append(tag_node)
+            await self._upsert_edge(
+                db,
+                workspace_id=workspace_id,
+                edge_type=GraphEdgeType.DOCUMENT_HAS_TAG,
+                source_node_id=document_node.id,
+                target_node_id=tag_node.id,
+                weight=1.0,
+                metadata={},
+            )
+
+        await self._upsert_pair_edges(
+            db,
+            workspace_id=workspace_id,
+            edge_type=GraphEdgeType.ENTITY_CO_OCCURS_WITH_ENTITY,
+            nodes=entity_nodes,
+        )
+        await self._upsert_pair_edges(
+            db,
+            workspace_id=workspace_id,
+            edge_type=GraphEdgeType.TAG_CO_OCCURS_WITH_TAG,
+            nodes=tag_nodes,
+        )
+        await self._cleanup_orphan_nodes(db, workspace_id)
+        await db.flush()
 
     async def remove_note_from_graph(self, db: AsyncSession, workspace_id: UUID, note_id: UUID) -> None:
         note_node = await db.execute(
@@ -554,7 +754,23 @@ class GraphService:
 
         await db.execute(delete(GraphNode).where(GraphNode.id == node.id))
         await self._cleanup_orphan_nodes(db, workspace_id)
-        await db.commit()
+        await db.flush()
+
+    async def remove_document_from_graph(self, db: AsyncSession, workspace_id: UUID, document_id: UUID) -> None:
+        document_node = await db.execute(
+            select(GraphNode).where(
+                GraphNode.workspace_id == workspace_id,
+                GraphNode.node_type == GraphNodeType.DOCUMENT,
+                GraphNode.external_id == str(document_id),
+            )
+        )
+        node = document_node.scalar_one_or_none()
+        if node is None:
+            return
+
+        await db.execute(delete(GraphNode).where(GraphNode.id == node.id))
+        await self._cleanup_orphan_nodes(db, workspace_id)
+        await db.flush()
 
     async def _build_cluster_payload(
         self,
@@ -818,19 +1034,52 @@ class GraphService:
         await db.execute(
             delete(GraphEdge).where(
                 GraphEdge.workspace_id == workspace_id,
+                GraphEdge.edge_type == GraphEdgeType.WORKSPACE_CONTAINS_NOTE,
+                GraphEdge.target_node_id == note_node_id,
+            )
+        )
+        await db.execute(
+            delete(GraphEdge).where(
+                GraphEdge.workspace_id == workspace_id,
+                GraphEdge.edge_type.in_(
+                    [
+                        GraphEdgeType.NOTE_MENTIONS_ENTITY,
+                        GraphEdgeType.NOTE_HAS_TAG,
+                        GraphEdgeType.NOTE_LINKS_NOTE,
+                    ]
+                ),
+                GraphEdge.source_node_id == note_node_id,
+            )
+        )
+        await db.execute(
+            delete(GraphEdge).where(
+                GraphEdge.workspace_id == workspace_id,
+                GraphEdge.edge_type == GraphEdgeType.NOTE_RELATED_NOTE,
                 or_(
                     GraphEdge.source_node_id == note_node_id,
                     GraphEdge.target_node_id == note_node_id,
                 ),
+            )
+        )
+
+    async def _delete_document_derived_edges(self, db: AsyncSession, workspace_id: UUID, document_node_id: UUID) -> None:
+        await db.execute(
+            delete(GraphEdge).where(
+                GraphEdge.workspace_id == workspace_id,
+                GraphEdge.edge_type == GraphEdgeType.WORKSPACE_CONTAINS_DOCUMENT,
+                GraphEdge.target_node_id == document_node_id,
+            )
+        )
+        await db.execute(
+            delete(GraphEdge).where(
+                GraphEdge.workspace_id == workspace_id,
                 GraphEdge.edge_type.in_(
                     [
-                        GraphEdgeType.WORKSPACE_CONTAINS_NOTE,
-                        GraphEdgeType.NOTE_MENTIONS_ENTITY,
-                        GraphEdgeType.NOTE_HAS_TAG,
-                        GraphEdgeType.NOTE_LINKS_NOTE,
-                        GraphEdgeType.NOTE_RELATED_NOTE,
+                        GraphEdgeType.DOCUMENT_MENTIONS_ENTITY,
+                        GraphEdgeType.DOCUMENT_HAS_TAG,
                     ]
                 ),
+                GraphEdge.source_node_id == document_node_id,
             )
         )
 
@@ -887,15 +1136,8 @@ class GraphService:
         metadata: Dict[str, Any],
     ) -> GraphNode:
         result = await db.execute(
-            select(GraphNode).where(
-                GraphNode.workspace_id == workspace_id,
-                GraphNode.node_type == node_type,
-                GraphNode.external_id == external_id,
-            )
-        )
-        node = result.scalar_one_or_none()
-        if node is None:
-            node = GraphNode(
+            insert(GraphNode)
+            .values(
                 workspace_id=workspace_id,
                 node_type=node_type,
                 external_id=external_id,
@@ -904,17 +1146,25 @@ class GraphService:
                 weight=weight,
                 node_metadata=metadata,
             )
-            db.add(node)
-            await db.flush()
-            return node
-
-        node.label = label
-        node.normalized_label = _normalize_label(label)
-        node.weight = weight
-        node.node_metadata = metadata
-        node.updated_at = datetime.now(timezone.utc)
-        await db.flush()
-        return node
+            .on_conflict_do_update(
+                index_elements=[
+                    GraphNode.workspace_id,
+                    GraphNode.node_type,
+                    GraphNode.external_id,
+                ],
+                set_={
+                    "label": label,
+                    "normalized_label": _normalize_label(label),
+                    "weight": weight,
+                    GraphNode.node_metadata: metadata,
+                    "updated_at": func.now(),
+                },
+            )
+            .returning(GraphNode.id)
+        )
+        node_id = result.scalar_one()
+        node_result = await db.execute(select(GraphNode).where(GraphNode.id == node_id))
+        return node_result.scalar_one()
 
     async def _upsert_edge(
         self,
@@ -930,16 +1180,8 @@ class GraphService:
             source_node_id, target_node_id = target_node_id, source_node_id
 
         result = await db.execute(
-            select(GraphEdge).where(
-                GraphEdge.workspace_id == workspace_id,
-                GraphEdge.edge_type == edge_type,
-                GraphEdge.source_node_id == source_node_id,
-                GraphEdge.target_node_id == target_node_id,
-            )
-        )
-        edge = result.scalar_one_or_none()
-        if edge is None:
-            edge = GraphEdge(
+            insert(GraphEdge)
+            .values(
                 workspace_id=workspace_id,
                 edge_type=edge_type,
                 source_node_id=source_node_id,
@@ -947,15 +1189,104 @@ class GraphService:
                 weight=weight,
                 edge_metadata=metadata,
             )
-            db.add(edge)
-            await db.flush()
-            return edge
+            .on_conflict_do_update(
+                index_elements=[
+                    GraphEdge.workspace_id,
+                    GraphEdge.edge_type,
+                    GraphEdge.source_node_id,
+                    GraphEdge.target_node_id,
+                ],
+                set_={
+                    "weight": weight,
+                    GraphEdge.edge_metadata: metadata,
+                    "updated_at": func.now(),
+                },
+            )
+            .returning(GraphEdge.id)
+        )
+        edge_id = result.scalar_one()
+        edge_result = await db.execute(select(GraphEdge).where(GraphEdge.id == edge_id))
+        return edge_result.scalar_one()
 
-        edge.weight = weight
-        edge.edge_metadata = metadata
-        edge.updated_at = datetime.now(timezone.utc)
-        await db.flush()
-        return edge
+    def _prepare_clusters_for_sync(
+        self,
+        *,
+        node_map: Dict[str, GraphNode],
+        clusters: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized_clusters: List[Dict[str, Any]] = []
+
+        for cluster_index, cluster in enumerate(clusters):
+            deduped_members: Dict[str, Dict[str, Any]] = {}
+            for member in cluster.get("members") or []:
+                node_id = str(member.get("node_id") or "")
+                node = node_map.get(node_id)
+                if node is None:
+                    continue
+
+                candidate = {
+                    "node": node,
+                    "score": float(member.get("score") or 0.0),
+                    "rank": int(member.get("rank") or 0),
+                }
+                existing = deduped_members.get(node_id)
+                if existing is None or self._is_better_cluster_member(candidate, existing):
+                    deduped_members[node_id] = candidate
+
+            normalized_clusters.append(
+                {
+                    "index": cluster_index,
+                    "cluster": cluster,
+                    "members": deduped_members,
+                }
+            )
+
+        best_cluster_by_node: Dict[str, int] = {}
+        best_member_by_node: Dict[str, Dict[str, Any]] = {}
+
+        for cluster_info in normalized_clusters:
+            for node_id, member in cluster_info["members"].items():
+                existing_member = best_member_by_node.get(node_id)
+                if existing_member is None or self._is_better_cluster_member(member, existing_member):
+                    best_cluster_by_node[node_id] = cluster_info["index"]
+                    best_member_by_node[node_id] = member
+
+        prepared_clusters: List[Dict[str, Any]] = []
+        for cluster_info in normalized_clusters:
+            assigned_members = [
+                member
+                for node_id, member in cluster_info["members"].items()
+                if best_cluster_by_node.get(node_id) == cluster_info["index"]
+            ]
+            if not assigned_members:
+                continue
+
+            prepared_clusters.append(
+                {
+                    "cluster": cluster_info["cluster"],
+                    "members": sorted(
+                        assigned_members,
+                        key=lambda item: (-item["score"], item["rank"], item["node"].label),
+                    ),
+                }
+            )
+
+        return prepared_clusters
+
+    def _is_better_cluster_member(self, candidate: Dict[str, Any], existing: Dict[str, Any]) -> bool:
+        candidate_score = float(candidate.get("score") or 0.0)
+        existing_score = float(existing.get("score") or 0.0)
+        if candidate_score != existing_score:
+            return candidate_score > existing_score
+
+        candidate_rank = int(candidate.get("rank") or 0)
+        existing_rank = int(existing.get("rank") or 0)
+        if candidate_rank != existing_rank:
+            return candidate_rank < existing_rank
+
+        candidate_label = getattr(candidate.get("node"), "label", "")
+        existing_label = getattr(existing.get("node"), "label", "")
+        return str(candidate_label) < str(existing_label)
 
     async def buildGraphData(
         self,

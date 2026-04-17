@@ -9,6 +9,7 @@ from uuid import UUID
 logger = logging.getLogger(__name__)
 
 from app.services.embeddings import get_embedding_service
+from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
 from app.services.vector_db import get_vector_db_client
 
 
@@ -110,8 +111,8 @@ class RAGRetriever:
                     query_vector=query_vector,
                     workspace_id=workspace_id_str,
                     limit=candidate_limit,
-                    # Allow more candidates so reranking has material to work with
-                    score_threshold=max(self.similarity_threshold - 0.18, 0.18),
+                    # Allow slight buffer for edge cases, but don't pull in garbage
+                    score_threshold=max(self.similarity_threshold - 0.05, 0.30),
                 )
 
                 for result in raw_results:
@@ -245,6 +246,7 @@ class RAGRetriever:
         ]
 
     def _query_profile(self, query: str) -> Dict[str, Any]:
+        intent = analyze_query_intent(query)
         tokens = self._tokenize(query)
         token_set = set(tokens)
         technical_hits = sum(1 for token in token_set if token in self.TECHNICAL_TERMS)
@@ -256,6 +258,7 @@ class RAGRetriever:
             "technical": technical_hits >= 2,
             "short_query": short_query,
             "quoted_terms": [term.lower() for term in quoted_terms],
+            "intent": intent,
         }
 
     def _chunk_looks_narrative(self, text: str) -> bool:
@@ -295,7 +298,16 @@ class RAGRetriever:
     ) -> float:
         text = chunk.text or ""
         lowered_text = text.lower()
-        lexical = self._lexical_overlap_score(profile, text)
+        relevance = analyze_chunk_relevance(
+            query,
+            text,
+            title=chunk.document_title,
+            tags=(chunk.metadata or {}).get("tags"),
+            metadata=chunk.metadata,
+            source_type=chunk.source_type,
+        )
+        lexical = max(self._lexical_overlap_score(profile, text), relevance.lexical_overlap)
+        intent = profile["intent"]
 
         exact_phrase_bonus = 0.0
         for term in profile["quoted_terms"]:
@@ -314,14 +326,33 @@ class RAGRetriever:
         if profile["technical"] and self._chunk_looks_narrative(text):
             narrative_penalty = 0.22 if lexical >= 0.10 else 0.35
 
-        semantic_weight = 0.80 if profile["short_query"] else 0.72
+        if intent.is_domain_specific:
+            semantic_weight = 0.56 if profile["short_query"] else 0.48
+        else:
+            semantic_weight = 0.80 if profile["short_query"] else 0.72
         lexical_weight = 1.0 - semantic_weight
-        combined = (chunk.similarity * semantic_weight) + (lexical * lexical_weight) + exact_phrase_bonus - narrative_penalty
+        domain_bonus = (relevance.domain_alignment * 0.28) + (relevance.book_alignment * 0.08)
+        mismatch_penalty = relevance.domain_mismatch_score * (0.30 if intent.is_domain_specific else 0.0)
+        if relevance.off_topic:
+            mismatch_penalty += 0.35
+
+        combined = (
+            (chunk.similarity * semantic_weight)
+            + (lexical * lexical_weight)
+            + exact_phrase_bonus
+            + domain_bonus
+            - narrative_penalty
+            - mismatch_penalty
+        )
 
         chunk.metadata = dict(chunk.metadata or {})
         chunk.metadata["lexical_overlap"] = round(lexical, 4)
         chunk.metadata["rerank_score"] = round(combined, 4)
         chunk.metadata["narrative_penalty"] = round(narrative_penalty, 4)
+        chunk.metadata["domain_alignment"] = round(relevance.domain_alignment, 4)
+        chunk.metadata["domain_mismatch"] = round(relevance.domain_mismatch_score, 4)
+        chunk.metadata["evidence_score"] = round(relevance.evidence_score, 4)
+        chunk.metadata["off_topic"] = relevance.off_topic
         return combined
 
     def _rerank_and_filter_candidates(
@@ -348,11 +379,19 @@ class RAGRetriever:
         base_threshold = self.similarity_threshold
         lexical_floor = 0.05 if mode == "strict" else 0.0
         min_similarity = (base_threshold - 0.02) if mode == "strict" else max(base_threshold - 0.15, 0.25)
+        intent = profile["intent"]
 
         for score, chunk in scored:
             lexical = float((chunk.metadata or {}).get("lexical_overlap", 0.0))
+            domain_alignment = float((chunk.metadata or {}).get("domain_alignment", 0.0))
+            evidence_score = float((chunk.metadata or {}).get("evidence_score", 0.0))
+            off_topic = bool((chunk.metadata or {}).get("off_topic", False))
 
             if chunk.similarity < min_similarity:
+                discarded.append(chunk.chunk_id)
+                continue
+
+            if off_topic:
                 discarded.append(chunk.chunk_id)
                 continue
 
@@ -366,6 +405,9 @@ class RAGRetriever:
                 if profile["technical"] and self._chunk_looks_narrative(chunk.text or "") and lexical < 0.15:
                     discarded.append(chunk.chunk_id)
                     continue
+                if intent.is_domain_specific and evidence_score < 0.18 and domain_alignment < 0.12:
+                    discarded.append(chunk.chunk_id)
+                    continue
             else:
                 # Relaxed mode: be much more lenient
                 if profile["technical"] and self._chunk_looks_narrative(chunk.text or "") and chunk.similarity < 0.48:
@@ -373,6 +415,9 @@ class RAGRetriever:
                     continue
                 # Even zero-lexical chunks are acceptable in relaxed if similarity is reasonable
                 if lexical == 0.0 and chunk.similarity < 0.40 and not profile["short_query"]:
+                    discarded.append(chunk.chunk_id)
+                    continue
+                if intent.is_domain_specific and evidence_score < 0.12 and domain_alignment < 0.10:
                     discarded.append(chunk.chunk_id)
                     continue
 
@@ -419,14 +464,29 @@ class RAGRetriever:
         rescued: List[RetrievedChunk] = []
         profile = self._query_profile(query)
         for chunk in fallback:
+            relevance = analyze_chunk_relevance(
+                query,
+                chunk.text or "",
+                title=chunk.document_title,
+                tags=(chunk.metadata or {}).get("tags"),
+                metadata=chunk.metadata,
+                source_type=chunk.source_type,
+            )
             lexical = float((chunk.metadata or {}).get("lexical_overlap", 0.0))
             if profile["technical"] and self._chunk_looks_narrative(chunk.text or "") and chunk.similarity < 0.72:
                 continue
+            if relevance.off_topic:
+                continue
             if chunk.similarity < max(self.similarity_threshold - 0.08, 0.35):
+                continue
+            if profile["intent"].is_domain_specific and relevance.evidence_score < 0.14:
                 continue
             chunk.metadata = dict(chunk.metadata or {})
             chunk.metadata["fallback_mode"] = "semantic_rescue"
             chunk.metadata["lexical_overlap"] = round(lexical, 4)
+            chunk.metadata["domain_alignment"] = round(relevance.domain_alignment, 4)
+            chunk.metadata["evidence_score"] = round(relevance.evidence_score, 4)
+            chunk.metadata["off_topic"] = relevance.off_topic
             rescued.append(chunk)
             if len(rescued) >= top_k:
                 break
@@ -463,22 +523,39 @@ class RAGRetriever:
         if not chunks:
             return 0.0
 
+        intent = analyze_query_intent(query)
         avg_similarity = mean(c.similarity for c in chunks)
         top_similarity = max(c.similarity for c in chunks)
         unique_docs = len(set(c.document_id for c in chunks))
         source_diversity = min(unique_docs / max(self.max_documents, 1), 1.0)
+        avg_lexical = mean(float((c.metadata or {}).get("lexical_overlap", 0.0)) for c in chunks)
+        avg_domain = mean(float((c.metadata or {}).get("domain_alignment", 0.0)) for c in chunks)
+        avg_evidence = mean(float((c.metadata or {}).get("evidence_score", 0.0)) for c in chunks)
+        off_topic_ratio = (
+            sum(1 for c in chunks if bool((c.metadata or {}).get("off_topic", False))) / len(chunks)
+        )
 
         confidence = (
-            min(avg_similarity, 1.0) * 0.58 +
-            min(top_similarity, 1.0) * 0.27 +
-            source_diversity * 0.15
+            min(avg_similarity, 1.0) * 0.38 +
+            min(top_similarity, 1.0) * 0.17 +
+            source_diversity * 0.10 +
+            min(avg_lexical, 1.0) * 0.15 +
+            min(avg_domain, 1.0) * 0.10 +
+            min(avg_evidence, 1.0) * 0.10
         )
 
         if any((c.metadata or {}).get("fallback_mode") == "semantic_rescue" for c in chunks):
-            confidence *= 0.82
+            confidence *= 0.76
 
         if unique_docs == 1 and top_similarity >= 0.62:
             confidence = max(confidence, min(top_similarity * 0.78, 0.68))
+
+        if intent.is_domain_specific and avg_domain < 0.18:
+            confidence *= 0.45
+        if avg_lexical < 0.05:
+            confidence *= 0.7
+        if off_topic_ratio > 0.0:
+            confidence *= max(0.0, 1.0 - off_topic_ratio)
 
         return min(max(confidence, 0.0), 1.0)
 

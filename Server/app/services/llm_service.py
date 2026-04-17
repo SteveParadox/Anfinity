@@ -77,9 +77,11 @@ def _ai_runtime():
     return _Namespace(
         ollama=_Namespace(
             base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
+            api_key=getattr(settings, "OLLAMA_API_KEY", None),
             llm_model=getattr(settings, "OLLAMA_MODEL", "phi3:mini"),
             timeout=int(getattr(settings, "OLLAMA_TIMEOUT", 150) or 150),
             enabled=bool(getattr(settings, "OLLAMA_ENABLED", True)),
+            max_concurrent_requests=int(getattr(settings, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2),
         ),
         openai=_Namespace(
             api_key=getattr(settings, "OPENAI_API_KEY", None),
@@ -95,6 +97,20 @@ def _ai_runtime():
             ollama_model=getattr(settings, "OLLAMA_MODEL", "phi3:mini"),
         ),
     )
+
+
+def _ollama_headers(*, include_content_type: bool = True) -> dict[str, str]:
+    getter = getattr(app_config, "get_ollama_request_headers", None)
+    if callable(getter):
+        return getter(include_content_type=include_content_type)
+
+    runtime = _ai_runtime()
+    headers: dict[str, str] = {}
+    if include_content_type:
+        headers["Content-Type"] = "application/json"
+    if getattr(runtime.ollama, "api_key", None):
+        headers["Authorization"] = f"Bearer {runtime.ollama.api_key}"
+    return headers
 
 
 def _build_context_text(context_chunks: List[str]) -> str:
@@ -116,7 +132,7 @@ def _build_messages(query: str, context_chunks: List[str]) -> List[dict]:
 
 
 class OllamaClient:
-    """Thin wrapper around the ollama Python library with cached health checks."""
+    """Thin wrapper around the Ollama-compatible HTTP API with cached health checks."""
 
     _AVAILABILITY_TTL = 10.0
 
@@ -134,15 +150,8 @@ class OllamaClient:
         self.max_chunk_chars = 1200
         self._available: Optional[bool] = None
         self._availability_checked_at = 0.0
-
-        try:
-            import ollama as ollama_lib
-
-            self._lib = ollama_lib
-            logger.info("Ollama client initialised: %s", self.base_url)
-        except ImportError:
-            logger.error("ollama package not installed; Ollama backend disabled")
-            self._lib = None
+        self._headers = _ollama_headers()
+        logger.info("Ollama client initialised: %s", self.base_url)
 
         if self.model not in SUPPORTED_OLLAMA_MODELS:
             logger.warning("Unknown Ollama model configured: %s", self.model)
@@ -154,15 +163,12 @@ class OllamaClient:
         logger.info("Ollama model switched to: %s", self.model)
 
     def is_available(self) -> bool:
-        if self._lib is None:
-            return False
-
         now = time.monotonic()
         if (now - self._availability_checked_at) < self._AVAILABILITY_TTL:
             return bool(self._available)
 
         try:
-            with httpx.Client(timeout=3.0) as client:
+            with httpx.Client(timeout=3.0, headers=_ollama_headers(include_content_type=False)) as client:
                 response = client.get(f"{self.base_url}/api/tags")
             self._available = response.status_code == 200
         except Exception as exc:
@@ -178,16 +184,27 @@ class OllamaClient:
         temperature: float = 0.3,
         num_predict: int = 1000,
     ) -> Tuple[str, int]:
-        if not self._lib:
-            raise RuntimeError("Ollama client not initialised")
-
-        response = self._lib.chat(
-            model=self.model,
-            messages=messages,
-            stream=False,
-            options={"temperature": temperature, "num_predict": num_predict},
-        )
-        text = response["message"]["content"]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": "15m",
+            "options": {"temperature": temperature, "num_predict": num_predict},
+        }
+        timeout = httpx.Timeout(connect=5.0, read=float(self.timeout), write=30.0, pool=5.0)
+        try:
+            with httpx.Client(timeout=timeout, headers=self._headers) as client:
+                response = client.post(f"{self.base_url}/api/chat", json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                f"Ollama chat timed out after {self.timeout}s "
+                f"(model={self.model}, messages={len(messages)}, num_predict={num_predict})"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Ollama chat request failed: {exc}") from exc
+        text = ((data.get("message") or {}).get("content") or "")
         return text, len(text) // 4
 
     def generate(
@@ -197,17 +214,27 @@ class OllamaClient:
         temperature: float = 0.3,
         num_predict: int = 1000,
     ) -> Tuple[str, int]:
-        if not self._lib:
-            raise RuntimeError("Ollama client not initialised")
-
-        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-        response = self._lib.generate(
-            model=self.model,
-            prompt=full_prompt,
-            stream=False,
-            options={"temperature": temperature, "num_predict": num_predict},
-        )
-        text = response.get("response", "")
+        payload = {
+            "model": self.model,
+            "prompt": f"{system_prompt}\n\n{prompt}" if system_prompt else prompt,
+            "stream": False,
+            "keep_alive": "15m",
+            "options": {"temperature": temperature, "num_predict": num_predict},
+        }
+        timeout = httpx.Timeout(connect=5.0, read=float(self.timeout), write=30.0, pool=5.0)
+        try:
+            with httpx.Client(timeout=timeout, headers=self._headers) as client:
+                response = client.post(f"{self.base_url}/api/generate", json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                f"Ollama generate timed out after {self.timeout}s "
+                f"(model={self.model}, prompt_chars={len(prompt)}, num_predict={num_predict})"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Ollama generate request failed: {exc}") from exc
+        text = data.get("response", "")
         return text, len(text) // 4
 
 
@@ -341,7 +368,17 @@ class LLMService:
             logger.warning("Unknown LLM provider '%s', defaulting to ollama", primary)
             primary = "ollama"
         fallback = "openai" if primary == "ollama" else "ollama"
-        return [primary] if not self.use_fallback else [primary, fallback]
+        ordered = [primary] if not self.use_fallback else [primary, fallback]
+        configured = [provider for provider in ordered if self._provider_is_configured(provider)]
+        return configured or [primary]
+
+    def _provider_is_configured(self, provider_name: str) -> bool:
+        runtime = _ai_runtime()
+        if provider_name == "openai":
+            return bool(runtime.openai.api_key)
+        if provider_name == "ollama":
+            return bool(runtime.ollama.enabled)
+        return False
 
     def _is_token_exhaustion(self, err: str) -> bool:
         lowered = err.lower()

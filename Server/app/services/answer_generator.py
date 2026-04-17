@@ -19,6 +19,7 @@ import httpx
 
 from app import config as app_config
 from app.services.retrieval_cross_checker import RetrievalCrossChecker, RetrievalValidation
+from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
 
 logger = logging.getLogger(__name__)
 settings = app_config.settings
@@ -27,6 +28,13 @@ settings = app_config.settings
 def _ai_runtime():
     getter = getattr(app_config, "get_ai_runtime_config", None)
     return getter() if callable(getter) else getattr(settings, "ai_runtime", None)
+
+
+def _ollama_headers() -> Dict[str, str]:
+    getter = getattr(app_config, "get_ollama_request_headers", None)
+    if callable(getter):
+        return getter()
+    return {"Content-Type": "application/json"}
 
 
 @dataclass
@@ -314,7 +322,7 @@ class AnswerGenerator:
             },
         }
 
-        async with httpx.AsyncClient(timeout=float(self.ollama_timeout)) as client:
+        async with httpx.AsyncClient(timeout=float(self.ollama_timeout), headers=_ollama_headers()) as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
 
@@ -324,6 +332,7 @@ class AnswerGenerator:
     def _perform_cross_check(self, query: str, chunks: List[RetrievedChunk]) -> RetrievalCrossCheck:
         quality_issues: List[ChunkQualityIssue] = []
         filtered_chunks: List[RetrievedChunk] = []
+        intent = analyze_query_intent(query)
 
         query_terms = set(self._query_terms(query))
         is_short_query = len(query.split()) <= 2
@@ -332,8 +341,19 @@ class AnswerGenerator:
         for chunk in chunks:
             chunk_terms = set(self._query_terms(chunk.text)) if chunk.text else set()
             lexical_overlap = len(query_terms & chunk_terms) / max(len(query_terms), 1) if query_terms else 0.0
+            relevance = analyze_chunk_relevance(
+                query,
+                chunk.text or "",
+                title=chunk.document_title,
+                tags=(chunk.metadata or {}).get("tags"),
+                metadata=chunk.metadata,
+                source_type=chunk.source_type,
+            )
             metadata = dict(chunk.metadata or {})
-            metadata["generator_lexical_overlap"] = round(lexical_overlap, 4)
+            metadata["generator_lexical_overlap"] = round(max(lexical_overlap, relevance.lexical_overlap), 4)
+            metadata["generator_domain_alignment"] = round(relevance.domain_alignment, 4)
+            metadata["generator_evidence_score"] = round(relevance.evidence_score, 4)
+            metadata["generator_off_topic"] = relevance.off_topic
             chunk.metadata = metadata
 
             narrative_mismatch = (
@@ -354,6 +374,18 @@ class AnswerGenerator:
                 )
                 continue
 
+            if relevance.off_topic:
+                quality_issues.append(
+                    ChunkQualityIssue(
+                        chunk_id=chunk.chunk_id,
+                        issue_type="off_topic",
+                        severity="high",
+                        message="Chunk is strongly aligned to a conflicting topic/domain",
+                        affected_document=chunk.document_title,
+                    )
+                )
+                continue
+
             if (not is_short_query) and lexical_overlap < 0.05 and chunk.similarity < (self.similarity_threshold + 0.06):
                 quality_issues.append(
                     ChunkQualityIssue(
@@ -361,6 +393,18 @@ class AnswerGenerator:
                         issue_type="low_lexical_support",
                         severity="high",
                         message="Chunk passed vector search but has almost no lexical support for the query",
+                        affected_document=chunk.document_title,
+                    )
+                )
+                continue
+
+            if intent.is_domain_specific and relevance.evidence_score < 0.16 and relevance.domain_alignment < 0.12:
+                quality_issues.append(
+                    ChunkQualityIssue(
+                        chunk_id=chunk.chunk_id,
+                        issue_type="weak_domain_support",
+                        severity="high",
+                        message="Chunk has weak topical alignment to the query intent",
                         affected_document=chunk.document_title,
                     )
                 )
@@ -382,8 +426,17 @@ class AnswerGenerator:
 
         if not filtered_chunks and chunks:
             best = max(chunks, key=lambda c: c.similarity)
-            logger.warning("Forcing best chunk to survive filtering: %s", best.chunk_id)
-            filtered_chunks = [best]
+            best_relevance = analyze_chunk_relevance(
+                query,
+                best.text or "",
+                title=best.document_title,
+                tags=(best.metadata or {}).get("tags"),
+                metadata=best.metadata,
+                source_type=best.source_type,
+            )
+            if not best_relevance.off_topic and best_relevance.evidence_score >= 0.20:
+                logger.warning("Rescuing best chunk after filtering: %s", best.chunk_id)
+                filtered_chunks = [best]
 
         high_quality_chunks = len(filtered_chunks)
         low_quality_chunks = max(0, len(chunks) - high_quality_chunks)
@@ -583,15 +636,23 @@ ANSWER:"""
         average_similarity = sum(c.similarity for c in chunks) / len(chunks)
         unique_docs = len(set(c.document_id for c in chunks))
         source_diversity = min(1.0, unique_docs / max(min(top_k, 5), 1))
+        avg_evidence = sum(float((c.metadata or {}).get("generator_evidence_score", 0.0)) for c in chunks) / len(chunks)
+        avg_domain_alignment = sum(float((c.metadata or {}).get("generator_domain_alignment", 0.0)) for c in chunks) / len(chunks)
 
         confidence = (
-            average_similarity * 0.65
-            + source_diversity * 0.20
+            average_similarity * 0.45
+            + source_diversity * 0.15
             + cross_doc_agreement_score * 0.15
+            + avg_evidence * 0.15
+            + avg_domain_alignment * 0.10
         ) * 100
 
         if quality_check and quality_check.fallback_used:
             confidence *= 0.88
+        if avg_evidence < 0.20:
+            confidence *= 0.55
+        if avg_domain_alignment < 0.15:
+            confidence *= 0.60
 
         confidence = max(0.0, min(100.0, confidence))
         return round(confidence, 1)
