@@ -8,7 +8,7 @@ from starlette.websockets import WebSocketState
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.session import bind_db_user_context, get_db
+from app.database.session import bind_db_user_context, get_db, get_session_info
 from app.database.models import User as DBUser, Workspace, WorkspaceMember, WorkspaceRole
 from app.core.security import get_token_payload
 
@@ -31,6 +31,10 @@ ROLE_HIERARCHY = {
     WorkspaceRole.MEMBER: 2,
     WorkspaceRole.VIEWER: 1,
 }
+
+
+def _workspace_context_cache_key(workspace_id: UUID, user_id: UUID) -> str:
+    return f"workspace_context:{workspace_id}:{user_id}"
 
 
 def has_required_role(user_role: WorkspaceRole, required_role: WorkspaceRole) -> bool:
@@ -89,6 +93,17 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    session_info = get_session_info(db)
+    cached_user = session_info.get("current_user_object")
+    if cached_user is not None and getattr(cached_user, "id", None) == parsed_user_id:
+        bind_db_user_context(db, cached_user.id)
+        if not cached_user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User account is disabled",
+            )
+        return cached_user
+
     result = await db.execute(
         select(DBUser).where(DBUser.id == parsed_user_id)
     )
@@ -108,6 +123,7 @@ async def get_current_user(
         )
 
     bind_db_user_context(db, user.id)
+    session_info["current_user_object"] = user
     
     return user
 
@@ -173,6 +189,16 @@ async def get_websocket_user(
             if _can_close_websocket(websocket):
                 await websocket.close(code=1008, reason="Unauthorized")
             raise Exception("Invalid token payload")
+
+        session_info = get_session_info(db)
+        cached_user = session_info.get("current_user_object")
+        if cached_user is not None and getattr(cached_user, "id", None) == parsed_user_id:
+            bind_db_user_context(db, cached_user.id)
+            if not cached_user.is_active:
+                if _can_close_websocket(websocket):
+                    await websocket.close(code=1008, reason="Unauthorized")
+                raise Exception("User account is disabled")
+            return cached_user
         
         # Get user from database
         result = await db.execute(
@@ -189,7 +215,9 @@ async def get_websocket_user(
             if _can_close_websocket(websocket):
                 await websocket.close(code=1008, reason="Unauthorized")
             raise Exception("User account is disabled")
-        
+
+        bind_db_user_context(db, user.id)
+        session_info["current_user_object"] = user
         return user
     except Exception as e:
         if _can_close_websocket(websocket):
@@ -246,37 +274,47 @@ async def get_workspace_context(
     Raises:
         HTTPException: If user is not a workspace member
     """
-    workspace_result = await db.execute(
-        select(Workspace.id).where(Workspace.id == workspace_id)
-    )
-    workspace_exists = workspace_result.scalar_one_or_none()
+    session_info = get_session_info(db)
+    cache = session_info.setdefault("workspace_context_cache", {})
+    cache_key = _workspace_context_cache_key(workspace_id, user.id)
 
-    if workspace_exists is None:
+    cached_context = cache.get(cache_key)
+    if cached_context is not None:
+        return cached_context
+
+    result = await db.execute(
+        select(Workspace, WorkspaceMember)
+        .outerjoin(
+            WorkspaceMember,
+            (WorkspaceMember.workspace_id == Workspace.id)
+            & (WorkspaceMember.user_id == user.id),
+        )
+        .where(Workspace.id == workspace_id)
+    )
+    row = result.first()
+
+    if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found"
         )
 
-    result = await db.execute(
-        select(WorkspaceMember).where(
-            WorkspaceMember.workspace_id == workspace_id,
-            WorkspaceMember.user_id == user.id
-        )
-    )
-    member = result.scalar_one_or_none()
-    
+    _, member = row
+
     if member is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not a member of this workspace"
         )
-    
-    return WorkspaceContext(
+
+    context = WorkspaceContext(
         workspace_id=workspace_id,
         user=user,
         role=WorkspaceRole(member.role),
         member_record=member
     )
+    cache[cache_key] = context
+    return context
 
 
 def require_role(required_role: WorkspaceRole):

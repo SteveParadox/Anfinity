@@ -17,7 +17,7 @@ from app.database.models import (
     WorkspaceRole,
     WorkspaceSection,
 )
-from app.database.session import get_db
+from app.database.session import get_db, get_session_info
 
 PermissionAction = Literal["view", "create", "update", "delete", "manage"]
 PermissionState = Dict[PermissionAction, bool]
@@ -94,6 +94,10 @@ DEFAULT_PERMISSION_MATRIX: Dict[WorkspaceRole, WorkspacePermissionMap] = {
 }
 
 
+def _permission_cache_key(workspace_id: UUID, user_id: UUID) -> str:
+    return f"workspace_permissions:{workspace_id}:{user_id}"
+
+
 def _coerce_role(role: WorkspaceRole | str) -> WorkspaceRole:
     return role if isinstance(role, WorkspaceRole) else WorkspaceRole(str(role))
 
@@ -144,6 +148,13 @@ async def get_workspace_permissions_for_user(
     if user.is_superuser:
         return build_role_permissions(WorkspaceRole.OWNER)
 
+    session_info = get_session_info(db)
+    cache = session_info.setdefault("workspace_permission_cache", {})
+    cache_key = _permission_cache_key(workspace_id, user.id)
+    cached_permissions = cache.get(cache_key)
+    if cached_permissions is not None:
+        return deepcopy(cached_permissions)
+
     workspace_context = context or await get_workspace_context(workspace_id, user, db)
     permissions = build_role_permissions(workspace_context.role)
     override_result = await db.execute(
@@ -153,7 +164,9 @@ async def get_workspace_permissions_for_user(
         )
     )
     overrides = override_result.scalars().all()
-    return apply_permission_overrides(permissions, overrides)
+    resolved_permissions = apply_permission_overrides(permissions, overrides)
+    cache[cache_key] = deepcopy(resolved_permissions)
+    return resolved_permissions
 
 
 async def get_bulk_workspace_permissions_for_user(

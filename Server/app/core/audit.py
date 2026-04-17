@@ -107,9 +107,12 @@ async def log_audit_event(
         user_agent=user_agent
     )
     
-    db.add(audit_log)
-    await db.commit()
-    await db.refresh(audit_log)
+    # Keep audit entries inside the caller's request transaction so we don't
+    # open an extra transaction mid-request. A nested transaction/savepoint
+    # preserves the existing best-effort behavior if audit persistence fails.
+    async with db.begin_nested():
+        db.add(audit_log)
+        await db.flush()
     
     return audit_log
 
