@@ -38,14 +38,33 @@ interface SemanticResult {
   content: string;
   highlight: string;
   tags: string[];
+  source_kind: string;
   source_type: string;
   chunk_index: number;
+  token_count: number;
+  context_before?: string | null;
+  context_after?: string | null;
+  metadata?: Record<string, unknown>;
   created_at: string;
   interaction_count: number;
   similarity_score: number;
   recency_score: number;
   usage_score: number;
   final_score: number;
+}
+
+interface SearchDisplayResult {
+  note: Note;
+  score: number;
+  highlights: string[];
+  sourceType: string;
+  sourceKind: string;
+  chunkIndex: number;
+  tokenCount: number;
+  contextBefore?: string | null;
+  contextAfter?: string | null;
+  metadata: Record<string, unknown>;
+  raw: SemanticResult;
 }
 
 interface SemanticSearchResponsePayload {
@@ -73,7 +92,7 @@ const TT = {
 export function SearchView() {
   const [query, setQuery] = useState('');
   const [isSearching, setIsSearching] = useState(false);
-  const [selectedNote, setSelectedNote] = useState<Note | null>(null);
+  const [selectedResult, setSelectedResult] = useState<SearchDisplayResult | null>(null);
   const [activeFilters, setActiveFilters] = useState<string[]>([]);
   const [semanticResults, setSemanticResults] = useState<SemanticResult[]>([]);
   const [searchLogId, setSearchLogId] = useState<string | null>(null);
@@ -190,6 +209,13 @@ export function SearchView() {
       score: result.final_score,
       highlights: [result.highlight || result.content.substring(0, 100) + '...'],
       sourceType: result.source_type,
+      sourceKind: result.source_kind,
+      chunkIndex: result.chunk_index,
+      tokenCount: result.token_count || 0,
+      contextBefore: result.context_before,
+      contextAfter: result.context_after,
+      metadata: result.metadata || {},
+      raw: result,
     }));
   }, [semanticResults, workspaceId]);
 
@@ -331,7 +357,7 @@ export function SearchView() {
 
     setIsSearching(true);
     setError(null);
-    setSelectedNote(null);
+    setSelectedResult(null);
     setSemanticResults([]);
     setSearchLogId(null);
     setQueryResults(null);
@@ -414,8 +440,8 @@ export function SearchView() {
     }
   };
 
-  const handleOpenSearchResult = async (result: (typeof filteredResults)[number]) => {
-    setSelectedNote(result.note);
+  const handleOpenSearchResult = async (result: SearchDisplayResult) => {
+    setSelectedResult(result);
 
     if (!workspaceId || !searchLogId) {
       return;
@@ -869,6 +895,23 @@ export function SearchView() {
                             ))}
                           </div>
 
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 10 }}>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: 'rgba(245,230,66,0.07)', border: '1px solid rgba(245,230,66,0.15)', borderRadius: 2, color: TT.yolk }}>
+                              {result.sourceKind}
+                            </span>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
+                              {result.sourceType}
+                            </span>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
+                              Chunk {result.chunkIndex + 1}
+                            </span>
+                            {result.tokenCount > 0 && (
+                              <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
+                                {result.tokenCount} tokens
+                              </span>
+                            )}
+                          </div>
+
                           {/* Tags + timestamp */}
                           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 5 }}>
                             {result.note.tags.slice(0, 4).map((tag) => (
@@ -914,9 +957,9 @@ export function SearchView() {
       </AnimatePresence>
 
       {/* ── Note detail modal ────────────────────────────────────── */}
-      {selectedNote && (
+      {selectedResult && (
         <div
-          onClick={() => setSelectedNote(null)}
+          onClick={() => setSelectedResult(null)}
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 50, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}
         >
           <motion.div
@@ -935,16 +978,33 @@ export function SearchView() {
               {/* Header */}
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>
                 <h2 style={{ fontFamily: TT.fontDisplay, fontSize: 28, letterSpacing: '0.06em', color: TT.snow, lineHeight: 1 }}>
-                  <span style={{ color: TT.yolk }}>{selectedNote.title.charAt(0)}</span>{selectedNote.title.slice(1)}
+                  <span style={{ color: TT.yolk }}>{selectedResult.note.title.charAt(0)}</span>{selectedResult.note.title.slice(1)}
                 </h2>
                 <button
-                  onClick={() => setSelectedNote(null)}
+                  onClick={() => setSelectedResult(null)}
                   style={{ background: 'none', border: `1px solid ${TT.inkBorder}`, borderRadius: 2, cursor: 'pointer', padding: '4px 6px', color: TT.inkMuted, transition: 'all 0.15s' }}
                   onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = TT.error; (e.currentTarget as HTMLElement).style.borderColor = 'rgba(255,69,69,0.3)'; }}
                   onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = TT.inkMuted; (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder; }}
                 >
                   <X size={12} />
                 </button>
+              </div>
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 14 }}>
+                <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', padding: '2px 7px', background: 'rgba(245,230,66,0.07)', border: '1px solid rgba(245,230,66,0.18)', borderRadius: 999, color: TT.yolk }}>
+                  {selectedResult.sourceKind}
+                </span>
+                <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', padding: '2px 7px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 999, color: TT.inkMuted }}>
+                  {selectedResult.sourceType}
+                </span>
+                <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', padding: '2px 7px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 999, color: TT.inkMuted }}>
+                  Chunk {selectedResult.chunkIndex + 1}
+                </span>
+                {selectedResult.tokenCount > 0 && (
+                  <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', padding: '2px 7px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 999, color: TT.inkMuted }}>
+                    {selectedResult.tokenCount} tokens
+                  </span>
+                )}
               </div>
 
               {/* STEP 7: Answer Summary (if displayed from search results) */}
@@ -996,21 +1056,71 @@ export function SearchView() {
                 </div>
               )}
 
-              {/* Tags */}
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 16 }}>
-                {selectedNote.tags.map((tag) => (
-                  <span key={tag} style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', padding: '2px 8px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
-                    {tag}
-                  </span>
-                ))}
+              <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '10px 12px', marginBottom: 16 }}>
+                <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.inkMid, marginBottom: 8 }}>
+                  Related Document Details
+                </div>
+                <div style={{ display: 'grid', gap: 6 }}>
+                  <div style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.snow }}>
+                    Document ID: <span style={{ color: TT.inkSubtle }}>{selectedResult.raw.document_id}</span>
+                  </div>
+                  <div style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.snow }}>
+                    Chunk ID: <span style={{ color: TT.inkSubtle }}>{selectedResult.raw.chunk_id}</span>
+                  </div>
+                </div>
               </div>
 
-              {/* Content */}
-              <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '14px 16px', marginBottom: 16 }}>
-                <p style={{ fontFamily: TT.fontBody, fontSize: 13, lineHeight: 1.7, color: TT.inkSubtle, whiteSpace: 'pre-wrap' }}>
-                  {selectedNote.content}
+              {selectedResult.note.tags.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 16 }}>
+                  {selectedResult.note.tags.map((tag) => (
+                    <span key={tag} style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', padding: '2px 8px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {selectedResult.contextBefore && (
+                <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px', marginBottom: 12 }}>
+                  <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.inkMid, marginBottom: 6 }}>
+                    Context Before
+                  </div>
+                  <p style={{ fontFamily: TT.fontBody, fontSize: 11.5, lineHeight: 1.6, color: TT.inkMuted, margin: 0 }}>
+                    {selectedResult.contextBefore}
+                  </p>
+                </div>
+              )}
+
+              <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '14px 16px', marginBottom: 12 }}>
+                <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk, marginBottom: 8 }}>
+                  Matched Chunk Text
+                </div>
+                <p style={{ fontFamily: TT.fontBody, fontSize: 13, lineHeight: 1.7, color: TT.inkSubtle, whiteSpace: 'pre-wrap', margin: 0 }}>
+                  {selectedResult.note.content}
                 </p>
               </div>
+
+              {selectedResult.contextAfter && (
+                <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px', marginBottom: 12 }}>
+                  <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.inkMid, marginBottom: 6 }}>
+                    Context After
+                  </div>
+                  <p style={{ fontFamily: TT.fontBody, fontSize: 11.5, lineHeight: 1.6, color: TT.inkMuted, margin: 0 }}>
+                    {selectedResult.contextAfter}
+                  </p>
+                </div>
+              )}
+
+              {Object.keys(selectedResult.metadata).length > 0 && (
+                <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px', marginBottom: 16 }}>
+                  <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.inkMid, marginBottom: 8 }}>
+                    Metadata
+                  </div>
+                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: TT.fontMono, fontSize: 10, lineHeight: 1.6, color: TT.inkSubtle }}>
+                    {JSON.stringify(selectedResult.metadata, null, 2)}
+                  </pre>
+                </div>
+              )}
 
               {/* Footer */}
               <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: `1px solid ${TT.inkBorder}`, paddingTop: 12 }}>
