@@ -11,8 +11,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.core.auth import get_current_active_user
-from app.database.models import Answer, Query, User as DBUser, Workspace, WorkspaceMember
+from app.core.auth import WorkspaceContext, get_current_active_user, get_workspace_context
+from app.database.models import Answer, Chunk, Document, Query, User as DBUser
 from app.database.session import get_db
 from app.services.answer_generator import GeneratedAnswer, RetrievedChunk, get_answer_generator
 from app.services.feedback_handler import get_feedback_handler
@@ -145,21 +145,12 @@ class ModelEvaluationMetrics(BaseModel):
     average_rating: float
 
 
-async def _verify_workspace_access(workspace_id: UUID, current_user: DBUser, db: AsyncSession) -> Workspace:
-    result = await db.execute(select(Workspace).where(Workspace.id == workspace_id))
-    workspace = result.scalar_one_or_none()
-    if workspace is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-    membership = await db.execute(
-        select(WorkspaceMember).where(
-            WorkspaceMember.workspace_id == workspace_id,
-            WorkspaceMember.user_id == current_user.id,
-        )
-    )
-    if membership.scalar_one_or_none() is None and workspace.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="No access to workspace")
-    return workspace
+async def _verify_workspace_access(
+    workspace_id: UUID,
+    current_user: DBUser,
+    db: AsyncSession,
+) -> WorkspaceContext:
+    return await get_workspace_context(workspace_id, current_user, db)
 
 
 async def _get_retrieved_chunks(
@@ -179,7 +170,7 @@ async def _get_retrieved_chunks(
             top_k=top_k,
             similarity_threshold=similarity_threshold,
         )
-        return [
+        raw_chunks = [
             RetrievedChunk(
                 chunk_id=str(chunk.chunk_id),
                 document_id=str(chunk.document_id),
@@ -195,9 +186,77 @@ async def _get_retrieved_chunks(
             )
             for chunk in result.chunks
         ]
+        return await _hydrate_retrieved_chunks(db, raw_chunks)
     except Exception as exc:
         logger.error("Error retrieving chunks: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to retrieve chunks: {exc}") from exc
+
+
+async def _hydrate_retrieved_chunks(
+    db: AsyncSession,
+    chunks: List[RetrievedChunk],
+) -> List[RetrievedChunk]:
+    """Replace sparse vector payload data with authoritative chunk rows."""
+    if not chunks:
+        return []
+
+    chunk_ids: List[UUID] = []
+    for chunk in chunks:
+        try:
+            chunk_ids.append(UUID(str(chunk.chunk_id)))
+        except (TypeError, ValueError):
+            continue
+
+    if not chunk_ids:
+        return chunks
+
+    try:
+        rows = await db.execute(
+            select(Chunk, Document)
+            .join(Document, Chunk.document_id == Document.id)
+            .where(Chunk.id.in_(chunk_ids))
+        )
+    except Exception as exc:
+        logger.warning("Falling back to retriever payloads for answer sources: %s", exc)
+        return chunks
+
+    hydrated_by_id = {
+        str(chunk_row.id): (chunk_row, document_row)
+        for chunk_row, document_row in rows.all()
+    }
+
+    hydrated: List[RetrievedChunk] = []
+    for chunk in chunks:
+        row = hydrated_by_id.get(str(chunk.chunk_id))
+        if row is None:
+            hydrated.append(chunk)
+            continue
+
+        chunk_row, document_row = row
+        merged_metadata = {
+            **(chunk_row.chunk_metadata or {}),
+            **(chunk.metadata or {}),
+        }
+        if getattr(chunk_row, "created_at", None):
+            merged_metadata.setdefault("created_at", chunk_row.created_at.isoformat())
+
+        hydrated.append(
+            RetrievedChunk(
+                chunk_id=str(chunk_row.id),
+                document_id=str(document_row.id),
+                similarity=float(chunk.similarity),
+                text=chunk_row.text or chunk.text,
+                source_type=getattr(document_row.source_type, "value", str(document_row.source_type)),
+                chunk_index=int(chunk_row.chunk_index),
+                document_title=document_row.title or chunk.document_title,
+                token_count=int(chunk_row.token_count or chunk.token_count or 0),
+                context_before=chunk_row.context_before or chunk.context_before,
+                context_after=chunk_row.context_after or chunk.context_after,
+                metadata=merged_metadata,
+            )
+        )
+
+    return hydrated
 
 
 @router.post("/generate", response_model=AnswerGenerationResponse)
@@ -442,6 +501,8 @@ async def submit_answer_feedback(
         comment=request.comment,
         user_id=current_user.id,
         db=db,
+        answer_workspace_id=answer.workspace_id,
+        answer_sources=answer.sources,
     )
     return AnswerFeedbackResponse(
         answer_id=result["answer_id"],

@@ -8,14 +8,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.audit import AuditAction, AuditLogger, EntityType
 from app.core.auth import get_current_active_user, get_workspace_context
 from app.database.models import Answer, Chunk, Document, Feedback, Query, User as DBUser
-from app.database.session import get_db
+from app.database.session import get_db, log_session_query_metrics
 from app.services.answer_generator import RetrievedChunk as AnswerRetrievedChunk
 from app.services.answer_generator import get_answer_generator
 from app.services.rag_retriever import get_rag_retriever
@@ -184,6 +184,30 @@ def _count_source_kinds(chunks: List[AnswerRetrievedChunk]) -> Dict[str, int]:
     return counts
 
 
+def _grounding_failure_confidence(evidence_summary: Dict[str, float]) -> float:
+    top_evidence = float(evidence_summary.get("top_evidence_score", 0.0) or 0.0)
+    avg_evidence = float(evidence_summary.get("avg_evidence_score", 0.0) or 0.0)
+    avg_domain_alignment = float(evidence_summary.get("avg_domain_alignment", 0.0) or 0.0)
+    confidence = top_evidence * 0.20 + avg_evidence * 0.10 + avg_domain_alignment * 0.05
+    return max(0.0, min(round(confidence, 3), 0.12))
+
+
+def _build_generation_failure_payload(
+    include_sources: bool,
+    reliable_evidence: bool,
+    evidence_summary: Dict[str, float],
+    sources: List[Source],
+) -> tuple[str, float, List[Dict[str, Any]]]:
+    if reliable_evidence and include_sources and sources:
+        return (
+            "I found source material that may be relevant, but I couldn't produce a reliable grounded answer from it. "
+            "Review the cited sources below.",
+            _grounding_failure_confidence(evidence_summary),
+            _source_models_to_payload(sources),
+        )
+    return NO_EVIDENCE_MESSAGE, 0.0, []
+
+
 def _confidence_factors_from_chunks(
     chunks: List[AnswerRetrievedChunk],
     confidence: float,
@@ -257,6 +281,86 @@ async def _hydrate_sources(
                 )
             )
     return sources, llm_chunks
+
+
+async def _hydrate_answer_chunks(
+    db: AsyncSession,
+    rag_chunks: List[Any],
+) -> List[AnswerRetrievedChunk]:
+    """Hydrate retrieved chunk IDs back to full chunk text and metadata."""
+    if not rag_chunks:
+        return []
+
+    chunk_ids: List[UUID] = []
+    for chunk in rag_chunks:
+        try:
+            chunk_ids.append(UUID(str(chunk.chunk_id)))
+        except (TypeError, ValueError):
+            continue
+
+    if not chunk_ids:
+        return []
+
+    chunk_map: Dict[str, Any] = {}
+    try:
+        result = await db.execute(
+            select(Chunk, Document)
+            .join(Document, Chunk.document_id == Document.id)
+            .where(Chunk.id.in_(chunk_ids))
+        )
+        chunk_map = {str(chunk.id): (chunk, doc) for chunk, doc in result.all()}
+    except Exception as exc:
+        logger.warning("Falling back to retriever payloads for answer chunks: %s", exc)
+
+    hydrated: List[AnswerRetrievedChunk] = []
+    for retrieved in rag_chunks:
+        chunk_row = chunk_map.get(str(retrieved.chunk_id))
+        if not chunk_row:
+            text = (getattr(retrieved, "text", "") or "").strip()
+            if not text:
+                continue
+            hydrated.append(
+                AnswerRetrievedChunk(
+                    chunk_id=str(retrieved.chunk_id),
+                    document_id=str(retrieved.document_id),
+                    similarity=float(retrieved.similarity or 0.0),
+                    text=text,
+                    source_type=str(getattr(retrieved, "source_type", "document")),
+                    chunk_index=int(getattr(retrieved, "chunk_index", 0) or 0),
+                    document_title=getattr(retrieved, "document_title", "") or "Untitled Document",
+                    token_count=int(getattr(retrieved, "token_count", 0) or 0),
+                    context_before=getattr(retrieved, "context_before", None),
+                    context_after=getattr(retrieved, "context_after", None),
+                    metadata={**(getattr(retrieved, "metadata", None) or {}), "source_kind": "document"},
+                )
+            )
+            continue
+
+        chunk, doc = chunk_row
+        metadata = {
+            **(chunk.chunk_metadata or {}),
+            **(getattr(retrieved, "metadata", None) or {}),
+            "source_kind": "document",
+        }
+        if getattr(chunk, "created_at", None):
+            metadata.setdefault("created_at", chunk.created_at.isoformat())
+
+        hydrated.append(
+            AnswerRetrievedChunk(
+                chunk_id=str(chunk.id),
+                document_id=str(doc.id),
+                similarity=float(retrieved.similarity or 0.0),
+                text=(chunk.text or "").strip(),
+                source_type=getattr(doc.source_type, "value", str(doc.source_type)),
+                chunk_index=int(chunk.chunk_index or 0),
+                document_title=doc.title or getattr(retrieved, "document_title", "") or "Untitled Document",
+                token_count=int(chunk.token_count or getattr(retrieved, "token_count", 0) or 0),
+                context_before=chunk.context_before or getattr(retrieved, "context_before", None),
+                context_after=chunk.context_after or getattr(retrieved, "context_after", None),
+                metadata=metadata,
+            )
+        )
+    return hydrated
 
 
 def _dedupe_source_records(records: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
@@ -451,27 +555,10 @@ async def query(
         note_search_strategy: Optional[str] = None
         candidate_chunk_count = 0
         candidate_source_kind_counts: Dict[str, int] = {"document": 0, "note": 0}
+        answer_generation_status = "not_started"
+        answer_generation_error: Optional[str] = None
 
-        answer_chunks = [
-            AnswerRetrievedChunk(
-                chunk_id=str(chunk.chunk_id),
-                document_id=str(chunk.document_id),
-                similarity=float(chunk.similarity or 0.0),
-                text=chunk.text,
-                source_type=chunk.source_type,
-                chunk_index=int(chunk.chunk_index or 0),
-                document_title=chunk.document_title or "Untitled Document",
-                token_count=int(getattr(chunk, "token_count", 0) or 0),
-                context_before=getattr(chunk, "context_before", None),
-                context_after=getattr(chunk, "context_after", None),
-                metadata={
-                    **(getattr(chunk, "metadata", None) or {}),
-                    "source_kind": "document",
-                },
-            )
-            for chunk in rag_result.chunks
-            if (chunk.text or "").strip()
-        ]
+        answer_chunks = await _hydrate_answer_chunks(db, rag_result.chunks)
 
         if query_request.top_k > 0:
             semantic_start = time.time()
@@ -540,6 +627,7 @@ async def query(
             )
             llm_start = time.time()
             try:
+                answer_generation_status = "started"
                 generated_answer = await answer_generator.generate(
                     query=query_request.query,
                     chunks=answer_chunks,
@@ -577,23 +665,21 @@ async def query(
                             }
                             for source in sources
                         ]
+                answer_generation_status = "succeeded"
             except Exception as exc:
                 logger.error("Query %s: answer generation error: %s", query_record.id, exc, exc_info=True)
-                answer_text = "I found relevant documents, but I couldn't generate a grounded answer from them."
-                confidence = min(max(confidence, 0.1), 0.4)
-                final_sources = [
-                    {
-                        "chunk_id": source.chunk_id,
-                        "document_id": source.document_id,
-                        "document_title": source.document_title,
-                        "source_kind": source.source_kind,
-                        "similarity": source.similarity,
-                        "text": source.text,
-                    }
-                    for source in sources
-                ] if query_request.include_sources else []
+                answer_generation_status = "failed"
+                answer_generation_error = type(exc).__name__
+                answer_text, confidence, final_sources = _build_generation_failure_payload(
+                    include_sources=query_request.include_sources,
+                    reliable_evidence=reliable_evidence,
+                    evidence_summary=evidence_summary,
+                    sources=sources,
+                )
             finally:
                 step_times["llm_response"] = (time.time() - llm_start) * 1000
+        else:
+            answer_generation_status = "skipped_no_reliable_evidence"
 
         if answer_text == NO_EVIDENCE_MESSAGE:
             if reliable_evidence and query_request.include_sources and sources:
@@ -641,12 +727,15 @@ async def query(
                 "top_evidence_score": _rounded_metric(evidence_summary.get("top_evidence_score")),
                 "off_topic_ratio": _rounded_metric(evidence_summary.get("off_topic_ratio")),
                 "sources_returned": len(final_sources),
+                "answer_generation_status": answer_generation_status,
+                "answer_generation_error": answer_generation_error,
                 "timings_ms": {k: round(v, 1) for k, v in step_times.items()},
                 "client_ip": request.client.host if request.client else None,
             },
         )
 
         response_time_ms = int((time.time() - start_time) * 1000)
+        log_session_query_metrics(db, "query.execute")
         return QueryResponse(
             query_id=str(query_record.id),
             answer_id=str(answer.id),
@@ -672,27 +761,49 @@ async def verify_answer(
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Answer).where(Answer.id == answer_id))
-    answer = result.scalar_one_or_none()
-    if answer is None:
+    normalized_status = "verified" if verification.status == "approved" else verification.status
+    rating = 5 if normalized_status == "verified" else 1
+    verified_at = datetime.utcnow()
+
+    result = await db.execute(
+        select(Answer.workspace_id).where(Answer.id == answer_id)
+    )
+    answer_workspace_id = result.scalar_one_or_none()
+    if answer_workspace_id is None:
         raise HTTPException(status_code=404, detail="Answer not found")
 
-    await get_workspace_context(answer.workspace_id, current_user, db)
+    await get_workspace_context(answer_workspace_id, current_user, db)
+
+    update_result = await db.execute(
+        update(Answer)
+        .where(Answer.id == answer_id)
+        .values(
+            verification_status=normalized_status,
+            verified_by=current_user.id,
+            verified_at=verified_at,
+            verification_comment=verification.comment,
+        )
+        .returning(Answer.id)
+    )
+    updated_answer_id = update_result.scalar_one_or_none()
+    if updated_answer_id is None:
+        raise HTTPException(status_code=404, detail="Answer not found")
 
     feedback = Feedback(
-        answer_id=answer.id,
+        answer_id=updated_answer_id,
+        workspace_id=answer_workspace_id,
         user_id=current_user.id,
-        status=verification.status,
+        rating=rating,
         comment=verification.comment,
-        verified_at=datetime.utcnow(),
     )
     db.add(feedback)
     await db.commit()
+    log_session_query_metrics(db, "query.verify_answer")
 
     return VerificationResponse(
-        answer_id=str(answer.id),
+        answer_id=str(updated_answer_id),
         status=verification.status,
         verified_by=str(current_user.id),
         comment=verification.comment,
-        verified_at=feedback.verified_at.isoformat(),
+        verified_at=verified_at.isoformat(),
     )

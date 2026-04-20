@@ -11,7 +11,7 @@ from uuid import UUID
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query as QueryParam, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -19,7 +19,7 @@ from app.core.auth import WorkspaceContext, get_current_active_user, get_workspa
 from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser
 from app.database.models import WorkspaceSection
-from app.database.session import get_db
+from app.database.session import get_db, log_session_query_metrics
 from app.services.semantic_search import SemanticSearchResult, get_semantic_search_service
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,10 @@ class SemanticSearchResultPayload(BaseModel):
     tags: List[str] = Field(default_factory=list)
     source_type: str
     chunk_index: int
+    token_count: int = 0
+    context_before: Optional[str] = None
+    context_after: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: str
     interaction_count: int = 0
     similarity_score: float = Field(..., ge=0, le=1)
@@ -148,6 +152,7 @@ async def _run_semantic_search(
                 )
                 data["cached"] = True
                 data["search_log_id"] = search_log_id
+                log_session_query_metrics(db, "search.semantic.cached")
                 return SemanticSearchResponse(**data)
         except Exception as exc:
             logger.warning("Search cache read error: %s", exc)
@@ -184,6 +189,7 @@ async def _run_semantic_search(
         except Exception as exc:
             logger.warning("Search cache write error: %s", exc)
 
+    log_session_query_metrics(db, "search.semantic")
     return SemanticSearchResponse(**response_data)
 
 
@@ -286,8 +292,6 @@ async def log_search_click(
     current_user: Annotated[DBUser, Depends(get_current_active_user)] = None,
     db: Annotated[AsyncSession, Depends(get_db)] = None,
 ) -> ClickLogResponse:
-    from app.database.models import SearchLog
-
     await ensure_workspace_permission(
         workspace_id=workspace_ctx.workspace_id,
         user=current_user,
@@ -298,57 +302,86 @@ async def log_search_click(
     )
 
     try:
-        result = await db.execute(
-            select(SearchLog).where(
-                SearchLog.id == search_log_id,
-                SearchLog.workspace_id == workspace_ctx.workspace_id,
-            )
-        )
-        search_log = result.scalars().first()
-        if search_log is None:
-            raise HTTPException(status_code=404, detail="Search log not found")
-
-        search_log.clicked_count = int(search_log.clicked_count or 0) + 1
-        clicked_ids = list(search_log.clicked_chunk_ids or [])
         chunk_id_str = str(chunk_id)
-        if chunk_id_str not in clicked_ids:
-            clicked_ids.append(chunk_id_str)
-        search_log.clicked_chunk_ids = clicked_ids
+        chunk_json = json.dumps([chunk_id_str])
 
-        note_exists = await db.execute(
+        result = await db.execute(
             text(
                 """
-                SELECT id
-                FROM notes
-                WHERE id = :note_id
-                  AND workspace_id = :workspace_id
+                WITH target AS (
+                    SELECT
+                        id,
+                        COALESCE(clicked_chunk_ids, '[]'::jsonb) AS clicked_chunk_ids,
+                        COALESCE(clicked_chunk_ids, '[]'::jsonb) @> CAST(:chunk_json AS jsonb) AS already_clicked
+                    FROM search_logs
+                    WHERE id = :search_log_id
+                      AND workspace_id = :workspace_id
+                    FOR UPDATE
+                ),
+                updated AS (
+                    UPDATE search_logs AS search_logs
+                    SET clicked_chunk_ids = CASE
+                            WHEN target.already_clicked
+                                THEN target.clicked_chunk_ids
+                            ELSE target.clicked_chunk_ids || CAST(:chunk_json AS jsonb)
+                        END,
+                        clicked_count = CASE
+                            WHEN target.already_clicked
+                                THEN jsonb_array_length(target.clicked_chunk_ids)
+                            ELSE jsonb_array_length(target.clicked_chunk_ids || CAST(:chunk_json AS jsonb))
+                        END,
+                        updated_at = NOW()
+                    FROM target
+                    WHERE search_logs.id = target.id
+                    RETURNING
+                        search_logs.clicked_count AS clicked_count,
+                        NOT target.already_clicked AS click_added
+                )
+                SELECT clicked_count, click_added
+                FROM updated
                 """
             ),
             {
-                "note_id": chunk_id_str,
-                "workspace_id": str(workspace_ctx.workspace_id),
+                "search_log_id": search_log_id,
+                "workspace_id": workspace_ctx.workspace_id,
+                "chunk_json": chunk_json,
             },
         )
-        if note_exists.first() is not None:
+        row = result.first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Search log not found")
+
+        clicked_count = int(row[0] or 0)
+        click_added = bool(row[1])
+
+        if click_added:
             await db.execute(
                 text(
                     """
                     INSERT INTO note_interactions (note_id, user_id, workspace_id, interaction_type, context)
-                    VALUES (:note_id, :user_id, :workspace_id, :interaction_type, CAST(:context AS jsonb))
+                    SELECT
+                        notes.id,
+                        :user_id,
+                        :workspace_id,
+                        :interaction_type,
+                        CAST(:context AS jsonb)
+                    FROM notes
+                    WHERE notes.id = :note_id
+                      AND notes.workspace_id = :workspace_id
                     """
                 ),
                 {
-                    "note_id": chunk_id_str,
-                    "user_id": str(current_user.id),
-                    "workspace_id": str(workspace_ctx.workspace_id),
+                    "note_id": chunk_id,
+                    "user_id": current_user.id,
+                    "workspace_id": workspace_ctx.workspace_id,
                     "interaction_type": "search_click",
-                    "context": json.dumps({"search_log_id": str(search_log.id)}),
+                    "context": json.dumps({"search_log_id": str(search_log_id)}),
                 },
             )
 
-        db.add(search_log)
         await db.commit()
-        return ClickLogResponse(status="logged", clicked_count=search_log.clicked_count)
+        log_session_query_metrics(db, "search.log_click")
+        return ClickLogResponse(status="logged", clicked_count=clicked_count)
     except HTTPException:
         raise
     except Exception as exc:
