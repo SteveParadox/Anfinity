@@ -132,7 +132,7 @@ class RAGRetriever:
                         continue
 
                     seen_chunk_ids.add(chunk_id)
-                    text = payload.get("text") or payload.get("chunk_text", "")
+                    text = payload.get("text") or payload.get("chunk_text") or payload.get("text_preview", "")
                     chunk = RetrievedChunk(
                         chunk_id=chunk_id,
                         document_id=str(payload.get("document_id", "unknown")),

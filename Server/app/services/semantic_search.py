@@ -13,7 +13,15 @@ from uuid import UUID
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Note, SearchLog, SearchQuery
+try:
+    from app.database.models import Chunk, Document, Note, SearchLog, SearchQuery
+except ImportError:
+    # Some isolated tests stub only the note/search models. Document-chunk
+    # hydration is optional and should degrade gracefully in that environment.
+    from app.database.models import Note, SearchLog, SearchQuery
+
+    Chunk = None
+    Document = None
 from app.services.embeddings import get_embedding_service
 from app.services.postgresql_search import get_postgresql_search_service
 from app.services.rag_retriever import RAGRetriever, RetrievedChunk, get_rag_retriever
@@ -44,6 +52,10 @@ class SemanticSearchResult:
         final_score: float = 0.0,
         highlight: str = "",
         tags: Optional[List[str]] = None,
+        token_count: int = 0,
+        context_before: Optional[str] = None,
+        context_after: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         self.chunk_id = chunk_id
         self.document_id = document_id
@@ -62,6 +74,10 @@ class SemanticSearchResult:
         self.final_score = final_score
         self.highlight = highlight
         self.tags = tags or []
+        self.token_count = token_count
+        self.context_before = context_before
+        self.context_after = context_after
+        self.metadata = metadata or {}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +97,10 @@ class SemanticSearchResult:
             "final_score": round(self.final_score, 4),
             "highlight": self.highlight,
             "tags": self.tags,
+            "token_count": int(self.token_count or 0),
+            "context_before": self.context_before,
+            "context_after": self.context_after,
+            "metadata": self.metadata,
         }
 
     @classmethod
@@ -111,6 +131,10 @@ class SemanticSearchResult:
             final_score=float(data.get("final_score", 0.0) or 0.0),
             highlight=data.get("highlight", ""),
             tags=list(data.get("tags", []) or []),
+            token_count=int(data.get("token_count", 0) or 0),
+            context_before=data.get("context_before"),
+            context_after=data.get("context_after"),
+            metadata=dict(data.get("metadata", {}) or {}),
         )
 
 
@@ -266,6 +290,8 @@ class SemanticSearchService:
                     usage_score=usage_score,
                     final_score=self._calculate_final_score(semantic_score, recency_score, usage_score),
                     highlight=row.get("highlight") or self._extract_highlight(row.get("content", ""), query),
+                    token_count=int(row.get("token_count", 0) or 0),
+                    metadata={"source_kind": "note"},
                 )
             )
 
@@ -314,11 +340,13 @@ class SemanticSearchService:
     ) -> List[SemanticSearchResult]:
         del user_id, workspace_id
         enriched: List[SemanticSearchResult] = []
+        hydrated_chunks = await self._hydrate_document_chunks(db, chunks)
 
-        for chunk in chunks:
+        for chunk in hydrated_chunks:
             try:
                 similarity_score = max(0.0, min(chunk.similarity, 1.0))
-                metadata = chunk.metadata or {}
+                metadata = dict(chunk.metadata or {})
+                metadata.setdefault("source_kind", "document")
                 created_at = self._parse_datetime(metadata.get("created_at"))
 
                 enriched.append(
@@ -337,6 +365,10 @@ class SemanticSearchService:
                         text_score=float(metadata.get("lexical_overlap", 0.0) or 0.0),
                         highlight=self._extract_highlight(chunk.text, query),
                         tags=list(metadata.get("tags", []) or []),
+                        token_count=int(getattr(chunk, "token_count", 0) or metadata.get("token_count", 0) or 0),
+                        context_before=getattr(chunk, "context_before", None) or metadata.get("context_before"),
+                        context_after=getattr(chunk, "context_after", None) or metadata.get("context_after"),
+                        metadata=metadata,
                     )
                 )
             except Exception as exc:
@@ -345,6 +377,83 @@ class SemanticSearchService:
         if db is not None:
             await self._hydrate_result_tags(db, enriched)
         return enriched
+
+    async def _hydrate_document_chunks(
+        self,
+        db: Optional[AsyncSession],
+        chunks: List[RetrievedChunk],
+    ) -> List[RetrievedChunk]:
+        """Hydrate authoritative chunk text/title from SQL when vector payloads are sparse."""
+        if db is None or not chunks or Chunk is None or Document is None:
+            return chunks
+
+        chunk_ids: List[UUID] = []
+        for chunk in chunks:
+            try:
+                chunk_ids.append(UUID(str(chunk.chunk_id)))
+            except (TypeError, ValueError):
+                continue
+
+        if not chunk_ids:
+            return chunks
+
+        try:
+            rows = await db.execute(
+                select(Chunk, Document)
+                .join(Document, Chunk.document_id == Document.id)
+                .where(Chunk.id.in_(chunk_ids))
+            )
+        except Exception as exc:
+            logger.warning("Failed to hydrate retriever fallback chunks: %s", exc)
+            return chunks
+
+        hydrated_by_id = {
+            str(chunk_row.id): (chunk_row, document_row)
+            for chunk_row, document_row in rows.all()
+        }
+
+        hydrated: List[RetrievedChunk] = []
+        for chunk in chunks:
+            row = hydrated_by_id.get(str(chunk.chunk_id))
+            if row is None:
+                hydrated.append(chunk)
+                continue
+
+            chunk_row, document_row = row
+            merged_metadata = {
+                **(chunk_row.chunk_metadata or {}),
+                **(chunk.metadata or {}),
+            }
+            merged_metadata.setdefault("source_kind", "document")
+            merged_metadata.setdefault("document_id", str(document_row.id))
+            merged_metadata.setdefault("chunk_id", str(chunk_row.id))
+            merged_metadata.setdefault("chunk_index", chunk_row.chunk_index)
+            merged_metadata.setdefault("document_title", document_row.title or chunk.document_title)
+            merged_metadata.setdefault("token_count", chunk_row.token_count or chunk.token_count or 0)
+            merged_metadata.setdefault("context_before", chunk_row.context_before or chunk.context_before)
+            merged_metadata.setdefault("context_after", chunk_row.context_after or chunk.context_after)
+            if getattr(chunk_row, "created_at", None):
+                merged_metadata.setdefault("created_at", chunk_row.created_at.isoformat())
+            if getattr(document_row, "created_at", None):
+                merged_metadata.setdefault("document_created_at", document_row.created_at.isoformat())
+
+            hydrated.append(
+                RetrievedChunk(
+                    chunk_id=str(chunk_row.id),
+                    document_id=str(document_row.id),
+                    text=chunk_row.text or chunk.text,
+                    similarity=chunk.similarity,
+                    chunk_index=chunk_row.chunk_index,
+                    source_type=getattr(document_row.source_type, "value", str(document_row.source_type)),
+                    metadata=merged_metadata,
+                    document_title=document_row.title or chunk.document_title,
+                    token_count=chunk_row.token_count or chunk.token_count,
+                    context_before=chunk_row.context_before or chunk.context_before,
+                    context_after=chunk_row.context_after or chunk.context_after,
+                )
+            )
+
+        return hydrated
 
     def _rerank(self, results: List[SemanticSearchResult], query: str = "") -> List[SemanticSearchResult]:
         intent = analyze_query_intent(query)
@@ -508,7 +617,11 @@ class SemanticSearchService:
         if not results:
             return
 
-        note_ids = [result.document_id for result in results]
+        note_results = [result for result in results if str(result.source_kind or "").lower() == "note"]
+        if not note_results:
+            return
+
+        note_ids = list({result.document_id for result in note_results})
         try:
             rows = await db.execute(
                 select(Note.id, Note.tags).where(Note.id.in_(note_ids))
@@ -521,7 +634,7 @@ class SemanticSearchService:
             str(row[0]): list(row[1] or [])
             for row in rows.fetchall()
         }
-        for result in results:
+        for result in note_results:
             result.tags = tags_by_note_id.get(str(result.document_id), result.tags or [])
 
     @staticmethod

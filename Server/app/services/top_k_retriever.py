@@ -214,7 +214,7 @@ class TopKRetriever:
                         chunk_id=payload.get("chunk_id", result.get("id", "")),
                         document_id=payload.get("document_id", ""),
                         similarity=similarity,
-                        text=payload.get("chunk_text", ""),
+                        text=payload.get("text") or payload.get("chunk_text") or payload.get("text_preview", ""),
                         source_type=payload.get("source_type", "unknown"),
                         chunk_index=payload.get("chunk_index", 0),
                         document_title=payload.get("document_title", "Unknown"),
