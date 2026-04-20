@@ -129,8 +129,13 @@ export interface SearchResult {
   content: string;
   highlight: string;
   tags: string[];
+  source_kind: string;
   source_type: string;
   chunk_index: number;
+  token_count: number;
+  context_before?: string | null;
+  context_after?: string | null;
+  metadata?: Record<string, any>;
   created_at: string;
   interaction_count: number;
   similarity_score: number;
