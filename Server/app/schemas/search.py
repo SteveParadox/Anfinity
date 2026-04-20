@@ -25,6 +25,9 @@ class SearchResult(BaseModel):
     chunk_index: int
     source_kind: str
     source_type: str
+    token_count: int = 0
+    context_before: Optional[str] = None
+    context_after: Optional[str] = None
     metadata: Dict[str, Any]
     created_at: str
 
