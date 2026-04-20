@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 from typing import Annotated, Dict, Iterable, Literal, Optional
 from uuid import UUID
 
@@ -18,6 +19,8 @@ from app.database.models import (
     WorkspaceSection,
 )
 from app.database.session import get_db, get_session_info
+
+logger = logging.getLogger(__name__)
 
 PermissionAction = Literal["view", "create", "update", "delete", "manage"]
 PermissionState = Dict[PermissionAction, bool]
@@ -153,7 +156,18 @@ async def get_workspace_permissions_for_user(
     cache_key = _permission_cache_key(workspace_id, user.id)
     cached_permissions = cache.get(cache_key)
     if cached_permissions is not None:
+        logger.debug(
+            "Workspace permission cache hit: workspace_id=%s user_id=%s",
+            workspace_id,
+            user.id,
+        )
         return deepcopy(cached_permissions)
+
+    logger.debug(
+        "Workspace permission cache miss: workspace_id=%s user_id=%s",
+        workspace_id,
+        user.id,
+    )
 
     workspace_context = context or await get_workspace_context(workspace_id, user, db)
     permissions = build_role_permissions(workspace_context.role)

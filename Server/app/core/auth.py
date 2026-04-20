@@ -1,4 +1,5 @@
 """Authentication and authorization dependencies."""
+import logging
 from typing import Annotated, Optional
 from uuid import UUID
 
@@ -11,6 +12,8 @@ from sqlalchemy import select
 from app.database.session import bind_db_user_context, get_db, get_session_info
 from app.database.models import User as DBUser, Workspace, WorkspaceMember, WorkspaceRole
 from app.core.security import get_token_payload
+
+logger = logging.getLogger(__name__)
 
 # Security scheme
 security = HTTPBearer(auto_error=False)
@@ -280,7 +283,18 @@ async def get_workspace_context(
 
     cached_context = cache.get(cache_key)
     if cached_context is not None:
+        logger.debug(
+            "Workspace context cache hit: workspace_id=%s user_id=%s",
+            workspace_id,
+            user.id,
+        )
         return cached_context
+
+    logger.debug(
+        "Workspace context cache miss: workspace_id=%s user_id=%s",
+        workspace_id,
+        user.id,
+    )
 
     result = await db.execute(
         select(Workspace, WorkspaceMember)
