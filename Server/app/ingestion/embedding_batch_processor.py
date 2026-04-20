@@ -190,10 +190,6 @@ class BatchEmbeddingProcessor:
                 return {**result, "duration_ms": (time.time() - start_time) * 1000}
 
             collection_name = str(workspace_id)
-            self.vector_db.create_collection(
-                collection_name,
-                embedding_dim=self.embedding_provider.dimension,
-            )
 
             for batch_start in range(0, len(chunks), self.batch_size):
                 batch_end = min(batch_start + self.batch_size, len(chunks))
@@ -219,7 +215,11 @@ class BatchEmbeddingProcessor:
                 result["vector_ids"].extend(batch_result["vector_ids"])
                 result["errors"].extend(batch_result["errors"])
 
-            document.status = DocumentStatus.INDEXED
+            document.status = (
+                DocumentStatus.INDEXED
+                if result["failed_chunks"] == 0
+                else DocumentStatus.FAILED
+            )
             document.processed_at = datetime.utcnow()
             try:
                 await self.db.commit()
@@ -297,6 +297,11 @@ class BatchEmbeddingProcessor:
                 f"({actual_model_info['model_dimension']}D) from {actual_model_info['provider']}"
             )
             
+            self.vector_db.create_collection(
+                collection_name,
+                embedding_dim=actual_model_info["model_dimension"],
+            )
+
             # Prepare vector points for Qdrant
             vector_points = []
             embedding_records = []

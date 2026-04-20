@@ -40,19 +40,24 @@ class DocumentParser(ABC):
         Returns:
             Cleaned text
         """
-        # Normalize whitespace
-        text = re.sub(r'\s+', ' ', text)
-        
-        # Remove control characters except newlines
-        text = ''.join(char for char in text if char == '\n' or ord(char) >= 32)
-        
-        # Remove excessive newlines
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        
-        # Strip leading/trailing whitespace
-        text = text.strip()
-        
-        return text
+        # Preserve line structure because downstream chunking relies on headings,
+        # paragraphs, and page markers remaining intact.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Remove control characters except newlines and tabs.
+        text = "".join(
+            char for char in text
+            if char in ("\n", "\t") or ord(char) >= 32
+        )
+
+        # Normalize intra-line whitespace without collapsing line breaks.
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+
+        # Keep at most one blank line between content blocks.
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        return text.strip()
     
     def _extract_title(self, text: str) -> Optional[str]:
         """Extract title from text.

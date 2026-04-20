@@ -40,7 +40,7 @@ class TextParser(DocumentParser):
             frontmatter_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', text, re.DOTALL)
             if frontmatter_match:
                 frontmatter_text = frontmatter_match.group(1)
-                text = text[frontmatch.end():]
+                text = text[frontmatter_match.end():]
                 
                 # Parse simple key: value pairs
                 for line in frontmatter_text.split('\n'):
