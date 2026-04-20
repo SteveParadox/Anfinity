@@ -744,6 +744,7 @@ class ChunkWeight(Base):
     
     # Indexes
     __table_args__ = (
+        UniqueConstraint('workspace_id', 'document_id', 'chunk_id', name='uq_chunk_weight_scope'),
         Index('idx_chunk_weight_workspace', 'workspace_id', 'created_at'),
         Index('idx_chunk_weight_accuracy', 'accuracy_rate'),
     )
