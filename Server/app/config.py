@@ -270,6 +270,8 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.3
     LLM_MAX_TOKENS: int = 1000
     LLM_USE_FALLBACK: bool = True  # Enable fallback on provider errors
+    THINKING_SESSION_SYNTHESIS_MODEL: str = "gpt-4o"
+    THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS: int = 90
     GRAPH_CLUSTER_SYNC_TOKEN: Optional[str] = None
     
     # Embeddings
@@ -307,9 +309,11 @@ class Settings(BaseSettings):
     GITHUB_CLIENT_SECRET: Optional[str] = None
     
     # Rate Limiting
+    RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_REQUESTS: int = 100
     RATE_LIMIT_WINDOW: int = 60
     RATE_LIMIT_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_SKIP_LOCALHOST_IN_DEVELOPMENT: bool = True
     
     # File Upload
     MAX_FILE_SIZE_MB: int = 50
@@ -317,6 +321,8 @@ class Settings(BaseSettings):
         "application/pdf",
         "text/plain",
         "text/markdown",
+        "text/html",
+        "application/xhtml+xml",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ])
     

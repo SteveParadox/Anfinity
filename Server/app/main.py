@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 
 from app.config import get_ollama_request_headers, settings
 from app.database.session import init_db
-from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat
+from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions
 from app.events import websocket_router
 from app.middleware.logging import RequestLoggingMiddleware
 
@@ -209,6 +209,7 @@ app.include_router(query.router)
 app.include_router(retrieval.router)
 app.include_router(answers.router)
 app.include_router(chat.router)  # Ask Your Past Self chat
+app.include_router(thinking_sessions.router)  # Live Thinking Sessions
 app.include_router(knowledge_graph.router)
 app.include_router(audit.router)
 app.include_router(connectors.router)
