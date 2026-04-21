@@ -1,479 +1,406 @@
-"""Embedding service for generating and managing embeddings."""
+"""Celery tasks for embedding and indexing chunks."""
+import asyncio
 import logging
-from threading import RLock
-from typing import List, Optional
-
-import requests
-from app import config as app_config
+import os
+from typing import Any, Dict, List, Optional
+from uuid import UUID
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
-settings = app_config.settings
-_OPENAI_EMBEDDING_DIMENSIONS = {
-    "text-embedding-ada-002": 1536,
-    "text-embedding-3-small": 1536,
-    "text-embedding-3-large": 3072,
-}
 
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except ImportError:
-    HAS_OPENAI = False
-
-try:
-    import cohere
-    HAS_COHERE = True
-except ImportError:
-    HAS_COHERE = False
-
-def _ai_runtime():
-    getter = getattr(app_config, "get_ai_runtime_config", None)
-    if callable(getter):
-        return getter()
-
-    class _Namespace:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    return _Namespace(
-        openai=_Namespace(
-            api_key=getattr(settings, "OPENAI_API_KEY", None),
-            embedding_model=getattr(settings, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
-        ),
-        ollama=_Namespace(
-            base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
-            api_key=getattr(settings, "OLLAMA_API_KEY", None),
-            embedding_model=getattr(settings, "OLLAMA_EMBEDDING_MODEL", "nomic-embed-text"),
-            embedding_timeout=int(getattr(settings, "OLLAMA_EMBED_TIMEOUT", getattr(settings, "OLLAMA_TIMEOUT", 60)) or 60),
-            embedding_batch_size=int(getattr(settings, "OLLAMA_EMBED_BATCH_SIZE", getattr(settings, "EMBEDDING_BATCH_SIZE", 32)) or 32),
-        ),
-        embeddings=_Namespace(
-            provider=str(getattr(settings, "EMBEDDING_PROVIDER", "ollama") or "ollama").lower(),
-            dimension=int(getattr(settings, "EMBEDDING_DIMENSION", 768) or 768),
-            cohere_api_key=getattr(settings, "COHERE_API_KEY", None),
-            cohere_model=getattr(settings, "COHERE_EMBEDDING_MODEL", "embed-english-v3.0"),
-        ),
-    )
-
-
-class EmbeddingService:
-    """Service for generating text embeddings.
-
-    Provider priority:
-        1. openai  — text-embedding-3-small  (1536-dim)
-        2. cohere  — embed-english-v3.0      (1024-dim)
-        3. ollama  — nomic-embed-text        (768-dim)   ← real local fallback
-
-    Mock / all-same-value vectors are never produced.  If every provider
-    fails a RuntimeError is raised so callers know the truth instead of
-    silently getting useless embeddings.
-    """
-
-    MAX_SINGLE_EMBED_TEXT_CHARS = 6000
-    LONG_TEXT_CHUNK_CHARS = 5000
-    LONG_TEXT_CHUNK_OVERLAP_CHARS = 500
-    MAX_LONG_TEXT_CHUNKS = 8
-
-    def __init__(self, provider: Optional[str] = None):
-        """Initialize embedding service.
-
-        Args:
-            provider: "openai", "cohere", or "ollama"
-        """
-        runtime = _ai_runtime()
-        self.provider = (provider or runtime.embeddings.provider or "ollama").lower()
-        self.model = None
-        self.dimension = runtime.embeddings.dimension
-        self._http: Optional[requests.Session] = None
-        self._cache = None
-        self._cache_lock = RLock()
-
-        if self.provider == "openai" and HAS_OPENAI:
-            self.client = OpenAI(api_key=runtime.openai.api_key)
-            self.model = runtime.openai.embedding_model
-            self.dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(self.model, 1536)
-
-        elif self.provider == "cohere" and HAS_COHERE:
-            self.client = cohere.Client(api_key=runtime.embeddings.cohere_api_key)
-            self.model = runtime.embeddings.cohere_model
-            self.dimension = 1024
-
-        elif self.provider == "ollama":
-            # Ollama is handled via HTTP in embed_with_ollama(); no SDK client.
-            self.client = None
-            self.model = runtime.ollama.embedding_model
-            self.dimension = runtime.embeddings.dimension
-
-        else:
-            # No recognised provider — do NOT silently fall back to mock data.
-            # STEP 1: surface the problem immediately at construction time.
-            raise ValueError(
-                f"Embedding provider '{self.provider}' is not available.  "
-                "Install 'openai', 'cohere', or run Ollama locally and set "
-                "provider='ollama'."
-            )
-
-    def _get_cache(self):
-        """Lazily create the shared embeddings cache."""
-        if self._cache is not None:
-            return self._cache
-
-        with self._cache_lock:
-            if self._cache is None:
-                try:
-                    from app.services.hybrid_embeddings_cache import HybridEmbeddingsCache
-
-                    self._cache = HybridEmbeddingsCache(enable_l2=True)
-                except Exception as exc:
-                    logger.warning("Embeddings cache unavailable: %s", exc)
-                    self._cache = False
-        return self._cache if self._cache is not False else None
-
-    # ------------------------------------------------------------------
-    # STEP 2: real Ollama integration
-    # ------------------------------------------------------------------
-
-    def _get_http(self) -> requests.Session:
-        """Create a reusable HTTP session for embedding calls."""
-        if self._http is None:
-            session = requests.Session()
-            getter = getattr(app_config, "get_ollama_request_headers", None)
-            if callable(getter):
-                session.headers.update(getter())
-            else:
-                session.headers.update({"Content-Type": "application/json"})
-            self._http = session
-        return self._http
-
-    def _validate_ollama_embeddings_response(
-        self,
-        data: dict,
-        expected_count: int,
-    ) -> List[List[float]]:
-        """Normalise Ollama responses across endpoint variants."""
-        embeddings = data.get("embeddings")
-        if embeddings is None and "embedding" in data:
-            embeddings = [data["embedding"]]
-        if not isinstance(embeddings, list):
-            raise RuntimeError(f"Ollama response missing embeddings payload: {data}")
-        if len(embeddings) != expected_count:
-            raise RuntimeError(
-                f"Ollama returned {len(embeddings)} embeddings for {expected_count} inputs"
-            )
-        return embeddings
-
-    def embed_with_ollama(self, texts: List[str]) -> List[List[float]]:
-        """Call a local Ollama instance to generate embeddings in batches.
-
-        Uses /api/embed with a list input so we avoid one-request-per-text
-        overhead. Falls back to the legacy /api/embeddings endpoint only when
-        the server does not support batch embedding.
-        """
-        if not texts:
-            return []
-
-        runtime = _ai_runtime()
-        ollama_base_url = runtime.ollama.base_url.rstrip("/")
-        ollama_model = self.model or runtime.ollama.embedding_model
-        ollama_batch_size = runtime.ollama.embedding_batch_size
-        ollama_timeout = runtime.ollama.embedding_timeout
-        session = self._get_http()
-        embeddings: List[List[float]] = []
-
-        for start in range(0, len(texts), ollama_batch_size):
-            batch = texts[start : start + ollama_batch_size]
-            try:
-                response = session.post(
-                    f"{ollama_base_url}/api/embed",
-                    json={"model": ollama_model, "input": batch},
-                    timeout=ollama_timeout,
-                )
-                if response.status_code == 404:
-                    raise requests.HTTPError("/api/embed unsupported", response=response)
-                response.raise_for_status()
-                embeddings.extend(
-                    self._validate_ollama_embeddings_response(
-                        response.json(),
-                        expected_count=len(batch),
-                    )
-                )
-                continue
-            except Exception as batch_err:
-                logger.warning(
-                    "Batch Ollama embedding failed for %d texts, falling back to legacy mode: %s",
-                    len(batch),
-                    batch_err,
-                )
-
-            for text in batch:
-                response = session.post(
-                    f"{ollama_base_url}/api/embeddings",
-                    json={"model": ollama_model, "prompt": text},
-                    timeout=ollama_timeout,
-                )
-                if response.status_code != 200:
-                    raise RuntimeError(
-                        f"Ollama embedding failed (HTTP {response.status_code}): "
-                        f"{response.text[:200]}"
-                    )
-                embeddings.extend(
-                    self._validate_ollama_embeddings_response(
-                        response.json(),
-                        expected_count=1,
-                    )
-                )
-
-        return embeddings
-
-
-    # ------------------------------------------------------------------
-    # BONUS: safety / sanity check
-    # ------------------------------------------------------------------
-
-    EXPECTED_DIMS = {768, 1024, 1536}
-
-    def is_valid_embedding(self, vec):
-        if not isinstance(vec, list):
-            return False
-
-        if len(vec) not in self.EXPECTED_DIMS:
-            return False
-
-        if len(set(vec)) <= 2:
-            return False
-
-        return True
-
-    def _split_long_text_for_embedding(self, text: str) -> List[str]:
-        """Split a long text into overlapping windows safe for local embedders."""
-        cleaned = (text or "").strip()
-        if not cleaned:
-            return []
-        if len(cleaned) <= self.MAX_SINGLE_EMBED_TEXT_CHARS:
-            return [cleaned]
-
-        chunk_size = self.LONG_TEXT_CHUNK_CHARS
-        overlap = min(self.LONG_TEXT_CHUNK_OVERLAP_CHARS, max(chunk_size // 4, 1))
-        step = max(chunk_size - overlap, 1)
-
-        chunks: List[str] = []
-        start = 0
-        while start < len(cleaned) and len(chunks) < self.MAX_LONG_TEXT_CHUNKS:
-            end = min(start + chunk_size, len(cleaned))
-            window = cleaned[start:end].strip()
-            if window:
-                chunks.append(window)
-            if end >= len(cleaned):
-                break
-            start += step
-
-        return chunks or [cleaned[: self.MAX_SINGLE_EMBED_TEXT_CHARS]]
-
-    def _pool_embeddings(
-        self,
-        embeddings: List[List[float]],
-        weights: Optional[List[float]] = None,
-    ) -> List[float]:
-        """Combine multiple chunk embeddings into a single vector."""
-        if not embeddings:
-            return []
-        if len(embeddings) == 1:
-            return embeddings[0]
-
-        dimension = len(embeddings[0])
-        if weights is None or len(weights) != len(embeddings):
-            weights = [1.0] * len(embeddings)
-
-        total_weight = sum(max(float(weight), 0.0) for weight in weights) or float(len(embeddings))
-        pooled = [0.0] * dimension
-
-        for embedding, weight in zip(embeddings, weights):
-            scaled_weight = max(float(weight), 0.0)
-            for index, value in enumerate(embedding):
-                pooled[index] += float(value) * scaled_weight
-
-        return [value / total_weight for value in pooled]
-
-    def embed_text(self, text: str) -> List[float]:
-        """Embed a single text string.
-
-        Args:
-            text: Text to embed.
-
-        Returns:
-            Embedding vector.
-
-        Raises:
-            RuntimeError: If embedding fails.
-        """
-        cleaned = (text or "").strip()
-        if not cleaned:
-            return []
-
-        cache = self._get_cache()
-        cache_model = self.get_model_name()
-        if cache is not None:
-            cached = cache.get(cleaned, cache_model)
-            if cached is not None:
-                return cached
-
-        embed_inputs = self._split_long_text_for_embedding(cleaned)
-        if len(embed_inputs) > 1:
-            logger.info(
-                "Long embedding input detected for model=%s; splitting into %d windows (chars=%d)",
-                cache_model,
-                len(embed_inputs),
-                len(cleaned),
-            )
-
-        result = self.embed_batch(embed_inputs)
-        if len(result) == len(embed_inputs) and len(result) > 1:
-            weights = [len(chunk) for chunk in embed_inputs]
-            embedding = self._pool_embeddings(result, weights=weights)
-        else:
-            embedding = result[0] if result else []
-
-        if embedding and cache is not None:
-            cache.set(cleaned, self.get_model_name(), embedding)
-        return embedding
-
-    def embed_query(self, text: str) -> List[float]:
-        """Embed a query string with caching enabled."""
-        return self.embed_text(text)
-
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Embed multiple texts.
-
-        Args:
-            texts: Texts to embed.
-
-        Returns:
-            List of validated embedding vectors.
-
-        Raises:
-            RuntimeError: If every provider fails or a vector fails
-                          the sanity check.
-        """
-        if not texts:
-            return []
-
-        # Sanitise inputs
-        texts = [t.strip() for t in texts if t and t.strip()]
-        if not texts:
-            return []
-
-        embeddings: List[List[float]] = []
-
-        try:
-            if self.provider == "openai" and self.client:
-                response = self.client.embeddings.create(
-                    model=self.model,
-                    input=texts,
-                )
-                # Maintain original order
-                sorted_data = sorted(response.data, key=lambda x: x.index)
-                embeddings = [e.embedding for e in sorted_data]
-
-            elif self.provider == "cohere" and self.client:
-                response = self.client.embed(
-                    texts=texts,
-                    model=self.model,
-                    input_type="search_document",
-                )
-                embeddings = response.embeddings
-
-            elif self.provider == "ollama":
-                embeddings = self.embed_with_ollama(texts)
-
-            else:
-                # STEP 1: no silent mock fallback — fail loudly.
-                raise RuntimeError("Embedding generation failed: no provider configured.")
-
-        except Exception as primary_err:
-            # Primary provider failed — attempt Ollama as emergency fallback
-            # only when the primary was NOT already Ollama.
-            if self.provider != "ollama":
-                # FIX: Check if Ollama has the same dimension as primary provider
-                # to prevent silent dimension mismatches during fallback
-                ollama_dimension = _ai_runtime().embeddings.dimension
-                if ollama_dimension != self.dimension:
-                    logger.error(
-                        "Cannot fall back to Ollama: dimension mismatch. "
-                        "Primary provider '%s' uses %dD, but Ollama uses %dD. "
-                        "This would corrupt query embeddings. "
-                        "Ensure consistent EMBEDDING_PROVIDER across ingestion and query.",
-                        self.provider,
-                        self.dimension,
-                        ollama_dimension,
-                    )
-                    raise RuntimeError(
-                        f"Primary embedding provider '{self.provider}' failed and "
-                        f"fallback provider (Ollama) has incompatible dimensions "
-                        f"({self.dimension}D vs {ollama_dimension}D). "
-                        f"Cannot safely fall back. Original error: {primary_err}"
-                    ) from primary_err
-                
-                logger.warning(
-                    "Primary embedding provider '%s' failed (%s). "
-                    "Falling back to Ollama (dimension-compatible).",
-                    self.provider,
-                    primary_err,
-                )
-                try:
-                    embeddings = self.embed_with_ollama(texts)
-                except Exception as ollama_err:
-                    logger.error("Ollama fallback also failed: %s", ollama_err)
-                    # STEP 1: raise — never return fake vectors.
-                    raise RuntimeError(
-                        f"All embedding providers failed. "
-                        f"Primary error: {primary_err}. "
-                        f"Ollama error: {ollama_err}"
-                    ) from ollama_err
-            else:
-                raise RuntimeError(
-                    f"Embedding generation failed: {primary_err}"
-                ) from primary_err
-
-        # BONUS: validate every vector before returning
-        for i, vec in enumerate(embeddings):
-            if not self.is_valid_embedding(vec):
-                raise RuntimeError(
-                    f"Embedding at index {i} failed sanity check "
-                    f"(length={len(vec)}, distinct_values={len(set(vec))}).  "
-                    "This looks like a constant/mock vector — refusing to return it."
-                )
-
-        return embeddings
-
-    def get_dimension(self) -> int:
-        """Return the embedding dimension for the active provider."""
-        return self.dimension
-
-    def get_model_name(self) -> str:
-        """Return the model name for the active provider."""
-        return self.model or _ai_runtime().ollama.embedding_model
+# Import the central Celery app
+from app.celery_app import celery_app
+
+# ---------------------------------------------------------------------------
+# FIX 8: Safe asyncio.run wrapper.
+#
+# asyncio.run() raises RuntimeError if called from inside an already-running
+# event loop (common in Jupyter, some test frameworks, and certain Celery
+# configurations).  This helper detects that situation and falls back to
+# creating a fresh loop on a background thread so the coroutine always runs.
+# ---------------------------------------------------------------------------
+def _run_async(coro):
+    """Run *coro* safely regardless of the current event-loop state."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # We're inside a running loop (e.g. gevent/eventlet Celery pool).
+        # Spin up a dedicated thread with its own loop.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
+    else:
+        return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
-# Singleton
+# FIX 6 & 7 & 9: Use AsyncSessionLocal (async session) instead of the sync
+# SessionLocal.  The BatchEmbeddingProcessor expects an async session; mixing
+# a sync session with async DB calls corrupts the connection.
 # ---------------------------------------------------------------------------
+async def generate_embeddings_for_document(
+    document_id: str,
+    workspace_id: str,
+    batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Generate embeddings for all chunks of a document.
 
-_embedding_service: "EmbeddingService | None" = None
-
-
-def get_embedding_service(provider: str = None) -> EmbeddingService:
-    """Get or create the global EmbeddingService singleton.
+    Steps:
+    1. Retrieve all chunks for the document.
+    2. Generate embeddings via the configured provider (batched).
+    3. Store embeddings in Qdrant with full metadata payload.
+    4. Update document status to INDEXED.
 
     Args:
-        provider: Override the EMBEDDING_PROVIDER env-var.
+        document_id:  Document UUID as string.
+        workspace_id: Workspace UUID as string.
+        batch_size:   Override default batch size from settings.
 
     Returns:
-        EmbeddingService instance.
+        Dict with processing stats and status.
     """
-    global _embedding_service
+    # Lazy imports — keep module-level import cost low
+    from app.database.session import AsyncSessionLocal  # FIX 6: async session
+    from app.ingestion.embedder import Embedder
+    from app.ingestion.embedding_batch_processor import BatchEmbeddingProcessor
+    from app.services.vector_db import get_vector_db_client
+    from app.config import settings
 
-    if _embedding_service is None:
-        provider = provider or _ai_runtime().embeddings.provider
-        _embedding_service = EmbeddingService(provider)
+    logger.info("Starting embedding generation for document %s", document_id)
 
-    return _embedding_service
+    # FIX 9: use async context manager — guarantees connection cleanup even
+    # if the processor raises partway through.
+    async with AsyncSessionLocal() as db:
+        try:
+            embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+            
+            # ── FIX: capture actual model and dimension for accurate collection creation ───
+            actual_model = embedder.model_name
+            actual_dim = embedder.dimension
+            logger.info(
+                "🧠 [EMBEDDING CONFIG] Model: %s, Dimension: %dD",
+                actual_model, actual_dim,
+            )
+            
+            vector_db = get_vector_db_client()
+            # Pass explicit dimension so collection is created with correct size
+            vector_db.create_collection(workspace_id, embedding_dim=actual_dim)
+
+            batch_sz = batch_size or settings.EMBEDDING_BATCH_SIZE
+            processor = BatchEmbeddingProcessor(
+                db=db,
+                embedding_provider=embedder._provider,
+                vector_db=vector_db,
+                batch_size=batch_sz,
+            )
+
+            doc_uuid = UUID(document_id)
+            ws_uuid = UUID(workspace_id)
+
+            result = await processor.process_document_chunks(doc_uuid, ws_uuid)
+
+            logger.info(
+                "✓ Embedding complete: %d/%d chunks processed for document %s",
+                result["processed_chunks"],
+                result["total_chunks"],
+                document_id,
+            )
+
+            return {
+                "status": "success" if result["success"] else "partial",
+                "document_id": document_id,
+                "workspace_id": workspace_id,
+                "total_chunks": result["total_chunks"],
+                "processed_chunks": result["processed_chunks"],
+                "failed_chunks": result["failed_chunks"],
+                "duration_ms": result["duration_ms"],
+                "errors": result["errors"],
+            }
+
+        except Exception as exc:
+            logger.error("Error generating embeddings for document %s: %s", document_id, exc, exc_info=True)
+            return {
+                "status": "error",
+                "document_id": document_id,
+                "workspace_id": workspace_id,
+                "error": str(exc),
+            }
+
+
+async def generate_embeddings_for_workspace(
+    workspace_id: str,
+    limit: Optional[int] = None,
+    batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Generate embeddings for all pending documents in a workspace.
+
+    Args:
+        workspace_id: Workspace UUID as string.
+        limit:        Max documents to process in this run.
+        batch_size:   Chunk batch size override.
+
+    Returns:
+        Dict with aggregate stats.
+    """
+    from app.database.session import AsyncSessionLocal  # FIX 7: async session
+    from app.ingestion.embedder import Embedder
+    from app.ingestion.embedding_batch_processor import BatchEmbeddingProcessor
+    from app.services.vector_db import get_vector_db_client
+    from app.config import settings
+
+    logger.info("Starting workspace batch embedding for %s", workspace_id)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+            
+            # ── FIX: capture actual model and dimension for accurate collection creation ───
+            actual_model = embedder.model_name
+            actual_dim = embedder.dimension
+            logger.info(
+                "🧠 [EMBEDDING CONFIG] Workspace batch - Model: %s, Dimension: %dD",
+                actual_model, actual_dim,
+            )
+            
+            vector_db = get_vector_db_client()
+            # Pass explicit dimension so collection is created with correct size
+            vector_db.create_collection(workspace_id, embedding_dim=actual_dim)
+
+            batch_sz = batch_size or settings.EMBEDDING_BATCH_SIZE
+            processor = BatchEmbeddingProcessor(
+                db=db,
+                embedding_provider=embedder._provider,
+                vector_db=vector_db,
+                batch_size=batch_sz,
+            )
+
+            ws_uuid = UUID(workspace_id)
+            result = await processor.process_pending_chunks(ws_uuid, limit)
+
+            logger.info(
+                "✓ Workspace batch complete: %d/%d chunks from %d documents for workspace %s",
+                result["total_processed_chunks"],
+                result["total_chunks"],
+                result["processed_documents"],
+                workspace_id,
+            )
+
+            return {
+                "status": "success" if result["success"] else "partial",
+                "workspace_id": workspace_id,
+                **result,
+            }
+
+        except Exception as exc:
+            logger.error("Error in workspace batch embedding for %s: %s", workspace_id, exc, exc_info=True)
+            return {
+                "status": "error",
+                "workspace_id": workspace_id,
+                "error": str(exc),
+            }
+
+
+# ---------------------------------------------------------------------------
+# Legacy sync task — kept for backward compatibility
+# ---------------------------------------------------------------------------
+def embed_chunks_task(
+    workspace_id: str,
+    chunk_ids: List[str],
+    texts: List[str],
+    batch_size: int = 50,
+) -> Dict[str, Any]:
+    """Embed chunks synchronously using the legacy embedding service."""
+    from app.services.embeddings import get_embedding_service
+    from app.services.vector_db import get_vector_db_client
+
+    embedding_service = get_embedding_service()
+    vector_db = get_vector_db_client()
+
+    logger.info(
+        "Starting legacy embedding task for workspace %s: %d chunks",
+        workspace_id,
+        len(chunk_ids),
+    )
+
+    try:
+        # ── FIX: Probe for actual embedding dimension (may differ from default) ────────
+        # Some services may return different dims in different scenarios.
+        probe_embedding = embedding_service.embed_batch(["test"])
+        actual_dim = len(probe_embedding[0]) if probe_embedding else 768
+        logger.info(
+            "🧠 [LEGACY EMBEDDING] Live dimension: %dD (probed from embedding service)",
+            actual_dim,
+        )
+        
+        # ── FIX: pass explicit dimension so collection is created correctly ───────────
+        vector_db.create_collection(str(workspace_id), embedding_dim=actual_dim)
+
+        total_embedded = 0
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            batch_ids = chunk_ids[i : i + batch_size]
+
+            logger.debug(
+                "Processing batch %d: %d chunks", i // batch_size + 1, len(batch_texts)
+            )
+
+            embeddings = embedding_service.embed_batch(batch_texts)
+
+            if not embeddings or len(embeddings) != len(batch_ids):
+                logger.error(
+                    "Embedding mismatch: got %d embeddings for %d chunks — skipping batch",
+                    len(embeddings) if embeddings else 0,
+                    len(batch_ids),
+                )
+                continue
+
+            points = [
+                {
+                    "id": chunk_id,
+                    "vector": embedding,
+                    "payload": {
+                        "chunk_id": chunk_id,
+                        "text": text[:1000],
+                        "workspace_id": workspace_id,
+                        "created_at": datetime.utcnow().isoformat(),
+                    },
+                }
+                for chunk_id, text, embedding in zip(batch_ids, batch_texts, embeddings)
+            ]
+
+            if vector_db.upsert_vectors(str(workspace_id), points):
+                total_embedded += len(batch_ids)
+            else:
+                logger.error("Failed to upsert batch %d", i // batch_size)
+
+        logger.info(
+            "✓ Embedded %d/%d chunks for workspace %s",
+            total_embedded,
+            len(chunk_ids),
+            workspace_id,
+        )
+
+        return {
+            "status": "success",
+            "workspace_id": workspace_id,
+            "chunks_embedded": total_embedded,
+            "total_chunks": len(chunk_ids),
+        }
+
+    except Exception as exc:
+        logger.error("Error embedding chunks for workspace %s: %s", workspace_id, exc, exc_info=True)
+        return {"status": "error", "workspace_id": workspace_id, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Celery task wrappers
+# FIX 8: Use _run_async() everywhere instead of bare asyncio.run()
+# ---------------------------------------------------------------------------
+
+@celery_app.task(bind=True, name="generate_embeddings_document")
+def generate_embeddings_document_celery(
+    self,
+    document_id: str,
+    workspace_id: str,
+    batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Celery task: generate embeddings for a single document."""
+    logger.info("🧠 [TASK START] generate_embeddings_document_celery - Document: %s, Workspace: %s, Batch Size: %s, Task ID: %s", document_id, workspace_id, batch_size, self.request.id)
+    
+    try:
+        logger.debug("🔄 [ASYNC EXECUTION] Starting async embedding generation")
+        result = _run_async(
+            generate_embeddings_for_document(document_id, workspace_id, batch_size)
+        )
+        logger.info("✅ [TASK SUCCESS] generate_embeddings_document_celery completed - Task ID: %s - Result: %s", self.request.id, result.get("status"))
+        return result
+    except Exception as exc:
+        logger.error("❌ [TASK ERROR] generate_embeddings_document_celery failed - Document: %s, Workspace: %s - Task ID: %s", document_id, workspace_id, self.request.id, exc_info=True)
+        return {"status": "error", "document_id": document_id, "error": str(exc)}
+
+@celery_app.task(bind=True, name="generate_embeddings_workspace")
+def generate_embeddings_workspace_celery(
+    self,
+    workspace_id: str,
+    limit: Optional[int] = None,
+    batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Celery task: generate embeddings for all pending documents in a workspace."""
+    logger.info("🧠 [TASK START] generate_embeddings_workspace_celery - Workspace: %s, Limit: %s, Batch Size: %s, Task ID: %s", workspace_id, limit, batch_size, self.request.id)
+    
+    try:
+        logger.debug("🔄 [ASYNC EXECUTION] Starting async workspace embedding generation for %d documents", limit or -1)
+        result = _run_async(
+            generate_embeddings_for_workspace(workspace_id, limit, batch_size)
+        )
+        logger.info("✅ [TASK SUCCESS] generate_embeddings_workspace_celery completed - Workspace: %s - Task ID: %s - Result: %s", workspace_id, self.request.id, result.get("status"))
+        return result
+    except Exception as exc:
+        logger.error("❌ [TASK ERROR] generate_embeddings_workspace_celery failed - Workspace: %s - Task ID: %s", workspace_id, self.request.id, exc_info=True)
+        return {"status": "error", "workspace_id": workspace_id, "error": str(exc)}
+
+@celery_app.task(bind=True, name="embed_chunks")
+def embed_chunks_celery(
+    self,
+    workspace_id: str,
+    chunk_ids: List[str],
+    texts: List[str],
+    batch_size: int = 50,
+) -> Dict[str, Any]:
+    """Celery task: legacy chunk embedding."""
+    logger.info("🧠 [TASK START] embed_chunks_celery - Workspace: %s, Chunks: %d, Batch Size: %d, Task ID: %s", workspace_id, len(chunk_ids), batch_size, self.request.id)
+    
+    try:
+        logger.debug("📦 [CHUNK PROCESSING] Processing %d chunks in batches of %d", len(chunk_ids), batch_size)
+        result = embed_chunks_task(workspace_id, chunk_ids, texts, batch_size)
+        logger.info("✅ [TASK SUCCESS] embed_chunks_celery completed - Workspace: %s, Chunks: %d - Task ID: %s - Result: %s", workspace_id, len(chunk_ids), self.request.id, result.get("status"))
+        return result
+    except Exception as exc:
+        logger.error("❌ [TASK ERROR] embed_chunks_celery failed - Workspace: %s, Chunks: %d - Task ID: %s", workspace_id, len(chunk_ids), self.request.id, exc_info=True)
+        return {"status": "error", "workspace_id": workspace_id, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Public queue helpers — callers should use these, not the task wrappers.
+# ---------------------------------------------------------------------------
+
+def queue_embedding_task(
+    workspace_id: str,
+    chunk_ids: List[str],
+    texts: List[str],
+    batch_size: int = 50,
+) -> str:
+    """Queue a legacy chunk-embedding job."""
+    task = embed_chunks_celery.delay(workspace_id, chunk_ids, texts, batch_size)
+    logger.debug("Queued embedding task: %s", task.id)
+    return str(task.id)
+
+
+def queue_document_embeddings(
+    document_id: str,
+    workspace_id: str,
+    batch_size: Optional[int] = None,
+) -> str:
+    """Queue embedding generation for a document."""
+    task = generate_embeddings_document_celery.delay(
+        document_id, workspace_id, batch_size
+    )
+    logger.info("Queued document embedding task: %s", task.id)
+    return str(task.id)
+
+
+def queue_workspace_embeddings(
+    workspace_id: str,
+    limit: Optional[int] = None,
+    batch_size: Optional[int] = None,
+) -> str:
+    """Queue batch embedding generation for a workspace."""
+    task = generate_embeddings_workspace_celery.delay(
+        workspace_id, limit, batch_size
+    )
+    logger.info("Queued workspace embedding task: %s", task.id)
+    return str(task.id)

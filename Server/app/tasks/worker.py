@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import List, Optional
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from celery.signals import task_postrun, task_prerun
 
@@ -31,9 +31,10 @@ from app.events import (
     broadcast_progress_update_sync,
     broadcast_stage_update_sync,
 )
-from app.ingestion.chunker import TextChunk, chunker
+from app.ingestion.chunker import TextChunk, chunk_parsed_document, chunker
 from app.ingestion.embedder import Embedder
 from app.ingestion.parsers import get_parser
+from app.ingestion.source_locations import enrich_citation_metadata
 from app.services.vector_db import get_vector_db_client
 from app.storage.s3 import s3_client
 
@@ -166,53 +167,156 @@ def _fail_document_without_retry(
     }
 
 
-def _save_chunks(db, document_uuid: UUID, chunks: List[TextChunk]) -> list:
-    """Upsert chunks and return ORM instances in chunk_index order.
+def _normalize_vector_ids(vector_ids: List[str]) -> list[str]:
+    """Normalize vector IDs for delete operations while preserving order."""
+    return list(dict.fromkeys(str(vector_id) for vector_id in vector_ids if vector_id))
 
-    IDEMPOTENT via ON CONFLICT DO UPDATE.
-    Uses a single SELECT … WHERE id IN (…) instead of one query per chunk.
-    """
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-    from sqlalchemy.sql import func as sql_func
 
-    # ✅ FIX: Batch upsert loop (but fetch in one query below)
-    for chunk in chunks:
-        stmt = (
-            pg_insert(Chunk)
-            .values(
-                document_id=document_uuid,
-                chunk_index=chunk.index,
-                text=chunk.text,
-                token_count=chunk.token_count,
-                context_before=chunk.context_before,
-                context_after=chunk.context_after,
-                chunk_metadata=chunk.metadata or {},
-                chunk_status=ChunkStatus.PENDING,
-            )
-            .on_conflict_do_update(
-                constraint="unique_chunk_index",
-                set_={
-                    "text": chunk.text,
-                    "token_count": chunk.token_count,
-                    "context_before": chunk.context_before,
-                    "context_after": chunk.context_after,
-                    "chunk_metadata": chunk.metadata or {},
-                    "updated_at": sql_func.now(),
-                    # chunk_status intentionally NOT updated — preserves EMBEDDED on retry
-                },
-            )
+def _schedule_deferred_vector_cleanup(
+    collection_name: str,
+    vector_ids: List[str],
+    *,
+    reason: str,
+) -> None:
+    """Queue a retryable cleanup task when immediate deletion fails."""
+    normalized_ids = _normalize_vector_ids(vector_ids)
+    if not normalized_ids:
+        return
+
+    try:
+        delete_vector_ids.delay(collection_name, normalized_ids, reason=reason)
+        logger.warning(
+            "Scheduled deferred vector cleanup for %d vector(s) in '%s': %s",
+            len(normalized_ids),
+            collection_name,
+            reason,
         )
-        db.execute(stmt)
+    except Exception:
+        logger.exception(
+            "Failed to schedule deferred vector cleanup for %d vector(s) in '%s'",
+            len(normalized_ids),
+            collection_name,
+        )
 
-    db.commit()
 
-    # ✅ FIX: Single query instead of N+1 SELECTs
-    return (
+def _cleanup_vector_ids(
+    collection_name: str,
+    vector_ids: List[str],
+    *,
+    reason: str,
+    defer_on_failure: bool = True,
+) -> bool:
+    """Delete vector IDs now, and optionally queue a retryable fallback cleanup."""
+    normalized_ids = _normalize_vector_ids(vector_ids)
+    if not normalized_ids:
+        return True
+
+    try:
+        deleted = get_vector_db_client().delete_points(collection_name, normalized_ids)
+    except Exception:
+        logger.exception(
+            "Immediate vector cleanup raised for %d vector(s) in '%s': %s",
+            len(normalized_ids),
+            collection_name,
+            reason,
+        )
+        deleted = False
+
+    if deleted:
+        logger.info(
+            "Cleaned up %d vector(s) from '%s': %s",
+            len(normalized_ids),
+            collection_name,
+            reason,
+        )
+        return True
+
+    logger.warning(
+        "Immediate vector cleanup failed for %d vector(s) in '%s': %s",
+        len(normalized_ids),
+        collection_name,
+        reason,
+    )
+    if defer_on_failure:
+        _schedule_deferred_vector_cleanup(
+            collection_name,
+            normalized_ids,
+            reason=reason,
+        )
+    return False
+
+
+def _save_chunks(db, document_uuid: UUID, chunks: List[TextChunk]) -> tuple[list, list[str]]:
+    """Synchronize chunk rows with the latest parsed output.
+
+    Returns:
+        Tuple ``(chunks_in_order, stale_vector_ids)``.
+    """
+    existing_chunks = (
         db.query(Chunk)
         .filter(Chunk.document_id == document_uuid)
         .order_by(Chunk.chunk_index)
         .all()
     )
+    existing_by_index = {chunk.chunk_index: chunk for chunk in existing_chunks}
+    incoming_indices = {chunk.index for chunk in chunks}
+    stale_vector_ids: List[str] = []
+
+    for chunk in chunks:
+        existing = existing_by_index.get(chunk.index)
+        if existing is None:
+            db.add(
+                Chunk(
+                    document_id=document_uuid,
+                    chunk_index=chunk.index,
+                    text=chunk.text,
+                    token_count=chunk.token_count,
+                    context_before=chunk.context_before,
+                    context_after=chunk.context_after,
+                    chunk_metadata=chunk.metadata or {},
+                    chunk_status=ChunkStatus.PENDING,
+                )
+            )
+            continue
+
+        changed = any(
+            [
+                existing.text != chunk.text,
+                int(existing.token_count or 0) != int(chunk.token_count or 0),
+                (existing.context_before or None) != (chunk.context_before or None),
+                (existing.context_after or None) != (chunk.context_after or None),
+                (existing.chunk_metadata or {}) != (chunk.metadata or {}),
+            ]
+        )
+
+        existing.text = chunk.text
+        existing.token_count = chunk.token_count
+        existing.context_before = chunk.context_before
+        existing.context_after = chunk.context_after
+        existing.chunk_metadata = chunk.metadata or {}
+
+        if changed:
+            if existing.embedding is not None:
+                stale_vector_ids.append(str(existing.embedding.vector_id))
+                db.delete(existing.embedding)
+            existing.chunk_status = ChunkStatus.PENDING
+
+    for stale_chunk in existing_chunks:
+        if stale_chunk.chunk_index in incoming_indices:
+            continue
+        if stale_chunk.embedding is not None:
+            stale_vector_ids.append(str(stale_chunk.embedding.vector_id))
+            db.delete(stale_chunk.embedding)
+        db.delete(stale_chunk)
+
+    db.commit()
+    refreshed_chunks = (
+        db.query(Chunk)
+        .filter(Chunk.document_id == document_uuid)
+        .order_by(Chunk.chunk_index)
+        .all()
+    )
+    return refreshed_chunks, stale_vector_ids
 
 
 def _index_vectors(
@@ -252,7 +356,7 @@ def _index_vectors(
     vector_db = get_vector_db_client()
     vector_db.create_collection(collection_name, embedding_dim=actual_dim)  # ← explicit dim
 
-    vector_ids = [str(uuid4()) for _ in embeddings]
+    vector_ids = [str(db_chunks[i].id) for i in range(len(embeddings))]
     payloads = [
         {
             "document_id": document_id,
@@ -266,7 +370,11 @@ def _index_vectors(
             "token_count": chunk.token_count,
             "context_before": chunk.context_before,
             "context_after": chunk.context_after,
-            "metadata": dict(chunk.metadata or {}),
+            "metadata": enrich_citation_metadata(
+                dict(chunk.metadata or {}),
+                document_title=document.title,
+                source_type=document.source_type.value,
+            ),
             "created_at": datetime.utcnow().isoformat(),
             **extra_payload,
         }
@@ -296,18 +404,29 @@ def _index_vectors(
         raise RuntimeError(error_msg)
 
     # ✅ FIX: Batch insert for Embedding rows (no N+1 adds)
-    for db_chunk, vector_id in zip(db_chunks, vector_ids):
-        db.add(
-            Embedding(
-                chunk_id=db_chunk.id,
-                vector_id=vector_id,
-                collection_name=collection_name,
-                model_used=actual_model,            # ← actual provider, not default
-                embedding_dimension=actual_dim,     # ← actual dimension
+    try:
+        for db_chunk, vector_id in zip(db_chunks, vector_ids):
+            db.add(
+                Embedding(
+                    chunk_id=db_chunk.id,
+                    vector_id=vector_id,
+                    collection_name=collection_name,
+                    model_used=actual_model,            # ← actual provider, not default
+                    embedding_dimension=actual_dim,     # ← actual dimension
+                )
             )
+            db_chunk.chunk_status = ChunkStatus.EMBEDDED
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        cleanup_reason = (
+            "Rolling back freshly upserted vectors after SQL persistence failure "
+            f"for document {document_id}"
         )
-        db_chunk.chunk_status = ChunkStatus.EMBEDDED
-    db.commit()
+        _cleanup_vector_ids(collection_name, vector_ids, reason=cleanup_reason)
+        raise RuntimeError(
+            f"Failed to persist embedding metadata for document {document_id}"
+        ) from exc
 
     return vector_ids
 
@@ -475,12 +594,20 @@ def process_document(self, document_id: str) -> dict:
                 progress={"status": "Creating chunks…"},
             )
 
-            logger.debug("🔄 [CHUNKER] Starting text chunking - Text length: %d chars", len(parsed_text))
-            chunks = chunker.chunk_text(
-                parsed_text,
+            document.source_metadata = {
+                **(document.source_metadata or {}),
+                **(parsed.metadata or {}),
+            }
+            db.commit()
+
+            logger.debug("🔄 [CHUNKER] Starting traceable chunking - Text length: %d chars", len(parsed_text))
+            chunks = chunk_parsed_document(
+                parsed,
                 metadata={
                     "document_id": document_id,
                     "source_type": document.source_type.value,
+                    "source_file_name": document.source_metadata.get("filename") or document.title,
+                    "document_title": document.title,
                     **parsed.metadata,
                 },
             )
@@ -496,10 +623,17 @@ def process_document(self, document_id: str) -> dict:
                     error_code="NO_CHUNKS_CREATED",
                 )
             logger.debug("💾 [DB INSERT] Saving %d chunks to database", len(chunks))
-            db_chunks = _save_chunks(db, document_uuid, chunks)
+            db_chunks, stale_vector_ids = _save_chunks(db, document_uuid, chunks)
             document.chunk_count = len(chunks)
             db.commit()
             logger.debug("💾 [DB UPDATE] Chunk count updated - Chunks: %d", len(chunks))
+
+            if stale_vector_ids:
+                _cleanup_vector_ids(
+                    str(document.workspace_id),
+                    stale_vector_ids,
+                    reason=f"Removing stale vectors after rechunking document {document_id}",
+                )
 
             chunk_ms = int((time.time() - t0) * 1000)
             logger.info("✅ [STAGE 3 COMPLETE] Created %d chunks in %d ms - Document: %s", len(chunks), chunk_ms, document_id)
@@ -633,31 +767,103 @@ def process_document(self, document_id: str) -> dict:
             return {"status": "failed", "document_id": document_id, "error": error_msg}
 
 
-@celery_app.task
-def delete_document_vectors(document_id: str, workspace_id: str) -> dict:
-    """Remove all vectors for a document from the vector index.
+@celery_app.task(bind=True, max_retries=3)
+def delete_vector_ids(
+    self,
+    collection_name: str,
+    vector_ids: List[str],
+    reason: Optional[str] = None,
+) -> dict:
+    """Retryable cleanup task for explicit vector IDs."""
+    normalized_ids = _normalize_vector_ids(vector_ids)
+    logger.info(
+        "delete_vector_ids started for collection %s with %d vector(s)",
+        collection_name,
+        len(normalized_ids),
+    )
 
-    BUG FIX: the original code referenced the undefined name ``vector_index``.
-    We now obtain the client via :func:`get_vector_db_client`, consistent with
-    how every other task in this module accesses the vector store.
-    """
-    logger.info("🗑️ [TASK START] delete_document_vectors - Document: %s, Workspace: %s", document_id, workspace_id)
-    
+    if not normalized_ids:
+        return {
+            "status": "success",
+            "collection_name": collection_name,
+            "deleted_count": 0,
+            "message": "No vector IDs to delete",
+        }
+
     try:
-        logger.debug("🔄 [VECTOR_DB] Getting vector database client")
-        vector_db = get_vector_db_client()
-        collection_name = workspace_id
-        logger.debug("🔍 [VECTOR_DB] Deleting vectors from collection: %s", collection_name)
-        
-        vector_db.delete_by_filter(
+        deleted = get_vector_db_client().delete_points(collection_name, normalized_ids)
+        if not deleted:
+            raise RuntimeError(
+                f"Vector delete returned false for collection '{collection_name}'"
+            )
+        logger.info(
+            "delete_vector_ids completed for collection %s with %d vector(s)",
             collection_name,
+            len(normalized_ids),
+        )
+        return {
+            "status": "success",
+            "collection_name": collection_name,
+            "deleted_count": len(normalized_ids),
+            "reason": reason,
+        }
+    except Exception as exc:
+        logger.error(
+            "delete_vector_ids failed for collection %s: %s",
+            collection_name,
+            exc,
+            exc_info=True,
+        )
+        if self.request.retries < self.max_retries:
+            countdown = _retry_countdown(self.request.retries)
+            raise self.retry(exc=exc, countdown=countdown)
+        return {
+            "status": "failed",
+            "collection_name": collection_name,
+            "deleted_count": 0,
+            "reason": reason,
+            "error": str(exc),
+        }
+
+
+@celery_app.task(bind=True, max_retries=3)
+def delete_document_vectors(self, document_id: str, workspace_id: str) -> dict:
+    """Remove all vectors for a document from the vector index."""
+    logger.info(
+        "delete_document_vectors started for document %s in workspace %s",
+        document_id,
+        workspace_id,
+    )
+
+    try:
+        deleted = get_vector_db_client().delete_by_filter(
+            workspace_id,
             filters={"document_id": document_id},
         )
-        logger.info("✅ [VECTOR_DB] Deleted vectors for document %s from collection %s", document_id, collection_name)
-        logger.info("✅ [TASK SUCCESS] delete_document_vectors completed")
-        return {"status": "success", "document_id": document_id, "message": "Vectors deleted"}
+        if not deleted:
+            raise RuntimeError(
+                f"Vector delete returned false for document {document_id}"
+            )
+        logger.info(
+            "delete_document_vectors completed for document %s in workspace %s",
+            document_id,
+            workspace_id,
+        )
+        return {
+            "status": "success",
+            "document_id": document_id,
+            "message": "Vectors deleted",
+        }
     except Exception as exc:
-        logger.error("❌ [TASK ERROR] Failed to delete vectors for document %s: %s", document_id, exc, exc_info=True)
+        logger.error(
+            "delete_document_vectors failed for document %s: %s",
+            document_id,
+            exc,
+            exc_info=True,
+        )
+        if self.request.retries < self.max_retries:
+            countdown = _retry_countdown(self.request.retries)
+            raise self.retry(exc=exc, countdown=countdown)
         return {"status": "failed", "document_id": document_id, "error": str(exc)}
 
 
@@ -781,10 +987,17 @@ def process_paste_content(
             logger.debug("✂️ [CHUNKING] Starting chunking process")
             chunks = chunker.chunk_text(text_content, metadata=metadata)
             logger.debug("💾 [DB INSERT] Saving %d chunks", len(chunks))
-            db_chunks = _save_chunks(db, document_uuid, chunks)
+            db_chunks, stale_vector_ids = _save_chunks(db, document_uuid, chunks)
             document.chunk_count = len(chunks)
             db.commit()
             logger.info("✅ [CHUNKS SAVED] %d chunks created and indexed", len(chunks))
+
+            if stale_vector_ids:
+                _cleanup_vector_ids(
+                    str(document.workspace_id),
+                    stale_vector_ids,
+                    reason=f"Removing stale vectors after reprocessing pasted document {document_id}",
+                )
 
             logger.debug("🧠 [EMBEDDING] Starting vector indexing")
             vector_ids = _index_vectors(
@@ -959,10 +1172,17 @@ def process_voice_input(
             logger.debug("✂️ [CHUNKING] Creating chunks from transcript")
             chunks = chunker.chunk_text(text_content, metadata=metadata)
             logger.debug("💾 [DB INSERT] Saving %d chunks", len(chunks))
-            db_chunks = _save_chunks(db, document_uuid, chunks)
+            db_chunks, stale_vector_ids = _save_chunks(db, document_uuid, chunks)
             document.chunk_count = len(chunks)
             db.commit()
             logger.info("✅ [CHUNKS] Created %d chunks", len(chunks))
+
+            if stale_vector_ids:
+                _cleanup_vector_ids(
+                    str(document.workspace_id),
+                    stale_vector_ids,
+                    reason=f"Removing stale vectors after reprocessing voice document {document_id}",
+                )
 
             logger.debug("🧠 [EMBEDDING] Indexing vectors")
             vector_ids = _index_vectors(
