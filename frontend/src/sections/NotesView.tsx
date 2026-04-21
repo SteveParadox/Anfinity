@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext } from 'react';
+import { useState, useEffect, useContext, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -10,6 +10,9 @@ import type { Note, NoteConnectionSuggestion, NoteVersion, Workspace } from '@/t
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
+import { getCollaboratorColor } from '@/lib/collaboration/colors';
+import { CollaborativeNoteEditor } from '@/components/notes/CollaborativeNoteEditor';
+import { NoteInvitePanel } from '@/components/notes/NoteInvitePanel';
 
 interface NotesViewProps {
   notes?: Note[];
@@ -449,11 +452,13 @@ export function NotesView({
 }: NotesViewProps) {
   const authContext = useContext(AuthContext);
   const {
+    user,
     currentWorkspaceId,
     workspaces: ctxWorkspaces,
     setCurrentWorkspace,
     hasPermission,
   } = authContext || {
+    user: null,
     currentWorkspaceId: null,
     workspaces: [],
     setCurrentWorkspace: () => {},
@@ -469,17 +474,22 @@ export function NotesView({
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
   const [restoringVersionId, setRestoringVersionId] = useState<string | null>(null);
+  const [collaborationSyncState, setCollaborationSyncState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [isCreating, setIsCreating] = useState(false);
   const [editingNote, setEditingNote] = useState<Note | null>(null);
   const [newTag, setNewTag] = useState('');
   const [connectionSuggestions, setConnectionSuggestions] = useState<NoteConnectionSuggestion[]>([]);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  const lastCollaborativeContentRef = useRef<Record<string, string>>({});
+  const collaborativeSyncRequestRef = useRef(0);
+  const collaborativeSyncAbortRef = useRef<AbortController | null>(null);
 
   const workspaceId = currentWorkspaceId || initialSelectedWorkspace;
   const defaultWorkspaceId = workspaceId || workspaces[0]?.id || '';
   const canViewWorkspaceNotes = Boolean(workspaceId && hasPermission(workspaceId, 'notes', 'view'));
   const canCreateWorkspaceNotes = Boolean(defaultWorkspaceId && hasPermission(defaultWorkspaceId, 'notes', 'create'));
   const canUpdateSelectedNote = Boolean(selectedNote?.workspaceId && hasPermission(selectedNote.workspaceId, 'notes', 'update'));
+  const collaborationToken = api.getToken();
 
   const createEmptyNote = (targetWorkspaceId = '') => ({
     title: '',
@@ -525,6 +535,103 @@ export function NotesView({
       return { ...prev, workspaceId: defaultWorkspaceId };
     });
   }, [defaultWorkspaceId, workspaces]);
+
+  useEffect(() => {
+    collaborativeSyncRequestRef.current += 1;
+    collaborativeSyncAbortRef.current?.abort();
+    collaborativeSyncAbortRef.current = null;
+
+    if (!editingNote) {
+      setCollaborationSyncState('idle');
+      return;
+    }
+
+    lastCollaborativeContentRef.current[editingNote.id] = editingNote.content;
+    setCollaborationSyncState('idle');
+  }, [editingNote?.id]);
+
+  useEffect(() => {
+    if (!editingNote?.workspaceId || !collaborationToken) {
+      return;
+    }
+
+    if (!hasPermission(editingNote.workspaceId, 'notes', 'update')) {
+      return;
+    }
+
+    const lastPersistedContent = lastCollaborativeContentRef.current[editingNote.id] ?? '';
+    if (editingNote.content === lastPersistedContent) {
+      if (collaborationSyncState === 'saving') {
+        setCollaborationSyncState('saved');
+      }
+      return;
+    }
+
+    setCollaborationSyncState('saving');
+    const requestId = collaborativeSyncRequestRef.current + 1;
+    collaborativeSyncRequestRef.current = requestId;
+    const timeout = setTimeout(async () => {
+      const abortController = new AbortController();
+      collaborativeSyncAbortRef.current?.abort();
+      collaborativeSyncAbortRef.current = abortController;
+
+      try {
+        const syncedNote = normalizeNote(
+          await api.syncCollaborativeNoteContent(editingNote.id, editingNote.content, {
+            signal: abortController.signal,
+          })
+        );
+
+        if (
+          abortController.signal.aborted
+          || requestId !== collaborativeSyncRequestRef.current
+        ) {
+          return;
+        }
+
+        lastCollaborativeContentRef.current[editingNote.id] = syncedNote.content;
+        setCollaborationSyncState('saved');
+        setNotes((prev) => prev.map((note) => (note.id === syncedNote.id ? syncedNote : note)));
+        setSelectedNote((current) => (current?.id === syncedNote.id ? syncedNote : current));
+        setEditingNote((current) => {
+          if (!current || current.id !== syncedNote.id) {
+            return current;
+          }
+
+          return {
+            ...current,
+            updatedAt: syncedNote.updatedAt,
+          };
+        });
+      } catch (err) {
+        if (
+          abortController.signal.aborted
+          || requestId !== collaborativeSyncRequestRef.current
+        ) {
+          return;
+        }
+
+        console.error('Collaborative note sync error:', err);
+        setCollaborationSyncState('error');
+      } finally {
+        if (collaborativeSyncAbortRef.current === abortController) {
+          collaborativeSyncAbortRef.current = null;
+        }
+      }
+    }, 1500);
+
+    return () => {
+      clearTimeout(timeout);
+      collaborativeSyncAbortRef.current?.abort();
+      collaborativeSyncAbortRef.current = null;
+    };
+  }, [
+    collaborationToken,
+    editingNote?.content,
+    editingNote?.id,
+    editingNote?.workspaceId,
+    hasPermission,
+  ]);
 
   // Load notes from API
   useEffect(() => {
@@ -715,11 +822,13 @@ export function NotesView({
     try {
       const updatedNote: any = await api.updateNote(editingNote.id, {
         title: editingNote.title,
-        content: editingNote.content,
+        ...(collaborationToken ? {} : { content: editingNote.content }),
         tags: editingNote.tags,
         note_type: editingNote.type,
       });
       const normalizedUpdatedNote = normalizeNote(updatedNote);
+      lastCollaborativeContentRef.current[normalizedUpdatedNote.id] = normalizedUpdatedNote.content;
+      setCollaborationSyncState('saved');
 
       setNotes(notes.map(n => n.id === normalizedUpdatedNote.id ? normalizedUpdatedNote : n) as Note[]);
       if (selectedNote?.id === normalizedUpdatedNote.id) {
@@ -1254,11 +1363,39 @@ export function NotesView({
                 </SelectContent>
               </Select>
             </div>
+            <NoteInvitePanel
+              noteId={editingNote.id}
+              noteTitle={editingNote.title}
+              canManage={Boolean(
+                (user?.id && editingNote.userId === user.id)
+                || (editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'manage'))
+              )}
+            />
             <div>
               <FieldLabel>Content</FieldLabel>
-              <TTTextarea
-                value={editingNote.content}
-                onChange={(v) => setEditingNote({ ...editingNote, content: v })}
+              <CollaborativeNoteEditor
+                noteId={editingNote.id}
+                token={collaborationToken}
+                user={{
+                  userId: user?.id || editingNote.userId,
+                  email: user?.email || '',
+                  name: user?.full_name || user?.email || 'Collaborator',
+                  color: getCollaboratorColor(user?.id || editingNote.userId),
+                  canUpdate: Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update')),
+                }}
+                editable={Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update'))}
+                onPlainTextChange={(content) => {
+                  setEditingNote((current) => {
+                    if (!current || current.id !== editingNote.id || current.content === content) {
+                      return current;
+                    }
+
+                    return {
+                      ...current,
+                      content,
+                    };
+                  });
+                }}
               />
             </div>
             <div>
@@ -1282,6 +1419,47 @@ export function NotesView({
                   <TagChip key={tag} label={tag} onRemove={() => removeTag(tag, true)} />
                 ))}
               </div>
+            </div>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 10,
+                flexWrap: 'wrap',
+                padding: '10px 12px',
+                borderRadius: 3,
+                background: 'rgba(245,230,66,0.04)',
+                border: `1px solid ${TT.inkBorder}`,
+              }}
+            >
+              <span style={{ fontFamily: TT.fontMono, fontSize: 9.5, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted }}>
+                Collaboration Save
+              </span>
+              <span
+                style={{
+                  fontFamily: TT.fontMono,
+                  fontSize: 9.5,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase',
+                  color:
+                    collaborationSyncState === 'error'
+                      ? TT.error
+                      : collaborationSyncState === 'saved'
+                        ? '#34D399'
+                        : collaborationSyncState === 'saving'
+                          ? TT.yolk
+                          : TT.inkSubtle,
+                }}
+              >
+                {collaborationSyncState === 'error'
+                  ? 'Sync failed'
+                  : collaborationSyncState === 'saved'
+                    ? 'Synced'
+                    : collaborationSyncState === 'saving'
+                      ? 'Saving…'
+                      : 'Waiting'}
+              </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 8 }}>
               <GhostBtn onClick={() => setEditingNote(null)}>Cancel</GhostBtn>

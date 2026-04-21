@@ -4,7 +4,7 @@
  */
 
 import { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,7 +15,9 @@ import { cn } from '@/lib/utils';
 
 export function LoginPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { login, isLoading, error, clearError } = useAuth();
+  const redirectTo = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
 
   const [formData, setFormData] = useState({
     email: '',
@@ -46,7 +48,7 @@ export function LoginPage() {
     if (!validateForm()) return;
     try {
       await login(formData.email, formData.password);
-      navigate('/dashboard');
+      navigate(redirectTo ? `${redirectTo.pathname || ''}${redirectTo.search || ''}` : '/dashboard');
     } catch {}
   };
 

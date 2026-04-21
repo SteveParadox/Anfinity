@@ -10,6 +10,8 @@ import { PrivateRoute } from '@/components/PrivateRoute';
 import App from '@/App';
 import { LoginPage } from '@/pages/LoginPage';
 import { RegisterPage } from '@/pages/RegisterPage';
+import { AcceptNoteInvitePage } from '@/pages/AcceptNoteInvitePage';
+import { SharedNotePage } from '@/pages/SharedNotePage';
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 
@@ -42,6 +44,22 @@ function InnerRouter() {
         <Route path="/register" element={<RegisterPage />} />
 
         {/* Protected Routes */}
+        <Route
+          path="/note-invites/accept"
+          element={
+            <PrivateRoute>
+              <AcceptNoteInvitePage />
+            </PrivateRoute>
+          }
+        />
+        <Route
+          path="/shared-notes/:noteId"
+          element={
+            <PrivateRoute>
+              <SharedNotePage />
+            </PrivateRoute>
+          }
+        />
         <Route
           path="/*"
           element={

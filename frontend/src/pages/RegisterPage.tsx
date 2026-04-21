@@ -4,13 +4,15 @@
  */
 
 import { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { Loader2, UserPlus, AlertCircle, Check } from 'lucide-react';
 
 export function RegisterPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { register, isLoading, error, clearError } = useAuth();
+  const redirectTo = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
 
   const [formData, setFormData] = useState({
     email: '',
@@ -78,7 +80,7 @@ export function RegisterPage() {
     if (!validateForm()) return;
     try {
       await register(formData.email, formData.password, formData.fullName);
-      navigate('/dashboard');
+      navigate(redirectTo ? `${redirectTo.pathname || ''}${redirectTo.search || ''}` : '/dashboard');
     } catch {}
   };
 

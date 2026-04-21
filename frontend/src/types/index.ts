@@ -25,6 +25,33 @@ export interface Note {
   type: 'note' | 'web-clip' | 'document' | 'voice' | 'ai-generated';
   word_count?: number;
   embedding?: string;
+  access?: NoteAccess;
+}
+
+export interface NoteAccess {
+  noteId: string;
+  accessSource: string;
+  canView: boolean;
+  canUpdate: boolean;
+  canDelete: boolean;
+  canManage: boolean;
+  collaboratorRole?: 'viewer' | 'editor';
+}
+
+export interface NoteInvite {
+  id: string;
+  noteId: string;
+  inviterUserId?: string;
+  inviteeEmail?: string;
+  inviteeUserId?: string;
+  role: 'viewer' | 'editor';
+  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+  expiresAt: Date;
+  acceptedAt?: Date;
+  revokedAt?: Date;
+  message?: string;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export type NoteConnectionSuggestionStatus = 'pending' | 'confirmed' | 'dismissed';
