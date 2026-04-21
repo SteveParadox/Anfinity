@@ -12,7 +12,9 @@ import type {
   KnowledgeGraph,
   KnowledgeGraphFilters,
   Note as AppNote,
+  NoteAccess,
   NoteConnectionSuggestion,
+  NoteInvite,
   NoteVersion,
   WorkspacePermissions,
   WorkspacePermissionSection,
@@ -22,6 +24,24 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 const API_TIMEOUT = parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'); // 30 seconds
 const MAX_RETRIES = parseInt(import.meta.env.VITE_API_MAX_RETRIES || '3');
 const RETRY_DELAY = parseInt(import.meta.env.VITE_API_RETRY_DELAY || '1000'); // ms
+
+function transformNoteInviteFromAPI(invite: any): NoteInvite {
+  return {
+    id: invite.id,
+    noteId: invite.note_id || invite.noteId,
+    inviterUserId: invite.inviter_user_id || invite.inviterUserId || undefined,
+    inviteeEmail: invite.invitee_email || invite.inviteeEmail || undefined,
+    inviteeUserId: invite.invitee_user_id || invite.inviteeUserId || undefined,
+    role: invite.role || 'viewer',
+    status: invite.status || 'pending',
+    expiresAt: invite.expires_at ? new Date(invite.expires_at) : new Date(),
+    acceptedAt: invite.accepted_at ? new Date(invite.accepted_at) : undefined,
+    revokedAt: invite.revoked_at ? new Date(invite.revoked_at) : undefined,
+    message: invite.message || undefined,
+    createdAt: invite.created_at ? new Date(invite.created_at) : new Date(),
+    updatedAt: invite.updated_at ? new Date(invite.updated_at) : new Date(),
+  };
+}
 
 // Error Types
 export class ApiError extends Error {
@@ -284,24 +304,33 @@ class ApiClient {
   private mergeAbortSignals(
     timeoutController: AbortController,
     externalSignal?: AbortSignal | null
-  ): AbortSignal {
+  ): { signal: AbortSignal; cleanup: () => void } {
     if (!externalSignal) {
-      return timeoutController.signal;
+      return {
+        signal: timeoutController.signal,
+        cleanup: () => {},
+      };
     }
 
     if (externalSignal.aborted) {
       timeoutController.abort();
-      return timeoutController.signal;
+      return {
+        signal: timeoutController.signal,
+        cleanup: () => {},
+      };
     }
 
     const mergedController = new AbortController();
+    const cleanup = () => {
+      externalSignal.removeEventListener('abort', onExternalAbort);
+      timeoutController.signal.removeEventListener('abort', onTimeoutAbort);
+    };
     const forwardAbort = () => {
       if (!mergedController.signal.aborted) {
         mergedController.abort();
       }
       timeoutController.abort();
-      externalSignal.removeEventListener('abort', onExternalAbort);
-      timeoutController.signal.removeEventListener('abort', onTimeoutAbort);
+      cleanup();
     };
     const onExternalAbort = () => forwardAbort();
     const onTimeoutAbort = () => forwardAbort();
@@ -309,7 +338,10 @@ class ApiClient {
     externalSignal.addEventListener('abort', onExternalAbort, { once: true });
     timeoutController.signal.addEventListener('abort', onTimeoutAbort, { once: true });
 
-    return mergedController.signal;
+    return {
+      signal: mergedController.signal,
+      cleanup,
+    };
   }
 
   /**
@@ -336,6 +368,10 @@ class ApiClient {
           ) {
             throw error;
           }
+        }
+
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw error;
         }
 
         // Don't retry on last attempt
@@ -368,7 +404,7 @@ class ApiClient {
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), timeout);
     const requestKey = `${options.method || 'GET'} ${endpoint}`;
-    const requestSignal = this.mergeAbortSignals(abortController, externalSignal);
+    const { signal: requestSignal, cleanup: cleanupRequestSignal } = this.mergeAbortSignals(abortController, externalSignal);
 
     try {
       this.abortControllers.set(requestKey, abortController);
@@ -425,6 +461,7 @@ class ApiClient {
       this.logger.log(options.method || 'GET', endpoint, 500, duration, genericError.message);
       throw genericError;
     } finally {
+      cleanupRequestSignal();
       clearTimeout(timeoutId);
       this.abortControllers.delete(requestKey);
     }
@@ -648,10 +685,11 @@ class ApiClient {
     source_url?: string;
     note_type?: string;
   }): Promise<AppNote> {
-    return this.request('/notes', {
+    const response = await this.request('/notes', {
       method: 'POST',
       body: JSON.stringify(note),
     });
+    return transformNoteFromAPI(response);
   }
 
   async listNotes(params?: {
@@ -673,7 +711,92 @@ class ApiClient {
   }
 
   async getNote(noteId: string): Promise<AppNote> {
-    return this.request(`/notes/${noteId}`);
+    const response = await this.request(`/notes/${noteId}`);
+    return transformNoteFromAPI(response);
+  }
+
+  async getNoteAccess(noteId: string): Promise<NoteAccess> {
+    const response: any = await this.request(`/notes/${noteId}/access`);
+    return {
+      noteId: response.note_id || response.noteId || noteId,
+      accessSource: response.access_source || response.accessSource || 'workspace',
+      canView: Boolean(response.can_view ?? response.canView),
+      canUpdate: Boolean(response.can_update ?? response.canUpdate),
+      canDelete: Boolean(response.can_delete ?? response.canDelete),
+      canManage: Boolean(response.can_manage ?? response.canManage),
+      collaboratorRole: response.collaborator_role || response.collaboratorRole || undefined,
+    };
+  }
+
+  async createNoteInvite(
+    noteId: string,
+    payload: {
+      invitee_email?: string;
+      invitee_user_id?: string;
+      role: 'viewer' | 'editor';
+      expires_in_days?: number;
+      message?: string;
+    }
+  ): Promise<{
+    invite?: NoteInvite;
+    inviteToken?: string;
+    created: boolean;
+    collaboratorUpdated: boolean;
+    collaboratorRole?: 'viewer' | 'editor';
+  }> {
+    const response: any = await this.request(`/notes/${noteId}/invites`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
+    return {
+      invite: response.invite ? transformNoteInviteFromAPI(response.invite) : undefined,
+      inviteToken: response.invite_token || response.inviteToken || undefined,
+      created: Boolean(response.created),
+      collaboratorUpdated: Boolean(response.collaborator_updated ?? response.collaboratorUpdated),
+      collaboratorRole: response.collaborator_role || response.collaboratorRole || undefined,
+    };
+  }
+
+  async listNoteInvites(noteId: string): Promise<NoteInvite[]> {
+    const response = await this.request<any[]>(`/notes/${noteId}/invites`);
+    return (response || []).map(transformNoteInviteFromAPI);
+  }
+
+  async revokeNoteInvite(noteId: string, inviteId: string): Promise<NoteInvite> {
+    const response = await this.request<any>(`/notes/${noteId}/invites/${inviteId}/revoke`, {
+      method: 'POST',
+    });
+    return transformNoteInviteFromAPI(response);
+  }
+
+  async resolveNoteInvite(token: string): Promise<{
+    invite: NoteInvite;
+    noteTitle: string;
+    canAccept: boolean;
+  }> {
+    const response: any = await this.request(`/notes/invites/resolve?token=${encodeURIComponent(token)}`);
+    return {
+      invite: transformNoteInviteFromAPI(response.invite),
+      noteTitle: response.note_title || response.noteTitle || 'Untitled note',
+      canAccept: Boolean(response.can_accept ?? response.canAccept),
+    };
+  }
+
+  async acceptNoteInvite(token: string): Promise<{
+    invite: NoteInvite;
+    note: AppNote;
+    canUpdate: boolean;
+  }> {
+    const response: any = await this.request(`/notes/invites/accept`, {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    });
+    return {
+      invite: transformNoteInviteFromAPI(response.invite),
+      note: transformNoteFromAPI(response.note),
+      canUpdate: Boolean(response.can_update ?? response.canUpdate),
+    };
   }
 
   async updateNote(
@@ -686,10 +809,24 @@ class ApiClient {
       note_type: string;
     }>
   ): Promise<AppNote> {
-    return this.request(`/notes/${noteId}`, {
+    const response = await this.request(`/notes/${noteId}`, {
       method: 'PATCH',
       body: JSON.stringify(updates),
     });
+    return transformNoteFromAPI(response);
+  }
+
+  async syncCollaborativeNoteContent(
+    noteId: string,
+    content: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<AppNote> {
+    const response = await this.request(`/notes/${noteId}/collaboration`, {
+      method: 'PATCH',
+      body: JSON.stringify({ content }),
+      signal: options?.signal,
+    });
+    return transformNoteFromAPI(response);
   }
 
   async deleteNote(noteId: string): Promise<void> {

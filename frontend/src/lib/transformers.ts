@@ -32,6 +32,17 @@ export function transformNoteFromAPI(note: any): Note {
     source: note.source_url || note.source,
     type: note.note_type || note.type || 'note',
     word_count: note.word_count,
+    access: note.access
+      ? {
+          noteId: note.access.note_id || note.access.noteId || note.id,
+          accessSource: note.access.access_source || note.access.accessSource || 'workspace',
+          canView: Boolean(note.access.can_view ?? note.access.canView),
+          canUpdate: Boolean(note.access.can_update ?? note.access.canUpdate),
+          canDelete: Boolean(note.access.can_delete ?? note.access.canDelete),
+          canManage: Boolean(note.access.can_manage ?? note.access.canManage),
+          collaboratorRole: note.access.collaborator_role || note.access.collaboratorRole || undefined,
+        }
+      : undefined,
   };
 }
 
