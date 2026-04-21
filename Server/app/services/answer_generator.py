@@ -18,6 +18,31 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from app import config as app_config
+try:
+    from app.ingestion.source_locations import enrich_citation_metadata, source_location_payload
+except Exception:  # pragma: no cover - isolated module-loading tests stub the app package
+    def enrich_citation_metadata(metadata, *, document_title=None, source_type=None):
+        enriched = dict(metadata or {})
+        if source_type and not enriched.get("source_type"):
+            enriched["source_type"] = source_type
+        if document_title and not enriched.get("source_file_name"):
+            enriched["source_file_name"] = document_title
+        citation_parts = [
+            str(enriched.get("source_file_name") or document_title or "Untitled Document")
+        ]
+        if enriched.get("page_number") is not None:
+            citation_parts.append(f"page {enriched['page_number']}")
+        if enriched.get("section_title"):
+            citation_parts.append(f"section '{enriched['section_title']}'")
+        elif enriched.get("heading_path"):
+            citation_parts.append(f"heading '{enriched['heading_path'][-1]}'")
+        enriched.setdefault("citation_label", ", ".join(citation_parts))
+        enriched.setdefault("source_location", {"citation_label": enriched["citation_label"]})
+        return enriched
+
+    def source_location_payload(metadata, *, document_title=None):
+        enriched = enrich_citation_metadata(metadata, document_title=document_title)
+        return dict(enriched.get("source_location") or {"citation_label": enriched.get("citation_label")})
 from app.services.retrieval_cross_checker import RetrievalCrossChecker, RetrievalValidation
 from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
 
@@ -64,6 +89,8 @@ class Citation:
     chunk_index: int
     similarity: float
     text_snippet: str
+    citation_label: Optional[str] = None
+    source_location: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -534,6 +561,8 @@ class AnswerGenerator:
                         chunk_index=chunk.chunk_index,
                         similarity=chunk.similarity,
                         text_snippet=sentence[:200],
+                        citation_label=(chunk.metadata or {}).get("citation_label"),
+                        source_location=source_location_payload(chunk.metadata or {}, document_title=chunk.document_title),
                     )
                 )
 
@@ -877,15 +906,22 @@ class AnswerGenerator:
     def _build_context(self, chunks: List[RetrievedChunk], include_citations: bool) -> str:
         context_parts: List[str] = []
         for chunk in chunks:
+            chunk.metadata = enrich_citation_metadata(
+                chunk.metadata or {},
+                document_title=self._display_source_title(chunk),
+                source_type=chunk.source_type,
+            )
+            citation_label = (chunk.metadata or {}).get("citation_label")
             doc_ref = f"[Source Title: {self._display_source_title(chunk)}]"
             metadata_str = f" (Relevance: {chunk.similarity:.1%})" if include_citations else ""
             source_kind = self._display_source_kind(chunk)
+            location_str = f"\nCitation: {citation_label}" if citation_label else ""
             chunk_text = chunk.text
             if chunk.context_before:
                 chunk_text = f"...{chunk.context_before}\n\n{chunk_text}"
             if chunk.context_after:
                 chunk_text = f"{chunk_text}\n\n{chunk.context_after}..."
-            context_parts.append(f"{doc_ref}{metadata_str}\nSource Type: {source_kind}\n{chunk_text}\n")
+            context_parts.append(f"{doc_ref}{metadata_str}\nSource Type: {source_kind}{location_str}\n{chunk_text}\n")
         return "\n".join(context_parts)
 
     def _build_system_prompt(self, citation_style: str) -> str:
@@ -946,6 +982,8 @@ ANSWER:"""
                         chunk_index=chunk.chunk_index,
                         similarity=chunk.similarity,
                         text_snippet=chunk.text[:200],
+                        citation_label=(chunk.metadata or {}).get("citation_label"),
+                        source_location=source_location_payload(chunk.metadata or {}, document_title=chunk.document_title),
                     )
                 )
 
@@ -959,6 +997,8 @@ ANSWER:"""
                         chunk_index=chunk.chunk_index,
                         similarity=chunk.similarity,
                         text_snippet=chunk.text[:200],
+                        citation_label=(chunk.metadata or {}).get("citation_label"),
+                        source_location=source_location_payload(chunk.metadata or {}, document_title=chunk.document_title),
                     )
                 )
         return citations

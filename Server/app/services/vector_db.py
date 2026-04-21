@@ -53,6 +53,20 @@ DEFAULT_UPSERT_BATCH_SIZE: int = max(
     1,
     int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "128")),
 )
+RETRYABLE_CONNECTION_ERROR_MARKERS = (
+    "connection",
+    "connect",
+    "timeout",
+    "temporarily unavailable",
+    "unavailable",
+    "refused",
+    "reset by peer",
+    "broken pipe",
+    "network",
+    "socket",
+    "transport",
+    "disconnect",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,12 +157,44 @@ class VectorDBClient:
             )
             return False
 
-    def _ensure_connected(self) -> None:
+    def _invalidate_connection(self, reason: Optional[str] = None) -> None:
+        if reason:
+            logger.warning("Invalidating Qdrant connection: %s", reason)
+        self.client = None
+        self.is_connected = False
+        self._last_connect_attempt = 0.0
+
+    @staticmethod
+    def _is_retryable_connection_error(exc: Exception) -> bool:
+        error_text = f"{type(exc).__name__}: {exc}".lower()
+        return any(marker in error_text for marker in RETRYABLE_CONNECTION_ERROR_MARKERS)
+
+    def _execute_with_reconnect(self, operation_name: str, func):
+        try:
+            return func()
+        except Exception as exc:
+            if not self._is_retryable_connection_error(exc):
+                raise
+
+            logger.warning(
+                "%s hit a retryable Qdrant error; reconnecting once: %s",
+                operation_name,
+                exc,
+            )
+            self._invalidate_connection(str(exc))
+            self._ensure_connected(force=True)
+            if self.client is None:
+                raise RuntimeError(
+                    f"Qdrant client unavailable after reconnect attempt during {operation_name}"
+                ) from exc
+            return func()
+
+    def _ensure_connected(self, force: bool = False) -> None:
         if self.is_connected and self.client is not None:
             return
 
         elapsed = time.monotonic() - self._last_connect_attempt
-        if elapsed < RECONNECT_COOLDOWN_SECONDS:
+        if not force and elapsed < RECONNECT_COOLDOWN_SECONDS:
             if self.require_qdrant:
                 raise RuntimeError(
                     f"Qdrant unavailable at {self.url}. "
@@ -172,8 +218,8 @@ class VectorDBClient:
                 self.client.get_collections()
                 self.is_connected = True
                 return True
-        except Exception:
-            self.is_connected = False
+        except Exception as exc:
+            self._invalidate_connection(str(exc))
         return False
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -207,11 +253,17 @@ class VectorDBClient:
             return True
 
         try:
-            collections = self.client.get_collections()
+            collections = self._execute_with_reconnect(
+                f"create collection '{collection_name}'",
+                lambda: self.client.get_collections(),
+            )
             existing_names = {c.name for c in collections.collections}
 
             if collection_name in existing_names:
-                info = self.client.get_collection(collection_name)
+                info = self._execute_with_reconnect(
+                    f"inspect collection '{collection_name}'",
+                    lambda: self.client.get_collection(collection_name),
+                )
                 existing_dim: int = info.config.params.vectors.size
 
                 if existing_dim == dim:
@@ -236,7 +288,10 @@ class VectorDBClient:
                     collection_name, existing_dim, dim,
                 )
                 try:
-                    self.client.delete_collection(collection_name)
+                    self._execute_with_reconnect(
+                        f"delete collection '{collection_name}'",
+                        lambda: self.client.delete_collection(collection_name),
+                    )
                     logger.info("Deleted mismatched collection '%s'", collection_name)
                 except Exception as del_exc:
                     logger.warning(
@@ -244,9 +299,12 @@ class VectorDBClient:
                         collection_name, del_exc,
                     )
 
-            self.client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            self._execute_with_reconnect(
+                f"create collection '{collection_name}'",
+                lambda: self.client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+                ),
             )
             logger.info("Created Qdrant collection '%s' (dim=%d)", collection_name, dim)
             return True
@@ -265,7 +323,10 @@ class VectorDBClient:
             return True
 
         try:
-            self.client.delete_collection(collection_name)
+            self._execute_with_reconnect(
+                f"delete collection '{collection_name}'",
+                lambda: self.client.delete_collection(collection_name),
+            )
             logger.info("Deleted collection '%s'", collection_name)
             return True
         except Exception as exc:
@@ -276,18 +337,28 @@ class VectorDBClient:
         if not self.client:
             return None
         try:
-            info = self.client.get_collection(collection_name)
+            info = self._execute_with_reconnect(
+                f"inspect collection '{collection_name}'",
+                lambda: self.client.get_collection(collection_name),
+            )
             return info.config.params.vectors.size
-        except Exception:
+        except Exception as exc:
+            if self._is_retryable_connection_error(exc):
+                self._invalidate_connection(str(exc))
             return None
 
     def collection_exists(self, collection_name: str) -> bool:
         if not self.client:
             return collection_name in self.mock_storage
         try:
-            info = self.client.get_collection(collection_name)
+            info = self._execute_with_reconnect(
+                f"inspect collection '{collection_name}'",
+                lambda: self.client.get_collection(collection_name),
+            )
             return info is not None
-        except Exception:
+        except Exception as exc:
+            if self._is_retryable_connection_error(exc):
+                self._invalidate_connection(str(exc))
             return False
 
     def resolve_collection_name(
@@ -350,7 +421,10 @@ class VectorDBClient:
             return True
 
         try:
-            info = self.client.get_collection(collection_name)
+            info = self._execute_with_reconnect(
+                f"inspect collection '{collection_name}'",
+                lambda: self.client.get_collection(collection_name),
+            )
             stored_dim: int = info.config.params.vectors.size
 
             if actual_dim != stored_dim:
@@ -365,10 +439,16 @@ class VectorDBClient:
                     "DIMENSION MISMATCH '%s': collection=%dD vs vectors=%dD. Recreating.",
                     collection_name, stored_dim, actual_dim,
                 )
-                self.client.delete_collection(collection_name)
-                self.client.create_collection(
-                    collection_name=collection_name,
-                    vectors_config=VectorParams(size=actual_dim, distance=Distance.COSINE),
+                self._execute_with_reconnect(
+                    f"recreate collection '{collection_name}'",
+                    lambda: self.client.delete_collection(collection_name),
+                )
+                self._execute_with_reconnect(
+                    f"recreate collection '{collection_name}'",
+                    lambda: self.client.create_collection(
+                        collection_name=collection_name,
+                        vectors_config=VectorParams(size=actual_dim, distance=Distance.COSINE),
+                    ),
                 )
 
         except Exception as probe_exc:
@@ -386,17 +466,24 @@ class VectorDBClient:
 
         try:
             total_points = len(points)
-            for start in range(0, total_points, DEFAULT_UPSERT_BATCH_SIZE):
-                batch = points[start:start + DEFAULT_UPSERT_BATCH_SIZE]
-                qdrant_points = [
-                    PointStruct(
-                        id=p["id"],
-                        vector=p["vector"],
-                        payload=p.get("payload", {}),
-                    )
-                    for p in batch
-                ]
-                self.client.upsert(collection_name=collection_name, points=qdrant_points)
+
+            def _do_upsert():
+                for start in range(0, total_points, DEFAULT_UPSERT_BATCH_SIZE):
+                    batch = points[start:start + DEFAULT_UPSERT_BATCH_SIZE]
+                    qdrant_points = [
+                        PointStruct(
+                            id=p["id"],
+                            vector=p["vector"],
+                            payload=p.get("payload", {}),
+                        )
+                        for p in batch
+                    ]
+                    self.client.upsert(collection_name=collection_name, points=qdrant_points)
+
+            self._execute_with_reconnect(
+                f"upsert vectors into '{collection_name}'",
+                _do_upsert,
+            )
             logger.info(
                 "Upserted %d vectors to '%s' (dim=%d)",
                 total_points, collection_name, actual_dim,
@@ -406,9 +493,9 @@ class VectorDBClient:
         except Exception as exc:
             error_str = str(exc).lower()
 
-            if "connection" in error_str:
+            if self._is_retryable_connection_error(exc):
                 logger.error("Connection error to Qdrant at %s: %s", self.url, exc)
-                self.is_connected = False
+                self._invalidate_connection(str(exc))
             elif "not found" in error_str and "collection" in error_str:
                 logger.error(
                     "Collection '%s' not found — call create_collection() first.",
@@ -482,14 +569,17 @@ class VectorDBClient:
                     ]
                 )
 
-            results = self.client.query_points(
-                collection_name=collection_name,
-                query=query_vector,
-                query_filter=query_filter,
-                limit=limit,
-                score_threshold=score_threshold,
-                with_payload=True,
-            ).points
+            results = self._execute_with_reconnect(
+                f"search collection '{collection_name}'",
+                lambda: self.client.query_points(
+                    collection_name=collection_name,
+                    query=query_vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                    with_payload=True,
+                ).points,
+            )
             return [
                 {
                     "id": str(r.id),
@@ -521,8 +611,15 @@ class VectorDBClient:
             return True
 
         try:
-            self.client.delete(collection_name=collection_name, points_selector=ids)
-            logger.debug("Deleted %d vectors from '%s'", len(ids), collection_name)
+            normalized_ids = list(dict.fromkeys(str(point_id) for point_id in ids if point_id))
+            self._execute_with_reconnect(
+                f"delete points from '{collection_name}'",
+                lambda: self.client.delete(
+                    collection_name=collection_name,
+                    points_selector=normalized_ids,
+                ),
+            )
+            logger.debug("Deleted %d vectors from '%s'", len(normalized_ids), collection_name)
             return True
         except Exception as exc:
             logger.error("Error deleting vectors from '%s': %s", collection_name, exc)
@@ -551,9 +648,12 @@ class VectorDBClient:
                 FieldCondition(key=k, match=MatchValue(value=str(v)))
                 for k, v in filters.items()
             ]
-            self.client.delete(
-                collection_name=collection_name,
-                points_selector=Filter(must=conditions),
+            self._execute_with_reconnect(
+                f"delete filtered points from '{collection_name}'",
+                lambda: self.client.delete(
+                    collection_name=collection_name,
+                    points_selector=Filter(must=conditions),
+                ),
             )
             logger.debug(
                 "Deleted vectors from '%s' matching %s", collection_name, filters

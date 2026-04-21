@@ -17,6 +17,18 @@ from sqlalchemy.orm import Session
 from app.services.embeddings import get_embedding_service
 from app.services.vector_db import get_vector_db_client
 from app.config import settings
+try:
+    from app.ingestion.source_locations import enrich_citation_metadata
+except Exception:  # pragma: no cover - isolated tests stub the app package
+    def enrich_citation_metadata(metadata, *, document_title=None, source_type=None):
+        enriched = dict(metadata or {})
+        if source_type and not enriched.get("source_type"):
+            enriched["source_type"] = source_type
+        if document_title and not enriched.get("source_file_name"):
+            enriched["source_file_name"] = document_title
+        enriched.setdefault("citation_label", str(enriched.get("source_file_name") or document_title or "Untitled Document"))
+        enriched.setdefault("source_location", {"citation_label": enriched["citation_label"]})
+        return enriched
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +222,12 @@ class TopKRetriever:
                     payload = result.get("payload", {})
                     similarity = result.get("similarity", 0.0)
 
+                    metadata = enrich_citation_metadata(
+                        payload.get("metadata") or {},
+                        document_title=payload.get("document_title", "Unknown"),
+                        source_type=payload.get("source_type", "unknown"),
+                    )
+
                     chunk = RetrievedChunk(
                         chunk_id=payload.get("chunk_id", result.get("id", "")),
                         document_id=payload.get("document_id", ""),
@@ -221,7 +239,7 @@ class TopKRetriever:
                         token_count=payload.get("token_count", 0),
                         context_before=payload.get("context_before"),
                         context_after=payload.get("context_after"),
-                        metadata=payload.get("metadata")
+                        metadata=metadata,
                     )
                     chunk.metadata = dict(chunk.metadata or {})
                     chunk.metadata["retrieval_collection"] = collection_name

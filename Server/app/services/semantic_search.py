@@ -26,6 +26,22 @@ from app.services.embeddings import get_embedding_service
 from app.services.postgresql_search import get_postgresql_search_service
 from app.services.rag_retriever import RAGRetriever, RetrievedChunk, get_rag_retriever
 from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
+try:
+    from app.ingestion.source_locations import enrich_citation_metadata, source_location_payload
+except Exception:  # pragma: no cover - isolated tests stub the app package
+    def enrich_citation_metadata(metadata, *, document_title=None, source_type=None):
+        enriched = dict(metadata or {})
+        if source_type and not enriched.get("source_type"):
+            enriched["source_type"] = source_type
+        if document_title and not enriched.get("source_file_name"):
+            enriched["source_file_name"] = document_title
+        enriched.setdefault("citation_label", str(enriched.get("source_file_name") or document_title or "Untitled Document"))
+        enriched.setdefault("source_location", {"citation_label": enriched["citation_label"]})
+        return enriched
+
+    def source_location_payload(metadata, *, document_title=None):
+        enriched = enrich_citation_metadata(metadata, document_title=document_title)
+        return dict(enriched.get("source_location") or {"citation_label": enriched.get("citation_label")})
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +117,8 @@ class SemanticSearchResult:
             "context_before": self.context_before,
             "context_after": self.context_after,
             "metadata": self.metadata,
+            "citation_label": (self.metadata or {}).get("citation_label"),
+            "source_location": source_location_payload(self.metadata or {}, document_title=self.document_title),
         }
 
     @classmethod
@@ -436,6 +454,11 @@ class SemanticSearchService:
                 merged_metadata.setdefault("created_at", chunk_row.created_at.isoformat())
             if getattr(document_row, "created_at", None):
                 merged_metadata.setdefault("document_created_at", document_row.created_at.isoformat())
+            merged_metadata = enrich_citation_metadata(
+                merged_metadata,
+                document_title=document_row.title or chunk.document_title,
+                source_type=getattr(document_row.source_type, "value", str(document_row.source_type)),
+            )
 
             hydrated.append(
                 RetrievedChunk(

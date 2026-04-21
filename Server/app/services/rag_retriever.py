@@ -11,6 +11,18 @@ logger = logging.getLogger(__name__)
 from app.services.embeddings import get_embedding_service
 from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
 from app.services.vector_db import get_vector_db_client
+try:
+    from app.ingestion.source_locations import enrich_citation_metadata
+except Exception:  # pragma: no cover - isolated tests stub the app package
+    def enrich_citation_metadata(metadata, *, document_title=None, source_type=None):
+        enriched = dict(metadata or {})
+        if source_type and not enriched.get("source_type"):
+            enriched["source_type"] = source_type
+        if document_title and not enriched.get("source_file_name"):
+            enriched["source_file_name"] = document_title
+        enriched.setdefault("citation_label", str(enriched.get("source_file_name") or document_title or "Untitled Document"))
+        enriched.setdefault("source_location", {"citation_label": enriched["citation_label"]})
+        return enriched
 
 
 @dataclass
@@ -133,6 +145,20 @@ class RAGRetriever:
 
                     seen_chunk_ids.add(chunk_id)
                     text = payload.get("text") or payload.get("chunk_text") or payload.get("text_preview", "")
+                    metadata = enrich_citation_metadata(
+                        payload.get("metadata") or {},
+                        document_title=payload.get("document_title", ""),
+                        source_type=payload.get("source_type", "unknown"),
+                    )
+                    metadata.update(
+                        {
+                            "chunk_id": chunk_id,
+                            "document_id": str(payload.get("document_id", "unknown")),
+                            "chunk_index": payload.get("chunk_index", 0),
+                            "document_title": payload.get("document_title", ""),
+                        }
+                    )
+
                     chunk = RetrievedChunk(
                         chunk_id=chunk_id,
                         document_id=str(payload.get("document_id", "unknown")),
@@ -140,7 +166,7 @@ class RAGRetriever:
                         similarity=similarity,
                         chunk_index=payload.get("chunk_index", 0),
                         source_type=payload.get("source_type", "unknown"),
-                        metadata=dict(payload),
+                        metadata=metadata,
                         document_title=payload.get("document_title", ""),
                         token_count=payload.get("token_count", 0) or 0,
                         context_before=payload.get("context_before"),
