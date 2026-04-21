@@ -68,6 +68,42 @@ class WorkspaceSection(str, PyEnum):
     WORKFLOWS = "workflows"
 
 
+class NoteCollaborationRole(str, PyEnum):
+    """Note-scoped collaboration roles."""
+
+    VIEWER = "viewer"
+    EDITOR = "editor"
+
+
+class NoteInviteStatus(str, PyEnum):
+    """Lifecycle states for note collaboration invites."""
+
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class ThinkingSessionPhase(str, PyEnum):
+    """Live Thinking Session state machine phases."""
+
+    WAITING = "waiting"
+    GATHERING = "gathering"
+    SYNTHESIZING = "synthesizing"
+    REFINING = "refining"
+    COMPLETED = "completed"
+
+
+class ThinkingSynthesisStatus(str, PyEnum):
+    """Synthesis run lifecycle for Live Thinking Sessions."""
+
+    PENDING = "pending"
+    STREAMING = "streaming"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class GraphNodeType(str, PyEnum):
     """Knowledge graph node types."""
 
@@ -128,6 +164,8 @@ class Workspace(Base):
     owner = relationship("User", back_populates="owned_workspaces")
     members = relationship("WorkspaceMember", back_populates="workspace")
     documents = relationship("Document", back_populates="workspace")
+    notes = relationship("Note", back_populates="workspace")
+    thinking_sessions = relationship("ThinkingSession", back_populates="workspace", cascade="all, delete-orphan")
 
 
 class User(Base):
@@ -155,6 +193,27 @@ class User(Base):
     owned_workspaces = relationship("Workspace", back_populates="owner")
     workspace_memberships = relationship("WorkspaceMember", back_populates="user")
     connectors = relationship("Connector", back_populates="user")
+    owned_notes = relationship("Note", back_populates="owner")
+    note_collaborations = relationship(
+        "NoteCollaborator",
+        foreign_keys="NoteCollaborator.user_id",
+        back_populates="user",
+    )
+    granted_note_collaborations = relationship(
+        "NoteCollaborator",
+        foreign_keys="NoteCollaborator.granted_by_user_id",
+        back_populates="granted_by",
+    )
+    sent_note_invites = relationship(
+        "NoteInvite",
+        foreign_keys="NoteInvite.inviter_user_id",
+        back_populates="inviter",
+    )
+    targeted_note_invites = relationship(
+        "NoteInvite",
+        foreign_keys="NoteInvite.invitee_user_id",
+        back_populates="invitee_user",
+    )
 
 
 class WorkspaceMember(Base):
@@ -542,12 +601,263 @@ class Note(Base):
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    
+
+    # Relationships
+    workspace = relationship("Workspace", back_populates="notes")
+    owner = relationship("User", back_populates="owned_notes")
+    collaborators = relationship("NoteCollaborator", back_populates="note", cascade="all, delete-orphan")
+    invites = relationship("NoteInvite", back_populates="note", cascade="all, delete-orphan")
+
     # Indexes
     __table_args__ = (
         Index('idx_note_workspace', 'workspace_id', 'created_at'),
         Index('idx_note_user', 'user_id', 'updated_at'),
         Index('idx_note_type', 'note_type'),
+    )
+
+
+class NoteCollaborator(Base):
+    """Note-scoped collaborator access granted outside of workspace membership."""
+
+    __tablename__ = "note_collaborators"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(
+        Enum(
+            NoteCollaborationRole,
+            name="notecollaborationrole",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=NoteCollaborationRole.VIEWER,
+    )
+    granted_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    note = relationship("Note", back_populates="collaborators")
+    user = relationship("User", foreign_keys=[user_id], back_populates="note_collaborations")
+    granted_by = relationship("User", foreign_keys=[granted_by_user_id], back_populates="granted_note_collaborations")
+
+    __table_args__ = (
+        UniqueConstraint("note_id", "user_id", name="uq_note_collaborators_note_user"),
+        Index("idx_note_collaborators_note_role", "note_id", "role", "updated_at"),
+        Index("idx_note_collaborators_user_role", "user_id", "role", "updated_at"),
+    )
+
+
+class NoteInvite(Base):
+    """Secure note collaboration invite persisted until accepted, revoked, or expired."""
+
+    __tablename__ = "note_invites"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False, index=True)
+    inviter_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    invitee_email = Column(String(255), nullable=True, index=True)
+    invitee_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    role = Column(
+        Enum(
+            NoteCollaborationRole,
+            name="notecollaborationrole",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=NoteCollaborationRole.VIEWER,
+    )
+    status = Column(
+        Enum(
+            NoteInviteStatus,
+            name="noteinvitestatus",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=NoteInviteStatus.PENDING,
+        index=True,
+    )
+    token_hash = Column(String(128), nullable=False, unique=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    note = relationship("Note", back_populates="invites")
+    inviter = relationship("User", foreign_keys=[inviter_user_id], back_populates="sent_note_invites")
+    invitee_user = relationship("User", foreign_keys=[invitee_user_id], back_populates="targeted_note_invites")
+
+    __table_args__ = (
+        Index("idx_note_invites_note_status", "note_id", "status", "created_at"),
+        Index("idx_note_invites_email_status", "invitee_email", "status", "expires_at"),
+        Index("idx_note_invites_user_status", "invitee_user_id", "status", "expires_at"),
+    )
+
+
+class ThinkingSession(Base):
+    """Persisted Live Thinking Session metadata and current state."""
+
+    __tablename__ = "thinking_sessions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="SET NULL"), nullable=True, index=True)
+    room_id = Column(String(255), nullable=False, unique=True, index=True)
+    title = Column(String(255), nullable=False)
+    prompt_context = Column(Text, nullable=True)
+    created_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    host_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    phase = Column(
+        Enum(
+            ThinkingSessionPhase,
+            name="thinkingsessionphase",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=ThinkingSessionPhase.WAITING,
+        index=True,
+    )
+    phase_entered_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    waiting_started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    gathering_started_at = Column(DateTime(timezone=True), nullable=True)
+    synthesizing_started_at = Column(DateTime(timezone=True), nullable=True)
+    refining_started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    active_synthesis_run_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    synthesis_output = Column(Text, nullable=True)
+    refined_output = Column(Text, nullable=True)
+    final_output = Column(Text, nullable=True)
+    last_refined_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    workspace = relationship("Workspace", back_populates="thinking_sessions")
+    note = relationship("Note", foreign_keys=[note_id], lazy="joined")
+    creator = relationship("User", foreign_keys=[created_by_user_id], lazy="joined")
+    host = relationship("User", foreign_keys=[host_user_id], lazy="joined")
+    last_refined_by = relationship("User", foreign_keys=[last_refined_by_user_id], lazy="joined")
+    participants = relationship("ThinkingSessionParticipant", back_populates="session", cascade="all, delete-orphan")
+    contributions = relationship("ThinkingSessionContribution", back_populates="session", cascade="all, delete-orphan")
+    synthesis_runs = relationship("ThinkingSessionSynthesisRun", back_populates="session", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_thinking_sessions_workspace_phase", "workspace_id", "phase", "updated_at"),
+        Index("idx_thinking_sessions_host_phase", "host_user_id", "phase", "updated_at"),
+    )
+
+
+class ThinkingSessionParticipant(Base):
+    """Known participant record for session recovery and auditability."""
+
+    __tablename__ = "thinking_session_participants"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("thinking_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    joined_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    session = relationship("ThinkingSession", back_populates="participants")
+    user = relationship("User", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "user_id", name="uq_thinking_session_participants_session_user"),
+        Index("idx_thinking_session_participants_last_seen", "session_id", "last_seen_at"),
+    )
+
+
+class ThinkingSessionContribution(Base):
+    """Participant contribution submitted during the gathering phase."""
+
+    __tablename__ = "thinking_session_contributions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("thinking_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    created_phase = Column(
+        Enum(
+            ThinkingSessionPhase,
+            name="thinkingsessionphase",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=ThinkingSessionPhase.GATHERING,
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    session = relationship("ThinkingSession", back_populates="contributions")
+    author = relationship("User", lazy="joined")
+    votes = relationship("ThinkingSessionVote", back_populates="contribution", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_thinking_session_contributions_session_created", "session_id", "created_at"),
+    )
+
+
+class ThinkingSessionVote(Base):
+    """Single user vote on a contribution with uniqueness per contribution/user."""
+
+    __tablename__ = "thinking_session_votes"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("thinking_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    contribution_id = Column(UUID(as_uuid=True), ForeignKey("thinking_session_contributions.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    contribution = relationship("ThinkingSessionContribution", back_populates="votes")
+    user = relationship("User", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("contribution_id", "user_id", name="uq_thinking_session_votes_contribution_user"),
+        Index("idx_thinking_session_votes_session_contribution", "session_id", "contribution_id"),
+    )
+
+
+class ThinkingSessionSynthesisRun(Base):
+    """Immutable record of one synthesis attempt and the contribution snapshot it used."""
+
+    __tablename__ = "thinking_session_synthesis_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("thinking_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    triggered_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    status = Column(
+        Enum(
+            ThinkingSynthesisStatus,
+            name="thinkingsynthesisstatus",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=ThinkingSynthesisStatus.PENDING,
+        index=True,
+    )
+    model = Column(String(100), nullable=False, default="gpt-4o")
+    snapshot_payload = Column(JSONB, nullable=False, default=dict)
+    facilitation_prompt = Column(Text, nullable=True)
+    output_text = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    failed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    session = relationship("ThinkingSession", back_populates="synthesis_runs")
+    triggered_by = relationship("User", lazy="joined")
+
+    __table_args__ = (
+        Index("idx_thinking_session_synthesis_runs_session_status", "session_id", "status", "created_at"),
     )
 
 
