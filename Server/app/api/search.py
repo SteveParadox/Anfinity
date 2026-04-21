@@ -73,6 +73,8 @@ class SemanticSearchResultPayload(BaseModel):
     context_before: Optional[str] = None
     context_after: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    citation_label: Optional[str] = None
+    source_location: Dict[str, Any] = Field(default_factory=dict)
     created_at: str
     interaction_count: int = 0
     similarity_score: float = Field(..., ge=0, le=1)

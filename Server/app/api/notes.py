@@ -1,6 +1,6 @@
 """Notes API routes for user note management."""
 from typing import Optional, List, Any, Dict, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 import logging
 import re
@@ -9,41 +9,32 @@ try:
     from diff_match_patch import diff_match_patch
 except ImportError:  # pragma: no cover - exercised only when dependency is absent
     diff_match_patch = None
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Response, status, Query, BackgroundTasks
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, func, text
+from sqlalchemy import select, and_, or_, false, func, text
 
 from app.database.session import get_db, AsyncSessionLocal
-from app.database.models import Note, NoteConnectionSuggestion, NoteVersion, User as DBUser, WorkspaceSection
+from app.database.models import Note, NoteCollaborator, NoteCollaborationRole, NoteConnectionSuggestion, NoteInvite, NoteInviteStatus, NoteVersion, User as DBUser, WorkspaceSection
 from app.core.auth import get_current_user
 from app.core.audit import log_audit_event, AuditAction, EntityType
-from app.core.permissions import ensure_workspace_permission
+from app.core.permissions import ensure_workspace_permission, get_bulk_workspace_permissions_for_user
 from app.services.graph_service import get_graph_service
+from app.services.note_access import ensure_note_permission, resolve_note_access
+from app.services.note_invites import (
+    DEFAULT_NOTE_INVITE_TTL,
+    accept_note_invite,
+    create_note_invite,
+    expire_note_invite_if_needed,
+    get_note_invite_by_token,
+    get_note_with_bypass,
+    revoke_note_invite,
+    temporary_rls_bypass,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/notes", tags=["Notes"])
-
-
-async def ensure_note_permission(
-    note: Note,
-    user: DBUser,
-    db: AsyncSession,
-    action: str,
-):
-    if note.workspace_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Note has no workspace",
-        )
-    return await ensure_workspace_permission(
-        workspace_id=note.workspace_id,
-        user=user,
-        db=db,
-        section=WorkspaceSection.NOTES,
-        action=action,
-    )
 
 # Helper function for lazy task imports to avoid Celery import hang at startup
 def queue_note_embedding(note_id: str) -> None:
@@ -93,6 +84,11 @@ class NoteUpdate(BaseModel):
     tags: Optional[List[str]] = None
     connections: Optional[List[str]] = None
     note_type: Optional[str] = Field(None, pattern='^(note|web-clip|document|voice|ai-generated)$')
+
+
+class NoteCollaborationSync(BaseModel):
+    """Schema for lightweight collaborative content persistence."""
+    content: str = Field(default="")
 
 
 class NoteResponse(BaseModel):
@@ -186,6 +182,64 @@ class NoteVersionRestoreResponse(BaseModel):
     restored_version: NoteVersionResponse
 
 
+class NoteInviteCreateRequest(BaseModel):
+    invitee_email: Optional[EmailStr] = None
+    invitee_user_id: Optional[str] = None
+    role: NoteCollaborationRole = NoteCollaborationRole.VIEWER
+    expires_in_days: Optional[int] = Field(default=7, ge=1, le=30)
+    message: Optional[str] = Field(default=None, max_length=1000)
+
+
+class NoteInviteAcceptRequest(BaseModel):
+    token: str = Field(..., min_length=20, max_length=255)
+
+
+class NoteInviteResponse(BaseModel):
+    id: str
+    note_id: str
+    inviter_user_id: Optional[str] = None
+    invitee_email: Optional[str] = None
+    invitee_user_id: Optional[str] = None
+    role: NoteCollaborationRole
+    status: NoteInviteStatus
+    expires_at: str
+    accepted_at: Optional[str] = None
+    revoked_at: Optional[str] = None
+    message: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class NoteInviteCreateResponse(BaseModel):
+    invite: Optional[NoteInviteResponse] = None
+    invite_token: Optional[str] = None
+    created: bool
+    collaborator_updated: bool = False
+    collaborator_role: Optional[NoteCollaborationRole] = None
+
+
+class NoteInviteResolveResponse(BaseModel):
+    invite: NoteInviteResponse
+    note_title: str
+    can_accept: bool
+
+
+class NoteInviteAcceptResponse(BaseModel):
+    invite: NoteInviteResponse
+    note: NoteResponse
+    can_update: bool
+
+
+class NoteAccessResponse(BaseModel):
+    note_id: str
+    access_source: str
+    can_view: bool
+    can_update: bool
+    can_delete: bool
+    can_manage: bool
+    collaborator_role: Optional[NoteCollaborationRole] = None
+
+
 # ==================== Routes ====================
 
 # ==================== Utility Functions ====================
@@ -224,6 +278,36 @@ def serialize_note(note: Note) -> NoteResponse:
         created_at=created_at.isoformat(),
         updated_at=updated_at.isoformat(),
     )
+
+
+def serialize_note_invite(invite: NoteInvite) -> NoteInviteResponse:
+    created_at = invite.created_at or datetime.now(timezone.utc)
+    updated_at = invite.updated_at or created_at
+    return NoteInviteResponse(
+        id=str(invite.id),
+        note_id=str(invite.note_id),
+        inviter_user_id=str(invite.inviter_user_id) if invite.inviter_user_id else None,
+        invitee_email=invite.invitee_email,
+        invitee_user_id=str(invite.invitee_user_id) if invite.invitee_user_id else None,
+        role=invite.role if isinstance(invite.role, NoteCollaborationRole) else NoteCollaborationRole(str(invite.role)),
+        status=invite.status if isinstance(invite.status, NoteInviteStatus) else NoteInviteStatus(str(invite.status)),
+        expires_at=invite.expires_at.isoformat(),
+        accepted_at=invite.accepted_at.isoformat() if invite.accepted_at else None,
+        revoked_at=invite.revoked_at.isoformat() if invite.revoked_at else None,
+        message=invite.message,
+        created_at=created_at.isoformat(),
+        updated_at=updated_at.isoformat(),
+    )
+
+
+async def load_note_or_404(note_id: UUID, db: AsyncSession) -> Note:
+    note = await get_note_with_bypass(db, note_id)
+    if note is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found",
+        )
+    return note
 
 
 def _tokenize_for_diff(text: str) -> List[str]:
@@ -786,9 +870,7 @@ async def list_notes(
     Returns:
         Paginated notes
     """
-    query = select(Note)
-    
-    # Filter by workspace if provided
+    workspace_uuid: Optional[UUID] = None
     if workspace_id:
         try:
             workspace_uuid = UUID(workspace_id)
@@ -797,65 +879,277 @@ async def list_notes(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Invalid workspace_id format",
             )
-        await ensure_workspace_permission(
-            workspace_id=workspace_uuid,
-            user=current_user,
-            db=db,
-            section=WorkspaceSection.NOTES,
-            action="view",
-        )
-        query = query.where(Note.workspace_id == workspace_uuid)
-    else:
-        query = query.where(Note.user_id == current_user.id)
-    
-    # Search filter
-    if search:
-        search_term = f"%{search}%"
-        query = query.where(
-            or_(
-                Note.title.ilike(search_term),
-                Note.content.ilike(search_term)
+
+    workspace_permissions = await get_bulk_workspace_permissions_for_user(db, current_user)
+    accessible_workspace_ids = {
+        UUID(workspace_key)
+        for workspace_key, payload in workspace_permissions.items()
+        if bool((payload.get("permissions") or {}).get("notes", {}).get("view"))
+    }
+
+    async with temporary_rls_bypass(db):
+        query = (
+            select(Note)
+            .outerjoin(
+                NoteCollaborator,
+                and_(
+                    NoteCollaborator.note_id == Note.id,
+                    NoteCollaborator.user_id == current_user.id,
+                ),
             )
+            .distinct()
         )
-    
-    # Tags filter - notes must have ALL specified tags
-    if tags:
-        for tag in tags:
-            query = query.where(Note.tags.contains([tag]))
-    
-    # Get total count - build count query with same filters
-    count_query = select(func.count()).select_from(Note)
-    if workspace_id:
-        count_query = count_query.where(Note.workspace_id == workspace_uuid)
-    else:
-        count_query = count_query.where(Note.user_id == current_user.id)
-    if search:
-        search_term = f"%{search}%"
-        count_query = count_query.where(
-            or_(
-                Note.title.ilike(search_term),
-                Note.content.ilike(search_term)
+
+        if workspace_uuid is not None:
+            query = query.where(Note.workspace_id == workspace_uuid)
+            if workspace_uuid not in accessible_workspace_ids:
+                query = query.where(
+                    or_(
+                        Note.user_id == current_user.id,
+                        NoteCollaborator.user_id == current_user.id,
+                    )
+                )
+        else:
+            workspace_scope = (
+                Note.workspace_id.in_(list(accessible_workspace_ids))
+                if accessible_workspace_ids
+                else false()
             )
+            query = query.where(
+                or_(
+                    Note.user_id == current_user.id,
+                    NoteCollaborator.user_id == current_user.id,
+                    workspace_scope,
+                )
+            )
+
+        if search:
+            search_term = f"%{search}%"
+            query = query.where(
+                or_(
+                    Note.title.ilike(search_term),
+                    Note.content.ilike(search_term),
+                )
+            )
+
+        if tags:
+            for tag in tags:
+                query = query.where(Note.tags.contains([tag]))
+
+        count_result = await db.execute(select(func.count()).select_from(query.subquery()))
+        total = count_result.scalar() or 0
+
+        offset = (page - 1) * page_size
+        result = await db.execute(
+            query.order_by(Note.updated_at.desc()).offset(offset).limit(page_size)
         )
-    if tags:
-        for tag in tags:
-            count_query = count_query.where(Note.tags.contains([tag]))
-    
-    count_result = await db.execute(count_query)
-    total = count_result.scalar() or 0
-    
-    # Apply pagination
-    offset = (page - 1) * page_size
-    query = query.order_by(Note.updated_at.desc()).offset(offset).limit(page_size)
-    
-    result = await db.execute(query)
-    notes = result.scalars().all()
+        notes = result.scalars().all()
     
     return NoteListResponse(
         items=[serialize_note(note) for note in notes],
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/invites/resolve", response_model=NoteInviteResolveResponse)
+async def resolve_note_invite_endpoint(
+    token: str = Query(..., min_length=20, max_length=255),
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve a note invite for the authenticated user before acceptance."""
+
+    invite = await get_note_invite_by_token(db, token.strip())
+    if invite is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+
+    await expire_note_invite_if_needed(invite, db)
+
+    note = await get_note_with_bypass(db, invite.note_id)
+    if note is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    normalized_invitee_email = (invite.invitee_email or "").strip().lower()
+    normalized_user_email = (current_user.email or "").strip().lower()
+    can_accept = (
+        invite.status == NoteInviteStatus.PENDING
+        and invite.expires_at > datetime.now(timezone.utc)
+        and (invite.invitee_user_id is None or invite.invitee_user_id == current_user.id)
+        and (not normalized_invitee_email or normalized_invitee_email == normalized_user_email)
+    )
+
+    return NoteInviteResolveResponse(
+        invite=serialize_note_invite(invite),
+        note_title=note.title,
+        can_accept=can_accept,
+    )
+
+
+@router.post("/invites/accept", response_model=NoteInviteAcceptResponse)
+async def accept_note_invite_endpoint(
+    payload: NoteInviteAcceptRequest,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Accept a valid note collaboration invite."""
+
+    invite, note, access = await accept_note_invite(payload.token.strip(), current_user, db)
+    return NoteInviteAcceptResponse(
+        invite=serialize_note_invite(invite),
+        note=serialize_note(note),
+        can_update=access.can_update,
+    )
+
+
+@router.get("/{note_id}/invites", response_model=List[NoteInviteResponse])
+async def list_note_invites(
+    note_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List invites for a note."""
+
+    note_uuid = UUID(note_id)
+    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
+    note = note_result.scalar_one_or_none()
+    if note is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    await ensure_note_permission(note, current_user, db, "manage")
+
+    invite_result = await db.execute(
+        select(NoteInvite)
+        .where(NoteInvite.note_id == note_uuid)
+        .order_by(NoteInvite.created_at.desc())
+    )
+    invites = invite_result.scalars().all()
+    serialized: list[NoteInviteResponse] = []
+    for invite in invites:
+        await expire_note_invite_if_needed(invite, db)
+        serialized.append(serialize_note_invite(invite))
+    return serialized
+
+
+@router.post("/{note_id}/invites", response_model=NoteInviteCreateResponse, status_code=status.HTTP_201_CREATED)
+async def create_note_invite_endpoint(
+    note_id: str,
+    payload: NoteInviteCreateRequest,
+    response: Response,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create or refresh a note collaboration invite."""
+
+    note_uuid = UUID(note_id)
+    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
+    note = note_result.scalar_one_or_none()
+    if note is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    await ensure_note_permission(note, current_user, db, "manage")
+
+    if payload.invitee_email is None and payload.invitee_user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Either invitee_email or invitee_user_id is required",
+        )
+
+    invitee_user_uuid: Optional[UUID] = None
+    if payload.invitee_user_id:
+        try:
+            invitee_user_uuid = UUID(payload.invitee_user_id)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid invitee_user_id format",
+            )
+
+    created_invite = await create_note_invite(
+        note,
+        current_user,
+        str(payload.invitee_email) if payload.invitee_email is not None else None,
+        invitee_user_uuid,
+        payload.role,
+        db,
+        message=payload.message,
+        expires_in=timedelta(days=payload.expires_in_days or int(DEFAULT_NOTE_INVITE_TTL.days)),
+    )
+
+    if created_invite.updated_collaborator is not None:
+        response.status_code = status.HTTP_200_OK
+        return NoteInviteCreateResponse(
+            invite=None,
+            invite_token=None,
+            created=False,
+            collaborator_updated=True,
+            collaborator_role=created_invite.updated_collaborator.role,
+        )
+
+    response.status_code = status.HTTP_201_CREATED if created_invite.created else status.HTTP_200_OK
+    return NoteInviteCreateResponse(
+        invite=serialize_note_invite(created_invite.invite) if created_invite.invite is not None else None,
+        invite_token=created_invite.token,
+        created=created_invite.created,
+        collaborator_updated=False,
+        collaborator_role=None,
+    )
+
+
+@router.post("/{note_id}/invites/{invite_id}/revoke", response_model=NoteInviteResponse)
+async def revoke_note_invite_endpoint(
+    note_id: str,
+    invite_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke a pending note invite."""
+
+    note_uuid = UUID(note_id)
+    invite_uuid = UUID(invite_id)
+
+    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
+    note = note_result.scalar_one_or_none()
+    if note is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+
+    await ensure_note_permission(note, current_user, db, "manage")
+
+    invite_result = await db.execute(
+        select(NoteInvite).where(
+            and_(
+                NoteInvite.id == invite_uuid,
+                NoteInvite.note_id == note_uuid,
+            )
+        )
+    )
+    invite = invite_result.scalar_one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+
+    invite = await revoke_note_invite(invite, db)
+    return serialize_note_invite(invite)
+
+
+@router.get("/{note_id}/access", response_model=NoteAccessResponse)
+async def get_note_access(
+    note_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return effective note access for the current user."""
+
+    note = await load_note_or_404(UUID(note_id), db)
+    access = await ensure_note_permission(note, current_user, db, "view")
+    return NoteAccessResponse(
+        note_id=str(note.id),
+        access_source=access.access_source,
+        can_view=access.can_view,
+        can_update=access.can_update,
+        can_delete=access.can_delete,
+        can_manage=access.can_manage,
+        collaborator_role=access.collaborator_role,
     )
 
 
@@ -875,14 +1169,7 @@ async def get_note(
     Returns:
         Note details
     """
-    result = await db.execute(select(Note).where(Note.id == UUID(note_id)))
-    note = result.scalar_one_or_none()
-    
-    if not note:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Note not found"
-        )
+    note = await load_note_or_404(UUID(note_id), db)
     await ensure_note_permission(note, current_user, db, "view")
     return serialize_note(note)
 
@@ -895,10 +1182,7 @@ async def list_note_versions(
 ):
     """List immutable note versions for timeline and lineage views."""
     note_uuid = UUID(note_id)
-    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
-    note = note_result.scalar_one_or_none()
-    if not note:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+    note = await load_note_or_404(note_uuid, db)
     await ensure_note_permission(note, current_user, db, "view")
 
     version_result = await db.execute(
@@ -921,10 +1205,7 @@ async def restore_note_version(
     note_uuid = UUID(note_id)
     version_uuid = UUID(version_id)
 
-    note_result = await db.execute(select(Note).where(Note.id == note_uuid))
-    note = note_result.scalar_one_or_none()
-    if not note:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Note not found")
+    note = await load_note_or_404(note_uuid, db)
     await ensure_note_permission(note, current_user, db, "update")
 
     version_result = await db.execute(
@@ -1020,14 +1301,7 @@ async def update_note(
     Returns:
         Updated note
     """
-    result = await db.execute(select(Note).where(Note.id == UUID(note_id)))
-    note = result.scalar_one_or_none()
-    
-    if not note:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Note not found"
-        )
+    note = await load_note_or_404(UUID(note_id), db)
     await ensure_note_permission(note, current_user, db, "update")
     # Update fields
     semantic_fields_updated = False
@@ -1094,6 +1368,35 @@ async def update_note(
     return serialize_note(note)
 
 
+@router.patch("/{note_id}/collaboration", response_model=NoteResponse)
+async def sync_note_collaboration(
+    note_id: str,
+    updates: NoteCollaborationSync,
+    background_tasks: BackgroundTasks,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Persist collaborative content without creating version or task storms."""
+    note = await load_note_or_404(UUID(note_id), db)
+
+    await ensure_note_permission(note, current_user, db, "update")
+
+    if updates.content == note.content:
+        return serialize_note(note)
+
+    note.content = updates.content
+    note.word_count = calculate_word_count(updates.content)
+    note.updated_at = datetime.now(timezone.utc)
+
+    await db.flush()
+    await db.commit()
+    await db.refresh(note)
+
+    background_tasks.add_task(sync_note_search_index_by_id, note.id)
+
+    return serialize_note(note)
+
+
 @router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(
     note_id: str,
@@ -1107,14 +1410,7 @@ async def delete_note(
         current_user: Current user
         db: Database session
     """
-    result = await db.execute(select(Note).where(Note.id == UUID(note_id)))
-    note = result.scalar_one_or_none()
-    
-    if not note:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Note not found"
-        )
+    note = await load_note_or_404(UUID(note_id), db)
     await ensure_note_permission(note, current_user, db, "delete")
     # Log action before deletion
     await log_audit_event(

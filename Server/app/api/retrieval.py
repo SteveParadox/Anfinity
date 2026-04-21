@@ -12,6 +12,7 @@ from app.config import settings
 from app.core.auth import get_current_user
 from app.database.models import Document, User as DBUser, Workspace, WorkspaceMember
 from app.database.session import get_db
+from app.ingestion.source_locations import source_location_payload
 from app.services.top_k_retriever import get_top_k_retriever
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,8 @@ class RetrievedChunkPayload(BaseModel):
     context_before: Optional[str] = None
     context_after: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    citation_label: Optional[str] = None
+    source_location: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RetrievalResponse(BaseModel):
@@ -101,6 +104,11 @@ def _as_payloads(result: Any) -> List[RetrievedChunkPayload]:
             context_before=getattr(chunk, "context_before", None),
             context_after=getattr(chunk, "context_after", None),
             metadata=getattr(chunk, "metadata", None) or {},
+            citation_label=((getattr(chunk, "metadata", None) or {}).get("citation_label")),
+            source_location=source_location_payload(
+                (getattr(chunk, "metadata", None) or {}),
+                document_title=getattr(chunk, "document_title", ""),
+            ),
         )
         for chunk in getattr(result, "chunks", [])
     ]

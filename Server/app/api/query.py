@@ -16,6 +16,7 @@ from app.core.audit import AuditAction, AuditLogger, EntityType
 from app.core.auth import get_current_active_user, get_workspace_context
 from app.database.models import Answer, Chunk, Document, Feedback, Query, User as DBUser
 from app.database.session import get_db, log_session_query_metrics
+from app.ingestion.source_locations import enrich_citation_metadata
 from app.services.answer_generator import RetrievedChunk as AnswerRetrievedChunk
 from app.services.answer_generator import get_answer_generator
 from app.services.rag_retriever import get_rag_retriever
@@ -331,7 +332,11 @@ async def _hydrate_answer_chunks(
                     token_count=int(getattr(retrieved, "token_count", 0) or 0),
                     context_before=getattr(retrieved, "context_before", None),
                     context_after=getattr(retrieved, "context_after", None),
-                    metadata={**(getattr(retrieved, "metadata", None) or {}), "source_kind": "document"},
+                    metadata=enrich_citation_metadata(
+                        {**(getattr(retrieved, "metadata", None) or {}), "source_kind": "document"},
+                        document_title=getattr(retrieved, "document_title", "") or "Untitled Document",
+                        source_type=str(getattr(retrieved, "source_type", "document")),
+                    ),
                 )
             )
             continue
@@ -344,6 +349,11 @@ async def _hydrate_answer_chunks(
         }
         if getattr(chunk, "created_at", None):
             metadata.setdefault("created_at", chunk.created_at.isoformat())
+        metadata = enrich_citation_metadata(
+            metadata,
+            document_title=doc.title or getattr(retrieved, "document_title", "") or "Untitled Document",
+            source_type=getattr(doc.source_type, "value", str(doc.source_type)),
+        )
 
         hydrated.append(
             AnswerRetrievedChunk(

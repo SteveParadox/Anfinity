@@ -14,6 +14,7 @@ from app.config import settings
 from app.core.auth import WorkspaceContext, get_current_active_user, get_workspace_context
 from app.database.models import Answer, Chunk, Document, Query, User as DBUser
 from app.database.session import get_db
+from app.ingestion.source_locations import enrich_citation_metadata, source_location_payload
 from app.services.answer_generator import GeneratedAnswer, RetrievedChunk, get_answer_generator
 from app.services.feedback_handler import get_feedback_handler
 
@@ -31,6 +32,8 @@ class CitationPayload(BaseModel):
     chunk_index: int
     similarity: float
     text_snippet: str
+    citation_label: Optional[str] = None
+    source_location: Dict[str, Any] = Field(default_factory=dict)
 
 
 class QualityCheckInfo(BaseModel):
@@ -239,6 +242,11 @@ async def _hydrate_retrieved_chunks(
         }
         if getattr(chunk_row, "created_at", None):
             merged_metadata.setdefault("created_at", chunk_row.created_at.isoformat())
+        merged_metadata = enrich_citation_metadata(
+            merged_metadata,
+            document_title=document_row.title or chunk.document_title,
+            source_type=getattr(document_row.source_type, "value", str(document_row.source_type)),
+        )
 
         hydrated.append(
             RetrievedChunk(
@@ -336,6 +344,8 @@ async def generate_answer(
             chunk_index=int(c.chunk_index),
             similarity=float(c.similarity),
             text_snippet=c.text_snippet,
+            citation_label=getattr(c, "citation_label", None),
+            source_location=getattr(c, "source_location", None) or {},
         )
         for c in generated_answer.citations
     ]
@@ -362,6 +372,8 @@ async def generate_answer(
             "similarity": round(float(chunk.similarity), 3),
             "source_kind": str((chunk.metadata or {}).get("source_kind", "document")),
             "source_type": chunk.source_type,
+            "citation_label": (chunk.metadata or {}).get("citation_label"),
+            "source_location": source_location_payload(chunk.metadata or {}, document_title=chunk.document_title),
         }
         for chunk in filtered_chunks
     ]
