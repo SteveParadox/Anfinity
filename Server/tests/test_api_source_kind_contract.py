@@ -110,7 +110,15 @@ def test_search_semantic_http_response_includes_source_kind():
                         source_kind="document",
                         source_type="upload",
                         chunk_index=2,
-                            created_at=datetime.now(timezone.utc),
+                        token_count=31,
+                        context_before="Prior section summary",
+                        context_after="Next section summary",
+                        metadata={
+                            "related_documents": [
+                                {"document_id": "doc-2", "title": "Assessment Appendix"}
+                            ]
+                        },
+                        created_at=datetime.now(timezone.utc),
                         interaction_count=0,
                         similarity_score=0.79,
                         final_score=0.79,
@@ -139,6 +147,10 @@ def test_search_semantic_http_response_includes_source_kind():
     assert response.status_code == 200
     payload = response.json()
     assert [item["source_kind"] for item in payload["results"]] == ["note", "document"]
+    assert payload["results"][1]["token_count"] == 31
+    assert payload["results"][1]["context_before"] == "Prior section summary"
+    assert payload["results"][1]["context_after"] == "Next section summary"
+    assert payload["results"][1]["metadata"]["related_documents"][0]["title"] == "Assessment Appendix"
 
 
 def test_query_http_response_includes_source_kind_on_sources():

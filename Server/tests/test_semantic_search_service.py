@@ -258,7 +258,14 @@ class SemanticSearchServiceTests(unittest.TestCase):
                     source_type="document",
                     chunk_index=0,
                     similarity=0.82,
-                    metadata={"created_at": "2026-04-02T00:00:00", "interaction_count": 3},
+                    token_count=24,
+                    context_before="Earlier context",
+                    context_after="Later context",
+                    metadata={
+                        "created_at": "2026-04-02T00:00:00",
+                        "interaction_count": 3,
+                        "related_documents": [{"document_id": "linked-doc", "title": "Linked handbook"}],
+                    },
                 )
                 return types.SimpleNamespace(chunks=[chunk])
 
@@ -281,6 +288,13 @@ class SemanticSearchServiceTests(unittest.TestCase):
         self.assertEqual(execution.strategy, "retriever_fallback")
         self.assertEqual(len(execution.results), 1)
         self.assertEqual(str(execution.results[0].chunk_id), str(chunk_id))
+        self.assertEqual(execution.results[0].token_count, 24)
+        self.assertEqual(execution.results[0].context_before, "Earlier context")
+        self.assertEqual(execution.results[0].context_after, "Later context")
+        self.assertEqual(
+            execution.results[0].metadata["related_documents"][0]["title"],
+            "Linked handbook",
+        )
         self.assertIsNotNone(execution.search_log_id)
 
     def test_postgresql_results_use_hybrid_semantic_score_and_tag_filter(self):

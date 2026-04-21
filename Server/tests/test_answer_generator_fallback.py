@@ -148,6 +148,47 @@ class AnswerGeneratorFallbackTests(unittest.TestCase):
         self.assertNotIn("off-topic", [chunk.chunk_id for chunk in selected])
         self.assertLessEqual(sum(len(chunk.text) for chunk in selected), generator.max_total_context_chars)
 
+    def test_context_uses_exact_saved_titles_not_document_number_placeholders(self):
+        answer_module = self._load_answer_generator_module()
+        generator = answer_module.AnswerGenerator()
+
+        chunks = [
+            answer_module.RetrievedChunk(
+                chunk_id="chunk-1",
+                document_id="doc-1",
+                similarity=0.81,
+                text="The note explains how to kill N+1 queries by batching related reads.",
+                source_type="note",
+                chunk_index=0,
+                document_title="Kill N+1 queries",
+                token_count=14,
+                metadata={},
+            ),
+            answer_module.RetrievedChunk(
+                chunk_id="chunk-2",
+                document_id="doc-2",
+                similarity=0.73,
+                text="The document lists fixes and suggestions for hybrid search ranking.",
+                source_type="document",
+                chunk_index=0,
+                document_title="Fixes and suggestions",
+                token_count=12,
+                metadata={},
+            ),
+        ]
+
+        context = generator._build_context(chunks, include_citations=True)
+        source_list = generator._build_source_list(chunks)
+        system_prompt = generator._build_system_prompt("inline")
+
+        self.assertIn("[Source Title: Kill N+1 queries]", context)
+        self.assertIn("[Source Title: Fixes and suggestions]", context)
+        self.assertNotIn("[Document 1:", context)
+        self.assertNotIn("[Document 2:", context)
+        self.assertIn("- Kill N+1 queries (Note)", source_list)
+        self.assertIn("- Fixes and suggestions (Document)", source_list)
+        self.assertIn("Do NOT refer to sources as 'Document 1'", system_prompt)
+
     def test_generate_uses_extractive_grounded_fallback_when_llm_fails(self):
         answer_module = self._load_answer_generator_module()
         generator = answer_module.AnswerGenerator()
