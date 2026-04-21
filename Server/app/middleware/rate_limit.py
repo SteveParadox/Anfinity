@@ -13,6 +13,36 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+LOOPBACK_CLIENT_IPS = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+
+
+def is_rate_limit_exempt_path(path: str) -> bool:
+    """Return True when a path should bypass the rate limiter entirely."""
+    return path in {"/health", "/", "/docs", "/redoc", "/openapi.json"}
+
+
+def is_loopback_client(client_ip: Optional[str]) -> bool:
+    """Detect local development traffic coming from the same machine."""
+    if not client_ip:
+        return False
+
+    normalized_ip = client_ip.strip().lower()
+    return normalized_ip in LOOPBACK_CLIENT_IPS
+
+
+def should_skip_rate_limit(*, path: str, client_ip: Optional[str]) -> bool:
+    """Centralize bypass rules so middleware and tests stay aligned."""
+    if not settings.RATE_LIMIT_ENABLED:
+        return True
+
+    if is_rate_limit_exempt_path(path):
+        return True
+
+    return bool(
+        settings.ENVIRONMENT == "development"
+        and settings.RATE_LIMIT_SKIP_LOCALHOST_IN_DEVELOPMENT
+        and is_loopback_client(client_ip)
+    )
 
 
 class RateLimiter:
@@ -133,13 +163,14 @@ class RateLimitMiddleware:
             return
 
         path = scope.get("path", "")
-        if path in ["/health", "/", "/docs", "/redoc", "/openapi.json"]:
+        client = scope.get("client")
+        client_ip = client[0] if client else "unknown"
+
+        if should_skip_rate_limit(path=path, client_ip=client_ip):
             await self.app(scope, receive, send)
             return
 
         headers = Headers(scope=scope)
-        client = scope.get("client")
-        client_ip = client[0] if client else "unknown"
         api_key = headers.get("x-api-key")
         key = f"rate_limit:{api_key or client_ip}"
 
