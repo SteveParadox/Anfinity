@@ -5,11 +5,20 @@ import re
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import tiktoken
 
 from app.config import settings
+from app.ingestion.source_locations import (
+    ParsedSegment,
+    enrich_citation_metadata,
+    merge_segment_metadata,
+    slice_location,
+)
+
+if TYPE_CHECKING:
+    from app.ingestion.parsers.base import ParsedDocument
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +140,47 @@ class Chunker:
         chunks = self._merge_small_chunks(chunks)
         chunks = self._add_context(chunks)
         return chunks
+
+    def chunk_parsed_document(
+        self,
+        parsed_document: ParsedDocument,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[TextChunk]:
+        """Chunk a parsed document while preserving source-location traceability."""
+        base_metadata = {
+            **(parsed_document.metadata or {}),
+            **(metadata or {}),
+        }
+        segments = list(parsed_document.segments or [])
+        if not segments:
+            return self.chunk_text(parsed_document.text, metadata=base_metadata)
+
+        expanded_segments = self._expand_segments_for_chunking(segments)
+        if not expanded_segments:
+            return []
+
+        chunks: List[TextChunk] = []
+        current: List[ParsedSegment] = []
+        current_tokens = 0
+        chunk_index = 0
+
+        for segment in expanded_segments:
+            segment_tokens = segment.token_count or self.count_tokens(segment.text)
+            segment.token_count = segment_tokens
+
+            if current and current_tokens + segment_tokens > self.chunk_size:
+                chunks.append(self._build_traceable_chunk(current, chunk_index, base_metadata))
+                chunk_index += 1
+                current = self._segment_overlap(current)
+                current_tokens = sum(part.token_count or self.count_tokens(part.text) for part in current)
+
+            current.append(segment)
+            current_tokens += segment_tokens
+
+        if current:
+            chunks.append(self._build_traceable_chunk(current, chunk_index, base_metadata))
+
+        return self._add_context(chunks)
 
     # ------------------------------------------------------------------
     # Splitting strategies
@@ -380,6 +430,115 @@ class Chunker:
 
         return chunks
 
+    def _expand_segments_for_chunking(self, segments: List[ParsedSegment]) -> List[ParsedSegment]:
+        """Split oversized segments while preserving location metadata."""
+        expanded: List[ParsedSegment] = []
+        for segment in segments:
+            text = str(segment.text or "").strip()
+            if not text:
+                continue
+
+            token_count = self.count_tokens(text)
+            segment.token_count = token_count
+            if token_count <= self.chunk_size:
+                expanded.append(segment)
+                continue
+
+            expanded.extend(self._split_segment(segment))
+        return expanded
+
+    def _split_segment(self, segment: ParsedSegment) -> List[ParsedSegment]:
+        """Split one oversized parsed segment into smaller traceable units."""
+        pieces: List[ParsedSegment] = []
+        text = segment.text
+        sentences = [
+            part.strip()
+            for part in self._SENTENCE_RE.split(text)
+            if part and part.strip()
+        ]
+
+        # Fall back to a hard token split for pathological paragraphs.
+        if len(sentences) <= 1:
+            return self._hard_split_segment(segment)
+
+        cursor = 0
+        current_parts: List[str] = []
+        current_start = 0
+        current_tokens = 0
+
+        for sentence in sentences:
+            start = text.find(sentence, cursor)
+            if start < 0:
+                start = cursor
+            end = start + len(sentence)
+            cursor = end
+            sentence_tokens = self.count_tokens(sentence)
+
+            if current_parts and current_tokens + sentence_tokens > self.chunk_size:
+                merged_text = " ".join(current_parts).strip()
+                pieces.append(
+                    ParsedSegment(
+                        text=merged_text,
+                        location=slice_location(segment.location, text, current_start, start),
+                        segment_type=segment.segment_type,
+                        separator=segment.separator,
+                        metadata=dict(segment.metadata or {}),
+                        token_count=self.count_tokens(merged_text),
+                    )
+                )
+                current_parts = [sentence]
+                current_start = start
+                current_tokens = sentence_tokens
+            else:
+                if not current_parts:
+                    current_start = start
+                current_parts.append(sentence)
+                current_tokens += sentence_tokens
+
+        if current_parts:
+            merged_text = " ".join(current_parts).strip()
+            pieces.append(
+                ParsedSegment(
+                    text=merged_text,
+                    location=slice_location(segment.location, text, current_start, len(text)),
+                    segment_type=segment.segment_type,
+                    separator=segment.separator,
+                    metadata=dict(segment.metadata or {}),
+                    token_count=self.count_tokens(merged_text),
+                )
+            )
+
+        return [piece for piece in pieces if piece.text.strip()] or self._hard_split_segment(segment)
+
+    def _hard_split_segment(self, segment: ParsedSegment) -> List[ParsedSegment]:
+        """Token-based fallback split that keeps char and line offsets honest."""
+        tokens = self._tokenizer.encode(segment.text)
+        stride = self.chunk_size - self.chunk_overlap
+        pieces: List[ParsedSegment] = []
+        source_text = segment.text
+        text_cursor = 0
+
+        for start in range(0, len(tokens), stride):
+            token_slice = tokens[start : start + self.chunk_size]
+            piece_text = self._tokenizer.decode(token_slice).strip()
+            if not piece_text:
+                continue
+            found_at = source_text.find(piece_text, text_cursor)
+            if found_at < 0:
+                found_at = text_cursor
+            text_cursor = found_at + len(piece_text)
+            pieces.append(
+                ParsedSegment(
+                    text=piece_text,
+                    location=slice_location(segment.location, source_text, found_at, text_cursor),
+                    segment_type=segment.segment_type,
+                    separator=segment.separator,
+                    metadata=dict(segment.metadata or {}),
+                    token_count=len(token_slice),
+                )
+            )
+        return pieces
+
     # ------------------------------------------------------------------
     # Post-processing helpers
     # ------------------------------------------------------------------
@@ -402,6 +561,47 @@ class Chunker:
             overlap_tokens += part_tokens
 
         return separator.join(overlap_parts) if overlap_parts else None
+
+    def _segment_overlap(self, segments: List[ParsedSegment]) -> List[ParsedSegment]:
+        """Return trailing segments that fit within the overlap token budget."""
+        overlap_tokens = 0
+        overlap_segments: List[ParsedSegment] = []
+
+        for segment in reversed(segments):
+            segment_tokens = segment.token_count or self.count_tokens(segment.text)
+            if overlap_tokens + segment_tokens > self.chunk_overlap:
+                break
+            overlap_segments.insert(0, segment)
+            overlap_tokens += segment_tokens
+
+        return overlap_segments
+
+    def _build_traceable_chunk(
+        self,
+        segments: List[ParsedSegment],
+        index: int,
+        base_metadata: Dict[str, Any],
+    ) -> TextChunk:
+        """Build a chunk from parsed segments with merged citation metadata."""
+        text_parts: List[str] = []
+        for segment_index, segment in enumerate(segments):
+            text_parts.append(segment.text)
+            if segment_index < len(segments) - 1:
+                text_parts.append(segment.separator or "\n\n")
+        text = "".join(text_parts).strip()
+        token_count = self.count_tokens(text)
+        merged_metadata = merge_segment_metadata(segments, base_metadata=base_metadata)
+        merged_metadata = enrich_citation_metadata(
+            merged_metadata,
+            document_title=str(base_metadata.get("source_file_name") or base_metadata.get("document_title") or ""),
+            source_type=str(base_metadata.get("source_type") or ""),
+        )
+        return TextChunk(
+            text=text,
+            index=index,
+            token_count=token_count,
+            metadata=merged_metadata,
+        )
 
     def _merge_small_chunks(self, chunks: List[TextChunk]) -> List[TextChunk]:
         """Merge adjacent chunks that are individually under-sized.
@@ -495,3 +695,11 @@ def chunk_text(
         List of TextChunk objects
     """
     return chunker.chunk_text(text, metadata)
+
+
+def chunk_parsed_document(
+    parsed_document: ParsedDocument,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[TextChunk]:
+    """Module-level convenience wrapper for traceable parsed-document chunking."""
+    return chunker.chunk_parsed_document(parsed_document, metadata)

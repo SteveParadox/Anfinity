@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Chunk, ChunkStatus, Embedding, Document, DocumentStatus
 from app.ingestion.embedder import EmbeddingProvider
+from app.ingestion.source_locations import enrich_citation_metadata
 from app.services.vector_db import VectorDBClient
 from app.config import settings
 
@@ -328,10 +329,14 @@ class BatchEmbeddingProcessor:
                         token_count=chunk.token_count,
                         context_before=chunk.context_before,
                         context_after=chunk.context_after,
-                        metadata={
-                            **(chunk.chunk_metadata or {}),
-                            "interaction_count": 0,
-                        }
+                        metadata=enrich_citation_metadata(
+                            {
+                                **(chunk.chunk_metadata or {}),
+                                "interaction_count": 0,
+                            },
+                            document_title=document.title,
+                            source_type=document.source_type.value,
+                        ),
                     )
                     
                     # Create point for vector DB
@@ -379,10 +384,33 @@ class BatchEmbeddingProcessor:
                     batch_result["failed"] = len(batch_chunks)
                     batch_result["vector_ids"] = []
                     return batch_result
-                
-                # Save embedding metadata to PostgreSQL
-                await self._save_embedding_metadata(embedding_records)
-                await self._mark_chunks_embedded([chunk.id for chunk in batch_chunks])
+
+                try:
+                    # Save embedding metadata to PostgreSQL
+                    await self._save_embedding_metadata(embedding_records)
+                    await self._mark_chunks_embedded([chunk.id for chunk in batch_chunks])
+                except Exception as persistence_exc:
+                    await self.db.rollback()
+                    cleanup_ids = [point["id"] for point in vector_points]
+                    cleanup_ok = self.vector_db.delete_points(
+                        collection_name,
+                        cleanup_ids,
+                    )
+                    if not cleanup_ok:
+                        logger.error(
+                            "Failed to clean up %d vector(s) after batch persistence error",
+                            len(cleanup_ids),
+                        )
+                    error = (
+                        "Failed to persist embedding metadata after vector upsert: "
+                        f"{persistence_exc}"
+                    )
+                    logger.error(error, exc_info=True)
+                    batch_result["errors"].append(error)
+                    batch_result["processed"] = 0
+                    batch_result["failed"] = len(batch_chunks)
+                    batch_result["vector_ids"] = []
+                    return batch_result
             
         except Exception as e:
             logger.error(f"Error processing batch: {e}", exc_info=True)
@@ -409,7 +437,15 @@ class BatchEmbeddingProcessor:
                 for record in embedding_records
             ]
             stmt = pg_insert(Embedding).values(values)
-            stmt = stmt.on_conflict_do_nothing(index_elements=["chunk_id"])
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["chunk_id"],
+                set_={
+                    "vector_id": stmt.excluded.vector_id,
+                    "collection_name": stmt.excluded.collection_name,
+                    "model_used": stmt.excluded.model_used,
+                    "embedding_dimension": stmt.excluded.embedding_dimension,
+                },
+            )
             await self.db.execute(stmt)
             await self.db.flush()
             logger.debug("Staged %d embedding metadata records", len(embedding_records))

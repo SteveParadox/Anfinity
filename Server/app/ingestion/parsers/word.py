@@ -1,71 +1,125 @@
-"""Word document parser."""
+"""Word document parser with heading and paragraph locations."""
+
+from __future__ import annotations
+
 import io
-from typing import Dict, Any
+import re
+from typing import List
 
 from docx import Document
 
 from app.ingestion.parsers.base import DocumentParser, ParsedDocument
 
 
+_HEADING_LEVEL_RE = re.compile(r"heading\s+(\d+)", re.IGNORECASE)
+
+
 class WordParser(DocumentParser):
     """Word document parser (.docx)."""
-    
+
     def parse(self, file_bytes: bytes) -> ParsedDocument:
-        """Parse Word document.
-        
-        Args:
-            file_bytes: Word file content
-            
-        Returns:
-            Parsed document
-        """
         doc = Document(io.BytesIO(file_bytes))
-        
-        text_parts = []
+
         metadata = {}
-        
-        # Extract document properties
         core_props = doc.core_properties
-        metadata['title'] = core_props.title
-        metadata['author'] = core_props.author
-        metadata['subject'] = core_props.subject
-        metadata['created'] = str(core_props.created) if core_props.created else None
-        metadata['modified'] = str(core_props.modified) if core_props.modified else None
-        
-        # Extract text from paragraphs
-        for para in doc.paragraphs:
-            if para.text.strip():
-                text_parts.append(para.text)
-        
-        # Extract text from tables
-        for table_idx, table in enumerate(doc.tables):
-            text_parts.append(f"\n--- Table {table_idx + 1} ---\n")
-            for row in table.rows:
-                row_text = []
-                for cell in row.cells:
-                    cell_text = cell.text.strip()
-                    if cell_text:
-                        row_text.append(cell_text)
-                if row_text:
-                    text_parts.append(' | '.join(row_text))
-        
-        # Combine text
-        full_text = '\n'.join(text_parts)
-        
-        # Clean text
-        full_text = self._clean_text(full_text)
-        
-        # Extract title
-        title = metadata.get('title') or self._extract_title(full_text)
-        
-        # Count words
-        word_count = self._count_words(full_text)
-        
-        return ParsedDocument(
-            text=full_text,
+        metadata["title"] = core_props.title
+        metadata["author"] = core_props.author
+        metadata["subject"] = core_props.subject
+        metadata["created"] = str(core_props.created) if core_props.created else None
+        metadata["modified"] = str(core_props.modified) if core_props.modified else None
+        metadata["content_format"] = "docx"
+
+        segments = []
+        heading_path: List[str] = []
+        paragraph_index = 0
+        block_index = 0
+
+        for paragraph in doc.paragraphs:
+            text = (paragraph.text or "").strip()
+            if not text:
+                continue
+
+            style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
+            heading_level = self._heading_level(style_name)
+
+            if heading_level is not None:
+                heading_path = heading_path[: heading_level - 1] + [text]
+                block_index += 1
+                segment = self._build_segment(
+                    text,
+                    segment_type="heading",
+                    source_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    block_index=block_index,
+                    heading_path=list(heading_path),
+                    heading_path_start=list(heading_path),
+                    heading_path_end=list(heading_path),
+                    section_title=text,
+                    section_title_start=text,
+                    section_title_end=text,
+                    extraction_confidence=0.95,
+                )
+            else:
+                paragraph_index += 1
+                block_index += 1
+                segment = self._build_segment(
+                    text,
+                    segment_type="paragraph",
+                    source_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    paragraph_index=paragraph_index,
+                    block_index=block_index,
+                    heading_path=list(heading_path),
+                    heading_path_start=list(heading_path),
+                    heading_path_end=list(heading_path),
+                    section_title=heading_path[-1] if heading_path else None,
+                    section_title_start=heading_path[-1] if heading_path else None,
+                    section_title_end=heading_path[-1] if heading_path else None,
+                    extraction_confidence=0.95,
+                )
+            if segment:
+                segments.append(segment)
+
+        for table_index, table in enumerate(doc.tables, start=1):
+            for row_index, row in enumerate(table.rows, start=1):
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if not cells:
+                    continue
+                paragraph_index += 1
+                block_index += 1
+                table_text = " | ".join(cells)
+                segment = self._build_segment(
+                    table_text,
+                    segment_type="table_row",
+                    source_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    paragraph_index=paragraph_index,
+                    block_index=block_index,
+                    heading_path=list(heading_path),
+                    heading_path_start=list(heading_path),
+                    heading_path_end=list(heading_path),
+                    section_title=heading_path[-1] if heading_path else None,
+                    section_title_start=heading_path[-1] if heading_path else None,
+                    section_title_end=heading_path[-1] if heading_path else None,
+                    extraction_confidence=0.9,
+                    metadata={"table_index": table_index, "row_index": row_index},
+                )
+                if segment:
+                    segments.append(segment)
+
+        title = metadata.get("title")
+        if not title:
+            for segment in segments:
+                if segment.segment_type == "heading":
+                    title = segment.text
+                    break
+
+        return self._build_document_from_segments(
+            segments=segments,
             metadata=metadata,
             title=title,
-            author=metadata.get('author'),
-            page_count=None,  # Word docs don't have fixed pages
-            word_count=word_count
+            author=metadata.get("author"),
         )
+
+    def _heading_level(self, style_name: str) -> int | None:
+        match = _HEADING_LEVEL_RE.search(style_name or "")
+        if not match:
+            return None
+        return max(1, int(match.group(1)))

@@ -3,6 +3,7 @@ from app.ingestion.parsers.base import DocumentParser, ParsedDocument
 from app.ingestion.parsers.pdf import PDFParser
 from app.ingestion.parsers.word import WordParser
 from app.ingestion.parsers.text import TextParser
+from app.ingestion.parsers.html import HTMLParser
 from app.ingestion.parsers.url import URLParser
 from app.ingestion.parsers.code import CodeParser
 from app.ingestion.parsers.data import DataParser
@@ -13,6 +14,7 @@ __all__ = [
     "PDFParser",
     "WordParser",
     "TextParser",
+    "HTMLParser",
     "URLParser",
     "CodeParser",
     "DataParser",
@@ -37,6 +39,8 @@ def get_parser(content_type: str) -> DocumentParser:
         "text/x-markdown": TextParser(),
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": WordParser(),
         "application/msword": WordParser(),
+        "text/html": HTMLParser(),
+        "application/xhtml+xml": HTMLParser(),
         "text/url": URLParser(),
         "application/url": URLParser(),
         "text/code": CodeParser(),
@@ -97,6 +101,8 @@ def detect_content_type(filename: str, file_bytes: bytes = None) -> str:
         return "application/pdf"
     if filename_lower.endswith((".docx", ".doc")):
         return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if filename_lower.endswith((".html", ".htm", ".xhtml")):
+        return "text/html"
     if filename_lower.endswith((".md", ".markdown")):
         return "text/markdown"
     
