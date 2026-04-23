@@ -9,18 +9,27 @@ try:
     from diff_match_patch import diff_match_patch
 except ImportError:  # pragma: no cover - exercised only when dependency is absent
     diff_match_patch = None
-from fastapi import APIRouter, Depends, HTTPException, Response, status, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Response, Request, status, Query, BackgroundTasks
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, false, func, text
 
 from app.database.session import get_db, AsyncSessionLocal
-from app.database.models import Note, NoteCollaborator, NoteCollaborationRole, NoteConnectionSuggestion, NoteInvite, NoteInviteStatus, NoteVersion, User as DBUser, WorkspaceSection
+from app.database.models import ApprovalWorkflowPriority, ApprovalWorkflowStatus, Note, NoteCollaborator, NoteCollaborationRole, NoteConnectionSuggestion, NoteInvite, NoteInviteStatus, NoteVersion, User as DBUser, WorkspaceSection
 from app.core.auth import get_current_user
-from app.core.audit import log_audit_event, AuditAction, EntityType
+from app.core.audit import AuditRequestContext, audit
 from app.core.permissions import ensure_workspace_permission, get_bulk_workspace_permissions_for_user
 from app.services.graph_service import get_graph_service
 from app.services.note_access import ensure_note_permission, resolve_note_access
+from app.services.note_comments import (
+    create_note_comment,
+    list_note_comments,
+    load_note_comment_or_404,
+    serialize_note_comment,
+    set_comment_resolution,
+    toggle_comment_reaction,
+)
+from app.services.note_contributions import build_note_contribution_breakdown, list_note_contributions
 from app.services.note_invites import (
     DEFAULT_NOTE_INVITE_TTL,
     accept_note_invite,
@@ -89,6 +98,7 @@ class NoteUpdate(BaseModel):
 class NoteCollaborationSync(BaseModel):
     """Schema for lightweight collaborative content persistence."""
     content: str = Field(default="")
+    base_content: Optional[str] = None
 
 
 class NoteResponse(BaseModel):
@@ -106,6 +116,13 @@ class NoteResponse(BaseModel):
     ai_generated: bool
     confidence_score: Optional[float]
     source_url: Optional[str]
+    approval_status: ApprovalWorkflowStatus = ApprovalWorkflowStatus.DRAFT
+    approval_priority: ApprovalWorkflowPriority = ApprovalWorkflowPriority.NORMAL
+    approval_due_at: Optional[str] = None
+    approval_submitted_at: Optional[str] = None
+    approval_submitted_by_user_id: Optional[str] = None
+    approval_decided_at: Optional[str] = None
+    approval_decided_by_user_id: Optional[str] = None
     created_at: str
     updated_at: str
 
@@ -240,6 +257,78 @@ class NoteAccessResponse(BaseModel):
     collaborator_role: Optional[NoteCollaborationRole] = None
 
 
+class NoteContributionBreakdownResponse(BaseModel):
+    note_created: int
+    note_updated: int
+    note_restored: int
+    thinking_contributions: int
+    votes_cast: int
+
+
+class NoteContributionResponse(BaseModel):
+    note_id: str
+    workspace_id: Optional[str]
+    contributor_user_id: str
+    contributor_name: Optional[str] = None
+    contributor_email: Optional[str] = None
+    contribution_count: int
+    breakdown: NoteContributionBreakdownResponse
+    first_contribution_at: Optional[str] = None
+    last_contribution_at: Optional[str] = None
+
+
+class NoteCommentCreateRequest(BaseModel):
+    body: str = Field(..., min_length=1, max_length=10000)
+
+
+class NoteCommentAuthorResponse(BaseModel):
+    id: str
+    email: str
+    name: str
+
+
+class NoteCommentMentionResponse(BaseModel):
+    id: str
+    comment_id: str
+    mentioned_user_id: str
+    mention_token: str
+    start_offset: int
+    end_offset: int
+    user: Optional[NoteCommentAuthorResponse] = None
+
+
+class NoteCommentReactionResponse(BaseModel):
+    emoji: str
+    emoji_value: str
+    count: int
+    reacted_by_current_user: bool
+
+
+class NoteCommentResponse(BaseModel):
+    id: str
+    note_id: str
+    author_user_id: str
+    parent_comment_id: Optional[str] = None
+    depth: int
+    body: str
+    is_resolved: bool
+    resolved_by_user_id: Optional[str] = None
+    resolved_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    author: Optional[NoteCommentAuthorResponse] = None
+    resolved_by: Optional[NoteCommentAuthorResponse] = None
+    mentions: List[NoteCommentMentionResponse] = Field(default_factory=list)
+    reactions: List[NoteCommentReactionResponse] = Field(default_factory=list)
+    replies: List["NoteCommentResponse"] = Field(default_factory=list)
+
+
+if hasattr(NoteCommentResponse, "model_rebuild"):
+    NoteCommentResponse.model_rebuild()
+else:  # pragma: no cover - compatibility for older Pydantic
+    NoteCommentResponse.update_forward_refs()
+
+
 # ==================== Routes ====================
 
 # ==================== Utility Functions ====================
@@ -275,6 +364,21 @@ def serialize_note(note: Note) -> NoteResponse:
         ai_generated=bool(note.ai_generated),
         confidence_score=note.confidence_score,
         source_url=note.source_url,
+        approval_status=(
+            note.approval_status
+            if isinstance(note.approval_status, ApprovalWorkflowStatus)
+            else ApprovalWorkflowStatus(str(note.approval_status or ApprovalWorkflowStatus.DRAFT.value))
+        ),
+        approval_priority=(
+            note.approval_priority
+            if isinstance(note.approval_priority, ApprovalWorkflowPriority)
+            else ApprovalWorkflowPriority(str(note.approval_priority or ApprovalWorkflowPriority.NORMAL.value))
+        ),
+        approval_due_at=note.approval_due_at.isoformat() if note.approval_due_at else None,
+        approval_submitted_at=note.approval_submitted_at.isoformat() if note.approval_submitted_at else None,
+        approval_submitted_by_user_id=str(note.approval_submitted_by_user_id) if note.approval_submitted_by_user_id else None,
+        approval_decided_at=note.approval_decided_at.isoformat() if note.approval_decided_at else None,
+        approval_decided_by_user_id=str(note.approval_decided_by_user_id) if note.approval_decided_by_user_id else None,
         created_at=created_at.isoformat(),
         updated_at=updated_at.isoformat(),
     )
@@ -300,6 +404,20 @@ def serialize_note_invite(invite: NoteInvite) -> NoteInviteResponse:
     )
 
 
+def serialize_note_contribution(summary) -> NoteContributionResponse:
+    return NoteContributionResponse(
+        note_id=str(summary.note_id),
+        workspace_id=str(summary.workspace_id) if summary.workspace_id else None,
+        contributor_user_id=str(summary.contributor_user_id),
+        contributor_name=summary.contributor_name,
+        contributor_email=summary.contributor_email,
+        contribution_count=summary.contribution_count,
+        breakdown=NoteContributionBreakdownResponse(**build_note_contribution_breakdown(summary)),
+        first_contribution_at=summary.first_contribution_at.isoformat() if summary.first_contribution_at else None,
+        last_contribution_at=summary.last_contribution_at.isoformat() if summary.last_contribution_at else None,
+    )
+
+
 async def load_note_or_404(note_id: UUID, db: AsyncSession) -> Note:
     note = await get_note_with_bypass(db, note_id)
     if note is None:
@@ -316,6 +434,16 @@ def _tokenize_for_diff(text: str) -> List[str]:
 
 def _count_words(text: str) -> int:
     return len(re.findall(r"\S+", text or ""))
+
+
+def parse_uuid_or_422(value: str, field_name: str) -> UUID:
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid {field_name} format",
+        ) from exc
 
 
 def _normalize_string_list(values: Sequence[Any] | None) -> List[str]:
@@ -729,26 +857,8 @@ def serialize_connection_suggestion(suggestion: NoteConnectionSuggestion) -> Con
     )
 
 
-async def safe_log_note_audit(
-    db: AsyncSession,
-    *,
-    current_user_id: UUID,
-    workspace_id: Optional[UUID],
-    note_id: UUID,
-    action: AuditAction,
-) -> None:
-    """Best-effort audit logging that never blocks note persistence."""
-    try:
-        await log_audit_event(
-            user_id=current_user_id,
-            workspace_id=workspace_id,
-            action=action,
-            entity_type=EntityType.NOTE,
-            entity_id=note_id,
-            db=db,
-        )
-    except Exception as exc:
-        logger.warning("Skipping audit log for note %s action %s: %s", note_id, action.value, exc)
+def build_note_audit_context(request: Request, source: str, *, session_id: Optional[str] = None) -> AuditRequestContext:
+    return AuditRequestContext.from_request(request, source=source, session_id=session_id)
 
 
 # ==================== Endpoints ====================
@@ -757,6 +867,7 @@ async def safe_log_note_audit(
 async def create_note(
     note_data: NoteCreate,
     background_tasks: BackgroundTasks,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -823,12 +934,20 @@ async def create_note(
         change_reason="created",
         extra_metadata={"trigger": "create_note"},
     )
-    await safe_log_note_audit(
+    await audit.note_created(
         db,
-        current_user_id=current_user.id,
+        actor_user_id=current_user.id,
         workspace_id=workspace_id,
         note_id=new_note.id,
-        action=AuditAction.NOTE_CREATED,
+        metadata={
+            "title": new_note.title,
+            "note_type": new_note.note_type,
+            "tag_count": len(new_note.tags or []),
+            "word_count": new_note.word_count or 0,
+            "version_id": str(created_version.id) if created_version is not None else None,
+            "source": "api.notes.create_note",
+        },
+        context=build_note_audit_context(request, "api.notes.create_note"),
     )
     await db.commit()
     await db.refresh(new_note)
@@ -990,12 +1109,18 @@ async def resolve_note_invite_endpoint(
 @router.post("/invites/accept", response_model=NoteInviteAcceptResponse)
 async def accept_note_invite_endpoint(
     payload: NoteInviteAcceptRequest,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Accept a valid note collaboration invite."""
 
-    invite, note, access = await accept_note_invite(payload.token.strip(), current_user, db)
+    invite, note, access = await accept_note_invite(
+        payload.token.strip(),
+        current_user,
+        db,
+        audit_context=build_note_audit_context(request, "api.notes.accept_note_invite"),
+    )
     return NoteInviteAcceptResponse(
         invite=serialize_note_invite(invite),
         note=serialize_note(note),
@@ -1011,7 +1136,7 @@ async def list_note_invites(
 ):
     """List invites for a note."""
 
-    note_uuid = UUID(note_id)
+    note_uuid = parse_uuid_or_422(note_id, "note_id")
     note_result = await db.execute(select(Note).where(Note.id == note_uuid))
     note = note_result.scalar_one_or_none()
     if note is None:
@@ -1037,12 +1162,13 @@ async def create_note_invite_endpoint(
     note_id: str,
     payload: NoteInviteCreateRequest,
     response: Response,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Create or refresh a note collaboration invite."""
 
-    note_uuid = UUID(note_id)
+    note_uuid = parse_uuid_or_422(note_id, "note_id")
     note_result = await db.execute(select(Note).where(Note.id == note_uuid))
     note = note_result.scalar_one_or_none()
     if note is None:
@@ -1075,6 +1201,7 @@ async def create_note_invite_endpoint(
         db,
         message=payload.message,
         expires_in=timedelta(days=payload.expires_in_days or int(DEFAULT_NOTE_INVITE_TTL.days)),
+        audit_context=build_note_audit_context(request, "api.notes.create_note_invite"),
     )
 
     if created_invite.updated_collaborator is not None:
@@ -1101,13 +1228,14 @@ async def create_note_invite_endpoint(
 async def revoke_note_invite_endpoint(
     note_id: str,
     invite_id: str,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Revoke a pending note invite."""
 
-    note_uuid = UUID(note_id)
-    invite_uuid = UUID(invite_id)
+    note_uuid = parse_uuid_or_422(note_id, "note_id")
+    invite_uuid = parse_uuid_or_422(invite_id, "invite_id")
 
     note_result = await db.execute(select(Note).where(Note.id == note_uuid))
     note = note_result.scalar_one_or_none()
@@ -1128,7 +1256,13 @@ async def revoke_note_invite_endpoint(
     if invite is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
 
-    invite = await revoke_note_invite(invite, db)
+    invite = await revoke_note_invite(
+        invite,
+        db,
+        actor_user_id=current_user.id,
+        workspace_id=note.workspace_id,
+        audit_context=build_note_audit_context(request, "api.notes.revoke_note_invite"),
+    )
     return serialize_note_invite(invite)
 
 
@@ -1140,7 +1274,7 @@ async def get_note_access(
 ):
     """Return effective note access for the current user."""
 
-    note = await load_note_or_404(UUID(note_id), db)
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
     access = await ensure_note_permission(note, current_user, db, "view")
     return NoteAccessResponse(
         note_id=str(note.id),
@@ -1169,9 +1303,143 @@ async def get_note(
     Returns:
         Note details
     """
-    note = await load_note_or_404(UUID(note_id), db)
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
     await ensure_note_permission(note, current_user, db, "view")
     return serialize_note(note)
+
+
+@router.get("/{note_id}/comments", response_model=List[NoteCommentResponse])
+async def get_note_comments(
+    note_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List threaded comments for one note."""
+
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    await ensure_note_permission(note, current_user, db, "view")
+    payload = await list_note_comments(db, note_id=note.id, current_user_id=current_user.id)
+    return [NoteCommentResponse(**entry) for entry in payload]
+
+
+@router.post("/{note_id}/comments", response_model=NoteCommentResponse, status_code=status.HTTP_201_CREATED)
+async def create_note_comment_endpoint(
+    note_id: str,
+    payload: NoteCommentCreateRequest,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new top-level comment on a note."""
+
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    await ensure_note_permission(note, current_user, db, "update")
+    comment = await create_note_comment(
+        db,
+        note=note,
+        author=current_user,
+        body=payload.body,
+    )
+    return NoteCommentResponse(**serialize_note_comment(comment, current_user_id=current_user.id))
+
+
+@router.post("/{note_id}/comments/{comment_id}/replies", response_model=NoteCommentResponse, status_code=status.HTTP_201_CREATED)
+async def create_note_reply_endpoint(
+    note_id: str,
+    comment_id: str,
+    payload: NoteCommentCreateRequest,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a nested reply for an existing note comment."""
+
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    await ensure_note_permission(note, current_user, db, "update")
+    comment = await create_note_comment(
+        db,
+        note=note,
+        author=current_user,
+        body=payload.body,
+        parent_comment_id=parse_uuid_or_422(comment_id, "comment_id"),
+    )
+    return NoteCommentResponse(**serialize_note_comment(comment, current_user_id=current_user.id))
+
+
+@router.post("/{note_id}/comments/{comment_id}/reactions/{emoji}", response_model=NoteCommentResponse)
+async def toggle_note_comment_reaction_endpoint(
+    note_id: str,
+    comment_id: str,
+    emoji: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle one allowed emoji reaction for the current user."""
+
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    await ensure_note_permission(note, current_user, db, "update")
+    comment = await load_note_comment_or_404(
+        db,
+        note_id=note.id,
+        comment_id=parse_uuid_or_422(comment_id, "comment_id"),
+    )
+    await toggle_comment_reaction(db, comment=comment, user_id=current_user.id, emoji=emoji)
+    refreshed_comment = await load_note_comment_or_404(db, note_id=note.id, comment_id=comment.id)
+    return NoteCommentResponse(**serialize_note_comment(refreshed_comment, current_user_id=current_user.id))
+
+
+@router.post("/{note_id}/comments/{comment_id}/resolve", response_model=NoteCommentResponse)
+async def resolve_note_comment_endpoint(
+    note_id: str,
+    comment_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark a note comment thread as resolved."""
+
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    await ensure_note_permission(note, current_user, db, "update")
+    comment = await load_note_comment_or_404(
+        db,
+        note_id=note.id,
+        comment_id=parse_uuid_or_422(comment_id, "comment_id"),
+    )
+    await set_comment_resolution(db, comment=comment, resolved=True, actor_user_id=current_user.id)
+    refreshed_comment = await load_note_comment_or_404(db, note_id=note.id, comment_id=comment.id)
+    return NoteCommentResponse(**serialize_note_comment(refreshed_comment, current_user_id=current_user.id))
+
+
+@router.post("/{note_id}/comments/{comment_id}/unresolve", response_model=NoteCommentResponse)
+async def unresolve_note_comment_endpoint(
+    note_id: str,
+    comment_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear the resolved state on a note comment thread."""
+
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    await ensure_note_permission(note, current_user, db, "update")
+    comment = await load_note_comment_or_404(
+        db,
+        note_id=note.id,
+        comment_id=parse_uuid_or_422(comment_id, "comment_id"),
+    )
+    await set_comment_resolution(db, comment=comment, resolved=False, actor_user_id=current_user.id)
+    refreshed_comment = await load_note_comment_or_404(db, note_id=note.id, comment_id=comment.id)
+    return NoteCommentResponse(**serialize_note_comment(refreshed_comment, current_user_id=current_user.id))
+
+
+@router.get("/{note_id}/contributions", response_model=List[NoteContributionResponse])
+async def get_note_contributions(
+    note_id: str,
+    current_user: DBUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return aggregated contribution attribution for one note."""
+
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    await ensure_note_permission(note, current_user, db, "view")
+    contributions = await list_note_contributions(db, note.id)
+    return [serialize_note_contribution(summary) for summary in contributions]
 
 
 @router.get("/{note_id}/versions", response_model=List[NoteVersionResponse])
@@ -1181,7 +1449,7 @@ async def list_note_versions(
     db: AsyncSession = Depends(get_db)
 ):
     """List immutable note versions for timeline and lineage views."""
-    note_uuid = UUID(note_id)
+    note_uuid = parse_uuid_or_422(note_id, "note_id")
     note = await load_note_or_404(note_uuid, db)
     await ensure_note_permission(note, current_user, db, "view")
 
@@ -1198,12 +1466,13 @@ async def restore_note_version(
     note_id: str,
     version_id: str,
     background_tasks: BackgroundTasks,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Restore a historical note version by creating a new current version."""
-    note_uuid = UUID(note_id)
-    version_uuid = UUID(version_id)
+    note_uuid = parse_uuid_or_422(note_id, "note_id")
+    version_uuid = parse_uuid_or_422(version_id, "version_id")
 
     note = await load_note_or_404(note_uuid, db)
     await ensure_note_permission(note, current_user, db, "update")
@@ -1260,12 +1529,18 @@ async def restore_note_version(
         },
     )
 
-    await safe_log_note_audit(
+    await audit.note_restored(
         db,
-        current_user_id=current_user.id,
+        actor_user_id=current_user.id,
         workspace_id=note.workspace_id,
         note_id=note.id,
-        action=AuditAction.NOTE_UPDATED,
+        metadata={
+            "restored_from_version_id": str(version.id),
+            "restored_from_version_number": version.version_number,
+            "restored_version_snapshot_id": str(restored_snapshot.id) if restored_snapshot is not None else None,
+            "source": "api.notes.restore_note_version",
+        },
+        context=build_note_audit_context(request, "api.notes.restore_note_version"),
     )
     await db.commit()
     await db.refresh(note)
@@ -1287,6 +1562,7 @@ async def update_note(
     note_id: str,
     updates: NoteUpdate,
     background_tasks: BackgroundTasks,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1301,37 +1577,43 @@ async def update_note(
     Returns:
         Updated note
     """
-    note = await load_note_or_404(UUID(note_id), db)
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
     await ensure_note_permission(note, current_user, db, "update")
     # Update fields
     semantic_fields_updated = False
     note_changed = False
+    changed_fields: List[str] = []
     if updates.title is not None:
         if updates.title != note.title:
             note.title = updates.title
             semantic_fields_updated = True
             note_changed = True
+            changed_fields.append("title")
     if updates.content is not None:
         if updates.content != note.content:
             note.content = updates.content
             note.word_count = calculate_word_count(updates.content)
             semantic_fields_updated = True
             note_changed = True
+            changed_fields.append("content")
     if updates.tags is not None:
         normalized_tags = list(updates.tags or [])
         if normalized_tags != list(note.tags or []):
             note.tags = normalized_tags
             semantic_fields_updated = True
             note_changed = True
+            changed_fields.append("tags")
     if updates.connections is not None:
         normalized_connections = [str(connection_id) for connection_id in (updates.connections or [])]
         if normalized_connections != [str(connection_id) for connection_id in (note.connections or [])]:
             note.connections = normalized_connections
             note_changed = True
+            changed_fields.append("connections")
     if updates.note_type is not None:
         if updates.note_type != note.note_type:
             note.note_type = updates.note_type
             note_changed = True
+            changed_fields.append("note_type")
 
     if not note_changed:
         return serialize_note(note)
@@ -1346,12 +1628,19 @@ async def update_note(
         change_reason="updated",
         extra_metadata={"trigger": "update_note"},
     )
-    await safe_log_note_audit(
+    await audit.note_updated(
         db,
-        current_user_id=current_user.id,
+        actor_user_id=current_user.id,
         workspace_id=note.workspace_id,
         note_id=note.id,
-        action=AuditAction.NOTE_UPDATED,
+        metadata={
+            "changed_fields": changed_fields,
+            "semantic_fields_updated": semantic_fields_updated,
+            "version_id": str(created_version.id) if created_version is not None else None,
+            "word_count": note.word_count or 0,
+            "source": "api.notes.update_note",
+        },
+        context=build_note_audit_context(request, "api.notes.update_note"),
     )
     await db.commit()
     await db.refresh(note)
@@ -1373,13 +1662,20 @@ async def sync_note_collaboration(
     note_id: str,
     updates: NoteCollaborationSync,
     background_tasks: BackgroundTasks,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Persist collaborative content without creating version or task storms."""
-    note = await load_note_or_404(UUID(note_id), db)
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
 
     await ensure_note_permission(note, current_user, db, "update")
+
+    if updates.base_content is not None and updates.base_content != note.content:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Collaborative note content changed since this client last synced",
+        )
 
     if updates.content == note.content:
         return serialize_note(note)
@@ -1389,6 +1685,18 @@ async def sync_note_collaboration(
     note.updated_at = datetime.now(timezone.utc)
 
     await db.flush()
+    await audit.note_collaboration_synced(
+        db,
+        actor_user_id=current_user.id,
+        workspace_id=note.workspace_id,
+        note_id=note.id,
+        metadata={
+            "content_length": len(note.content or ""),
+            "word_count": note.word_count or 0,
+            "source": "api.notes.sync_note_collaboration",
+        },
+        context=build_note_audit_context(request, "api.notes.sync_note_collaboration"),
+    )
     await db.commit()
     await db.refresh(note)
 
@@ -1400,6 +1708,7 @@ async def sync_note_collaboration(
 @router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(
     note_id: str,
+    request: Request,
     current_user: DBUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1410,16 +1719,20 @@ async def delete_note(
         current_user: Current user
         db: Database session
     """
-    note = await load_note_or_404(UUID(note_id), db)
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
     await ensure_note_permission(note, current_user, db, "delete")
-    # Log action before deletion
-    await log_audit_event(
-        user_id=current_user.id,
+    await audit.note_deleted(
+        db,
+        actor_user_id=current_user.id,
         workspace_id=note.workspace_id,
-        action=AuditAction.NOTE_DELETED,
-        entity_type=EntityType.NOTE,
-        entity_id=note.id,
-        db=db
+        note_id=note.id,
+        metadata={
+            "title": note.title,
+            "note_type": note.note_type,
+            "word_count": note.word_count or 0,
+            "source": "api.notes.delete_note",
+        },
+        context=build_note_audit_context(request, "api.notes.delete_note"),
     )
     
     workspace_id = note.workspace_id
@@ -1439,7 +1752,7 @@ async def list_connection_suggestions(
 ):
     """List persisted connection suggestions for a note."""
     try:
-        note_uuid = UUID(note_id)
+        note_uuid = parse_uuid_or_422(note_id, "note_id")
     except (TypeError, ValueError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note ID format")
     note_result = await db.execute(select(Note).where(Note.id == note_uuid))
@@ -1472,8 +1785,8 @@ async def confirm_connection_suggestion(
 ):
     """Confirm a suggested connection and persist the user signal."""
     try:
-        note_uuid = UUID(note_id)
-        suggestion_uuid = UUID(suggestion_id)
+        note_uuid = parse_uuid_or_422(note_id, "note_id")
+        suggestion_uuid = parse_uuid_or_422(suggestion_id, "suggestion_id")
     except (TypeError, ValueError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note or suggestion ID format")
 
@@ -1551,8 +1864,8 @@ async def dismiss_connection_suggestion(
 ):
     """Dismiss a suggested connection and preserve that user signal."""
     try:
-        note_uuid = UUID(note_id)
-        suggestion_uuid = UUID(suggestion_id)
+        note_uuid = parse_uuid_or_422(note_id, "note_id")
+        suggestion_uuid = parse_uuid_or_422(suggestion_id, "suggestion_id")
     except (TypeError, ValueError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid note or suggestion ID format")
 

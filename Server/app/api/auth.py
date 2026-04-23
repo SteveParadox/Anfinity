@@ -20,7 +20,7 @@ from app.core.security import (
     validate_password_strength,
 )
 from app.core.auth import get_current_user, get_current_active_user
-from app.core.audit import log_audit_event, AuditAction, EntityType
+from app.core.audit import AuditAction, AuditRequestContext, EntityType, audit, log_audit_event
 from app.ingestion.vector_index import vector_index
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -464,6 +464,7 @@ class InviteMemberRequest(BaseModel):
 async def invite_member(
     workspace_id: UUID,
     invite_data: InviteMemberRequest,
+    request: Request,
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -535,6 +536,18 @@ async def invite_member(
         )
         db.add(member)
         await db.flush()
+        await audit.member_invited(
+            db,
+            actor_user_id=current_user.id,
+            workspace_id=workspace_id,
+            target_user_id=existing_user.id,
+            metadata={
+                "invited_email": invite_data.email,
+                "role": role.value,
+                "source": "api.auth.invite_member",
+            },
+            context=AuditRequestContext.from_request(request, source="api.auth.invite_member"),
+        )
         
         return {
             "message": f"User invited to workspace",

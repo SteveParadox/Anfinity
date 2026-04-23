@@ -7,10 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.audit import AuditAction, EntityType, get_audit_logs, get_recent_activity
+from app.core.audit import AuditAction, EntityType, count_audit_logs, get_audit_logs, get_recent_activity
 from app.core.auth import get_current_active_user, get_workspace_context
 from app.database.models import User as DBUser
 from app.database.session import get_db
+from app.services.note_contributions import refresh_note_contributions_materialized_view
 
 router = APIRouter(prefix="/audit", tags=["Audit Logs"])
 
@@ -21,14 +22,25 @@ class AuditLogResponse(BaseModel):
     entity_type: Optional[str]
     entity_id: Optional[str]
     user_id: Optional[str]
+    workspace_id: Optional[str] = None
+    note_id: Optional[str] = None
+    target_user_id: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
     ip_address: Optional[str]
+    request_id: Optional[str] = None
+    session_id: Optional[str] = None
+    source: Optional[str] = None
     created_at: str
 
 
 class AuditLogListResponse(BaseModel):
     items: List[AuditLogResponse]
     total: int
+
+
+class NoteContributionsRefreshResponse(BaseModel):
+    refreshed: bool
+    forced: bool = True
 
 
 def _parse_action(value: Optional[str]) -> Optional[AuditAction]:
@@ -49,6 +61,11 @@ def _parse_entity_type(value: Optional[str]) -> Optional[EntityType]:
         raise HTTPException(status_code=400, detail=f"Invalid entity_type: {value}") from exc
 
 
+def _require_superuser(user: DBUser) -> None:
+    if not bool(getattr(user, "is_superuser", False)):
+        raise HTTPException(status_code=403, detail="Superuser access required")
+
+
 @router.get("/workspace/{workspace_id}", response_model=AuditLogListResponse)
 async def get_workspace_audit_logs(
     workspace_id: UUID,
@@ -62,41 +79,47 @@ async def get_workspace_audit_logs(
     db: AsyncSession = Depends(get_db),
 ):
     await get_workspace_context(workspace_id, current_user, db)
+    parsed_action = _parse_action(action)
+    parsed_entity_type = _parse_entity_type(entity_type)
     logs = await get_audit_logs(
         db=db,
         workspace_id=workspace_id,
-        action=_parse_action(action),
-        entity_type=_parse_entity_type(entity_type),
+        action=parsed_action,
+        entity_type=parsed_entity_type,
         start_date=start_date,
         end_date=end_date,
         limit=limit,
         offset=offset,
     )
-    total_logs = await get_audit_logs(
+    total_logs = await count_audit_logs(
         db=db,
         workspace_id=workspace_id,
-        action=_parse_action(action),
-        entity_type=_parse_entity_type(entity_type),
+        action=parsed_action,
+        entity_type=parsed_entity_type,
         start_date=start_date,
         end_date=end_date,
-        limit=10000,
-        offset=0,
     )
     return AuditLogListResponse(
         items=[
             AuditLogResponse(
                 id=str(log.id),
-                action=log.action,
+                action=log.action_type,
                 entity_type=log.entity_type,
                 entity_id=str(log.entity_id) if log.entity_id else None,
-                user_id=str(log.user_id) if log.user_id else None,
-                metadata=log.metadata or {},
+                user_id=str(log.actor_user_id) if log.actor_user_id else None,
+                workspace_id=str(log.workspace_id) if log.workspace_id else None,
+                note_id=str(log.note_id) if log.note_id else None,
+                target_user_id=str(log.target_user_id) if log.target_user_id else None,
+                metadata=log.metadata_json or {},
                 ip_address=log.ip_address,
+                request_id=log.request_id,
+                session_id=log.session_id,
+                source=log.source,
                 created_at=log.created_at.isoformat(),
             )
             for log in logs
         ],
-        total=len(total_logs),
+        total=total_logs,
     )
 
 
@@ -113,12 +136,18 @@ async def get_recent_workspace_activity(
         items=[
             AuditLogResponse(
                 id=str(log.id),
-                action=log.action,
+                action=log.action_type,
                 entity_type=log.entity_type,
                 entity_id=str(log.entity_id) if log.entity_id else None,
-                user_id=str(log.user_id) if log.user_id else None,
-                metadata=log.metadata or {},
+                user_id=str(log.actor_user_id) if log.actor_user_id else None,
+                workspace_id=str(log.workspace_id) if log.workspace_id else None,
+                note_id=str(log.note_id) if log.note_id else None,
+                target_user_id=str(log.target_user_id) if log.target_user_id else None,
+                metadata=log.metadata_json or {},
                 ip_address=log.ip_address,
+                request_id=log.request_id,
+                session_id=log.session_id,
+                source=log.source,
                 created_at=log.created_at.isoformat(),
             )
             for log in logs
@@ -133,3 +162,14 @@ async def get_audit_actions(current_user: DBUser = Depends(get_current_active_us
         "actions": [action.value for action in AuditAction],
         "entity_types": [entity.value for entity in EntityType],
     }
+
+
+@router.post("/internal/note-contributions/refresh", response_model=NoteContributionsRefreshResponse)
+async def refresh_note_contributions_endpoint(
+    current_user: DBUser = Depends(get_current_active_user),
+):
+    """Force-refresh the note contribution materialized view for rollout or repair."""
+
+    _require_superuser(current_user)
+    refreshed = await refresh_note_contributions_materialized_view(force=True)
+    return NoteContributionsRefreshResponse(refreshed=refreshed)

@@ -1,6 +1,7 @@
 """Workspace API routes."""
 from __future__ import annotations
 import logging
+import re
 from typing import Dict, List, Optional
 from uuid import UUID
 
@@ -25,11 +26,32 @@ from app.core.permissions import (
     get_workspace_permissions_for_user,
     require_permission,
 )
-from app.core.audit import log_audit_event, AuditAction, EntityType, AuditLogger
+from app.core.audit import AuditAction, AuditLogger, AuditRequestContext, EntityType, audit
 from app.ingestion.vector_index import vector_index
 
 router = APIRouter(prefix="/workspaces", tags=["Workspaces"])
 logger = logging.getLogger(__name__)
+
+
+def _slugify_workspace_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-")
+    return slug or "workspace"
+
+
+async def _generate_unique_workspace_slug(db: AsyncSession, name: str, *, exclude_workspace_id: Optional[UUID] = None) -> str:
+    base_slug = _slugify_workspace_name(name)
+    candidate = base_slug
+    suffix = 2
+
+    while True:
+        query = select(Workspace.id).where(Workspace.slug == candidate)
+        if exclude_workspace_id is not None:
+            query = query.where(Workspace.id != exclude_workspace_id)
+        existing = (await db.execute(query)).scalar_one_or_none()
+        if existing is None:
+            return candidate
+        candidate = f"{base_slug}-{suffix}"
+        suffix += 1
 
 
 def _initialize_workspace_vector_collection(workspace_id: str) -> None:
@@ -86,6 +108,7 @@ class WorkspaceResponse(BaseModel):
     """Workspace response."""
     id: str
     name: str
+    slug: Optional[str] = None
     description: Optional[str]
     owner_id: str
     role: str
@@ -163,6 +186,7 @@ async def create_workspace(
     # Create workspace
     workspace = Workspace(
         name=workspace_data.name,
+        slug=await _generate_unique_workspace_slug(db, workspace_data.name),
         description=workspace_data.description,
         owner_id=current_user.id,
         settings={}
@@ -186,18 +210,22 @@ async def create_workspace(
     background_tasks.add_task(_initialize_workspace_vector_collection, str(workspace.id))
     
     # Log audit event
-    logger = AuditLogger(db, current_user.id).with_request(request)
+    logger = AuditLogger(db, current_user.id).with_request(request, source="api.workspaces.create_workspace")
     await logger.log(
         action=AuditAction.WORKSPACE_CREATED,
         workspace_id=workspace.id,
         entity_type=EntityType.WORKSPACE,
         entity_id=workspace.id,
-        metadata={"name": workspace.name}
+        metadata={
+            "name": workspace.name,
+            "owner_user_id": str(current_user.id),
+        }
     )
     
     return WorkspaceResponse(
         id=str(workspace.id),
         name=workspace.name,
+        slug=workspace.slug,
         description=workspace.description,
         owner_id=str(workspace.owner_id),
         role=WorkspaceRole.OWNER.value,
@@ -256,6 +284,7 @@ async def list_workspaces(
         workspaces.append(WorkspaceResponse(
             id=str(workspace.id),
             name=workspace.name,
+            slug=workspace.slug,
             description=workspace.description,
             owner_id=str(workspace.owner_id),
             role=role.value if isinstance(role, WorkspaceRole) else str(role),
@@ -360,6 +389,7 @@ async def get_workspace(
     return WorkspaceResponse(
         id=str(workspace.id),
         name=workspace.name,
+        slug=workspace.slug,
         description=workspace.description,
         owner_id=str(workspace.owner_id),
         role=role.value if isinstance(role, WorkspaceRole) else str(role),
@@ -465,6 +495,12 @@ async def update_workspace(
     # Update fields
     if workspace_data.name is not None:
         workspace.name = workspace_data.name
+        if not workspace.slug:
+            workspace.slug = await _generate_unique_workspace_slug(
+                db,
+                workspace_data.name,
+                exclude_workspace_id=workspace_id,
+            )
     if workspace_data.description is not None:
         workspace.description = workspace_data.description
     
@@ -472,7 +508,7 @@ async def update_workspace(
     await db.refresh(workspace)
     
     # Log audit event
-    logger = AuditLogger(db, context.user.id).with_request(request)
+    logger = AuditLogger(db, context.user.id).with_request(request, source="api.workspaces.update_workspace")
     await logger.log(
         action=AuditAction.WORKSPACE_UPDATED,
         workspace_id=workspace_id,
@@ -494,6 +530,7 @@ async def update_workspace(
     return WorkspaceResponse(
         id=str(workspace.id),
         name=workspace.name,
+        slug=workspace.slug,
         description=workspace.description,
         owner_id=str(workspace.owner_id),
         role=context.role.value if isinstance(context.role, WorkspaceRole) else str(context.role),
@@ -559,11 +596,11 @@ async def upsert_workspace_permission_override(
     await db.flush()
     await db.refresh(override)
 
-    logger = AuditLogger(db, context.user.id).with_request(request)
+    logger = AuditLogger(db, context.user.id).with_request(request, source="api.workspaces.upsert_workspace_permission_override")
     await logger.log(
-        action=AuditAction.WORKSPACE_UPDATED,
+        action=AuditAction.WORKSPACE_PERMISSION_OVERRIDE_UPDATED,
         workspace_id=workspace_id,
-        entity_type=EntityType.USER,
+        entity_type=EntityType.WORKSPACE_PERMISSION,
         entity_id=user_id,
         metadata={
             "permission_override_section": override_data.section.value,
@@ -656,17 +693,17 @@ async def invite_member(
     db.add(member)
     await db.flush()
     
-    # Log audit event
-    logger = AuditLogger(db, context.user.id).with_request(request)
-    await logger.log(
-        action=AuditAction.MEMBER_INVITED,
+    await audit.member_invited(
+        db,
+        actor_user_id=context.user.id,
         workspace_id=workspace_id,
-        entity_type=EntityType.USER,
-        entity_id=user.id,
+        target_user_id=user.id,
         metadata={
             "invited_email": invite_data.email,
-            "role": invite_data.role.value
-        }
+            "role": invite_data.role.value,
+            "source": "api.workspaces.invite_member",
+        },
+        context=AuditRequestContext.from_request(request, source="api.workspaces.invite_member"),
     )
     
     return WorkspaceInviteResponse(
@@ -769,13 +806,13 @@ async def remove_member(
     await db.delete(member)
     await db.flush()
     
-    # Log audit event
-    logger = AuditLogger(db, context.user.id).with_request(request)
-    await logger.log(
-        action=AuditAction.MEMBER_REMOVED,
+    await audit.member_removed(
+        db,
+        actor_user_id=context.user.id,
         workspace_id=workspace_id,
-        entity_type=EntityType.USER,
-        entity_id=user_id
+        target_user_id=user_id,
+        metadata={"source": "api.workspaces.remove_member"},
+        context=AuditRequestContext.from_request(request, source="api.workspaces.remove_member"),
     )
     
     return {"message": "Member removed successfully"}
@@ -818,12 +855,10 @@ async def delete_workspace(
     except Exception:
         logger.warning("Workspace %s deleted but vector collection cleanup failed", workspace_id, exc_info=True)
     
-    # Audit with workspace_id=None so the audit row survives workspace deletion
-    # without depending on a soon-to-be-removed foreign key target.
-    logger = AuditLogger(db, context.user.id).with_request(request)
+    logger = AuditLogger(db, context.user.id).with_request(request, source="api.workspaces.delete_workspace")
     await logger.log(
         action=AuditAction.WORKSPACE_DELETED,
-        workspace_id=None,
+        workspace_id=workspace_id,
         entity_type=EntityType.WORKSPACE,
         entity_id=workspace_id,
         metadata={
