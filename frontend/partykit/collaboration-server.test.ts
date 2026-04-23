@@ -3,6 +3,8 @@ import type * as Party from "partykit/server";
 import { COLLABORATION_TYPING_TIMEOUT_MS } from "../src/lib/collaboration/constants";
 import NoteCollaborationServer from "./collaboration-server";
 
+const NOTE_ID = "11111111-1111-4111-8111-111111111111";
+
 const { onConnectMock } = vi.hoisted(() => ({
   onConnectMock: vi.fn(async () => {}),
 }));
@@ -32,7 +34,7 @@ class FakeConnection {
 
 function createRoom(): Party.Room {
   return {
-    id: "note-123",
+    id: `note:${NOTE_ID}`,
     env: {
       PARTYKIT_BACKEND_URL: "http://backend.test",
     },
@@ -77,7 +79,7 @@ describe("NoteCollaborationServer", () => {
   it("authorizes and decorates the request in onBeforeConnect", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        note_id: "note-123",
+        note_id: NOTE_ID,
         access_source: "workspace",
         can_view: true,
         can_update: true,
@@ -93,7 +95,7 @@ describe("NoteCollaborationServer", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const request = {
-      url: "https://collab.example.com/parties/main/note-123?token=test-token",
+      url: `https://collab.example.com/parties/main/note:${NOTE_ID}?token=test-token`,
       headers: new Headers(),
     } as unknown as Party.Request;
 
@@ -112,7 +114,7 @@ describe("NoteCollaborationServer", () => {
   it("rejects onBeforeConnect when note access cannot view the room", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        note_id: "note-123",
+        note_id: NOTE_ID,
         access_source: "none",
         can_view: false,
         can_update: false,
@@ -127,7 +129,7 @@ describe("NoteCollaborationServer", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const request = {
-      url: "https://collab.example.com/parties/main/note-123?token=test-token",
+      url: `https://collab.example.com/parties/main/note:${NOTE_ID}?token=test-token`,
       headers: new Headers(),
     } as unknown as Party.Request;
 
@@ -139,6 +141,26 @@ describe("NoteCollaborationServer", () => {
 
     expect(result).toBeInstanceOf(Response);
     expect((result as Response).status).toBe(401);
+  });
+
+  it("rejects malformed note room identifiers before backend access checks", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = {
+      url: "https://collab.example.com/parties/main/note:not-a-uuid?token=test-token",
+      headers: new Headers(),
+    } as unknown as Party.Request;
+
+    const result = await NoteCollaborationServer.onBeforeConnect(request, {
+      env: {
+        PARTYKIT_BACKEND_URL: "http://backend.test",
+      },
+    } as unknown as Party.Lobby);
+
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response).status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("sends a server error for malformed collaboration messages", async () => {
@@ -157,6 +179,33 @@ describe("NoteCollaborationServer", () => {
         code: "invalid_message",
       },
     });
+  });
+
+  it("rejects invalid selection ranges without broadcasting them", async () => {
+    const room = createRoom();
+    const server = new NoteCollaborationServer(room);
+    const connection = new FakeConnection("conn-1");
+
+    await server.onConnect(connection as unknown as Party.Connection, createContextForUser("user-1"));
+    connection.sent.length = 0;
+    vi.mocked(room.broadcast).mockClear();
+
+    await server.onMessage(JSON.stringify({
+      type: "selection_change",
+      payload: {
+        from: 10,
+        to: 2,
+        empty: false,
+      },
+    }), connection as unknown as Party.Connection);
+
+    expect(parseSentMessage(connection)).toMatchObject({
+      type: "server_error",
+      payload: {
+        code: "invalid_message",
+      },
+    });
+    expect(room.broadcast).not.toHaveBeenCalled();
   });
 
   it("clears presence only when the last connection for a user closes", async () => {
@@ -262,5 +311,24 @@ describe("NoteCollaborationServer", () => {
       expect.stringContaining('"type":"presence_leave"'),
       [],
     );
+  });
+
+  it("does not broadcast typing start from read-only connections", async () => {
+    const room = createRoom();
+    const server = new NoteCollaborationServer(room);
+    const connection = new FakeConnection("conn-1");
+
+    await server.onConnect(connection as unknown as Party.Connection, createContextForUser("user-1", false));
+    vi.mocked(room.broadcast).mockClear();
+
+    await server.onMessage(
+      JSON.stringify({
+        type: "typing_indicator",
+        payload: { isTyping: true },
+      }),
+      connection as unknown as Party.Connection,
+    );
+
+    expect(room.broadcast).not.toHaveBeenCalled();
   });
 });

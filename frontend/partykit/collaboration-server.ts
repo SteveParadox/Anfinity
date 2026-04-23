@@ -4,6 +4,7 @@ import {
   COLLABORATION_AUTH_TIMEOUT_MS,
   COLLABORATION_TYPING_TIMEOUT_MS,
   DEFAULT_PARTYKIT_BACKEND_URL,
+  NOTE_ROOM_PREFIX,
 } from "../src/lib/collaboration/constants";
 import { getCollaboratorColor } from "../src/lib/collaboration/colors";
 import { createYDocFromPlainText } from "../src/lib/collaboration/content";
@@ -22,6 +23,9 @@ const HEADER_USER_COLOR = "x-collab-user-color";
 const HEADER_CAN_UPDATE = "x-collab-can-update";
 const HEADER_CONNECTED_AT = "x-collab-connected-at";
 const HEADER_AUTH_TOKEN = "x-collab-auth-token";
+const MAX_COLLABORATION_MESSAGE_BYTES = 16_384;
+const MAX_DOCUMENT_POSITION = 1_000_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type BackendNoteResponse = {
   id: string;
@@ -69,6 +73,16 @@ function getRoomIdFromRequest(requestUrl: string): string | null {
   }
 }
 
+function getNoteIdFromRoomId(roomId: string): string {
+  return roomId.startsWith(NOTE_ROOM_PREFIX)
+    ? roomId.slice(NOTE_ROOM_PREFIX.length).trim()
+    : roomId.trim();
+}
+
+function isValidEntityId(value: string): boolean {
+  return UUID_PATTERN.test(value);
+}
+
 function getBearerToken(requestUrl: string): string {
   const url = new URL(requestUrl);
   return url.searchParams.get("token")?.trim() ?? "";
@@ -85,11 +99,20 @@ function isNullableNumber(value: unknown): value is number | null {
 function isNonNegativeIntegerOrNull(value: unknown): value is number | null {
   return (
     value === null
-    || (typeof value === "number" && Number.isInteger(value) && value >= 0)
+    || (
+      typeof value === "number"
+      && Number.isInteger(value)
+      && value >= 0
+      && value <= MAX_DOCUMENT_POSITION
+    )
   );
 }
 
 function parseClientMessage(rawMessage: string): CollaborationClientMessage | null {
+  if (rawMessage.length > MAX_COLLABORATION_MESSAGE_BYTES) {
+    return null;
+  }
+
   try {
     const parsed = JSON.parse(rawMessage) as unknown;
 
@@ -129,6 +152,14 @@ function parseClientMessage(rawMessage: string): CollaborationClientMessage | nu
         !isNonNegativeIntegerOrNull(payload.from)
         || !isNonNegativeIntegerOrNull(payload.to)
         || typeof payload.empty !== "boolean"
+      ) {
+        return null;
+      }
+
+      if (
+        payload.from !== null
+        && payload.to !== null
+        && payload.from > payload.to
       ) {
         return null;
       }
@@ -254,7 +285,7 @@ function toIdentity(state: ConnectionPresenceState): CollaboratorIdentity {
  * Binary Yjs sync is delegated to y-partykit, while string messages implement
  * note-specific presence, cursor, selection, and typing signals.
  */
-export default class NoteCollaborationServer implements Party.Server {
+export class NoteCollaborationServer implements Party.Server {
   private readonly connections = new Map<string, ConnectionPresenceState>();
   private readonly userConnections = new Map<string, Set<string>>();
   private readonly typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -271,22 +302,23 @@ export default class NoteCollaborationServer implements Party.Server {
     lobby: Party.Lobby,
   ): Promise<Party.Request | Response> {
     const token = getBearerToken(request.url);
-    const noteId = getRoomIdFromRequest(request.url);
+    const roomId = getRoomIdFromRequest(request.url);
+    const noteId = roomId ? getNoteIdFromRoomId(roomId) : null;
 
     if (!token) {
-      console.error("[Collab] No token provided in connection request");
       return new Response("Unauthorized: Missing token", { status: 401 });
     }
 
     if (!noteId) {
-      console.error("[Collab] No noteId in connection request");
       return new Response("Unauthorized: Missing noteId", { status: 401 });
+    }
+
+    if (!isValidEntityId(noteId)) {
+      return new Response("Unauthorized: Invalid note room id", { status: 401 });
     }
 
     try {
       const backendUrl = getBackendUrl(lobby.env);
-      console.log(`[Collab] Authenticating connection for note ${noteId} against ${backendUrl}`);
-
       const presence = await resolveConnectionContext(backendUrl, token, noteId);
 
       request.headers.set(HEADER_USER_ID, presence.userId);
@@ -297,11 +329,9 @@ export default class NoteCollaborationServer implements Party.Server {
       request.headers.set(HEADER_CONNECTED_AT, presence.connectedAt);
       request.headers.set(HEADER_AUTH_TOKEN, token);
 
-      console.log(`[Collab] Authentication successful for user ${presence.userId}`);
       return request;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error(`[Collab] Authentication failed: ${errorMsg}`);
       return new Response(`Unauthorized: ${errorMsg}`, { status: 401 });
     }
   }
@@ -313,9 +343,6 @@ export default class NoteCollaborationServer implements Party.Server {
     const presence = this.readPresenceFromHeaders(connection, ctx.request.headers);
     const token = ctx.request.headers.get(HEADER_AUTH_TOKEN)?.trim() || "";
 
-    console.log(
-      `[Collab] User ${presence.userId} connected to note ${this.room.id}`,
-    );
     const isFirstConnectionForUser = this.registerConnection(connection, presence);
 
     await onConnect(connection, this.room, {
@@ -392,18 +419,10 @@ export default class NoteCollaborationServer implements Party.Server {
   }
 
   async onClose(connection: Party.Connection): Promise<void> {
-    const presence = this.connections.get(connection.id);
-    if (presence) {
-      console.log(`[Collab] User ${presence.userId} disconnected from note ${this.room.id}`);
-    }
     this.unregisterConnection(connection);
   }
 
   async onError(connection: Party.Connection): Promise<void> {
-    const presence = this.connections.get(connection.id);
-    if (presence) {
-      console.error(`[Collab] Error for user ${presence.userId} on note ${this.room.id}`);
-    }
     this.unregisterConnection(connection);
   }
 
@@ -429,7 +448,7 @@ export default class NoteCollaborationServer implements Party.Server {
 
     try {
       const note = await fetchJson<BackendNoteResponse>(
-        `${getBackendUrl(this.room.env)}/notes/${this.room.id}`,
+        `${getBackendUrl(this.room.env)}/notes/${getNoteIdFromRoomId(this.room.id)}`,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -631,3 +650,5 @@ export default class NoteCollaborationServer implements Party.Server {
     });
   }
 }
+
+export default NoteCollaborationServer;
