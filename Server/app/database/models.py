@@ -84,6 +84,49 @@ class NoteInviteStatus(str, PyEnum):
     EXPIRED = "expired"
 
 
+class ApprovalWorkflowStatus(str, PyEnum):
+    """Strict approval workflow lifecycle for workspace-backed notes."""
+
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    NEEDS_CHANGES = "needs_changes"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+class ApprovalWorkflowPriority(str, PyEnum):
+    """Priority levels for approval workflow items."""
+
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class UserNotificationType(str, PyEnum):
+    """Durable in-app notification types."""
+
+    AUTOMATION = "automation"
+    COMMENT_MENTION = "comment_mention"
+    COMMENT_REPLY = "comment_reply"
+    APPROVAL_SUBMITTED = "approval_submitted"
+    APPROVAL_APPROVED = "approval_approved"
+    APPROVAL_REJECTED = "approval_rejected"
+    APPROVAL_NEEDS_CHANGES = "approval_needs_changes"
+
+
+class NoteCommentReactionType(str, PyEnum):
+    """Allowed reaction types for note comments."""
+
+    THUMBS_UP = "thumbs_up"
+    HEART = "heart"
+    LAUGH = "laugh"
+    HOORAY = "hooray"
+    EYES = "eyes"
+    ROCKET = "rocket"
+
+
 class ThinkingSessionPhase(str, PyEnum):
     """Live Thinking Session state machine phases."""
 
@@ -150,6 +193,7 @@ class Workspace(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
+    slug = Column(String(255), nullable=True, unique=True, index=True)
     description = Column(Text, nullable=True)
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     
@@ -165,6 +209,7 @@ class Workspace(Base):
     members = relationship("WorkspaceMember", back_populates="workspace")
     documents = relationship("Document", back_populates="workspace")
     notes = relationship("Note", back_populates="workspace")
+    automations = relationship("Automation", back_populates="workspace", cascade="all, delete-orphan")
     thinking_sessions = relationship("ThinkingSession", back_populates="workspace", cascade="all, delete-orphan")
 
 
@@ -193,7 +238,11 @@ class User(Base):
     owned_workspaces = relationship("Workspace", back_populates="owner")
     workspace_memberships = relationship("WorkspaceMember", back_populates="user")
     connectors = relationship("Connector", back_populates="user")
-    owned_notes = relationship("Note", back_populates="owner")
+    owned_notes = relationship(
+        "Note",
+        foreign_keys="Note.user_id",
+        back_populates="owner",
+    )
     note_collaborations = relationship(
         "NoteCollaborator",
         foreign_keys="NoteCollaborator.user_id",
@@ -213,6 +262,51 @@ class User(Base):
         "NoteInvite",
         foreign_keys="NoteInvite.invitee_user_id",
         back_populates="invitee_user",
+    )
+    authored_note_comments = relationship(
+        "NoteComment",
+        foreign_keys="NoteComment.author_user_id",
+        back_populates="author",
+    )
+    submitted_note_approvals = relationship(
+        "Note",
+        foreign_keys="Note.approval_submitted_by_user_id",
+        back_populates="approval_submitted_by",
+    )
+    decided_note_approvals = relationship(
+        "Note",
+        foreign_keys="Note.approval_decided_by_user_id",
+        back_populates="approval_decided_by",
+    )
+    note_approval_transitions = relationship(
+        "NoteApprovalTransition",
+        foreign_keys="NoteApprovalTransition.actor_user_id",
+        back_populates="actor",
+    )
+    resolved_note_comments = relationship(
+        "NoteComment",
+        foreign_keys="NoteComment.resolved_by_user_id",
+        back_populates="resolved_by",
+    )
+    comment_mentions = relationship(
+        "NoteCommentMention",
+        foreign_keys="NoteCommentMention.mentioned_user_id",
+        back_populates="mentioned_user",
+    )
+    comment_reactions = relationship(
+        "NoteCommentReaction",
+        foreign_keys="NoteCommentReaction.user_id",
+        back_populates="user",
+    )
+    notifications = relationship(
+        "UserNotification",
+        foreign_keys="UserNotification.user_id",
+        back_populates="user",
+    )
+    triggered_notifications = relationship(
+        "UserNotification",
+        foreign_keys="UserNotification.actor_user_id",
+        back_populates="actor",
     )
 
 
@@ -411,13 +505,21 @@ class Connector(Base):
     access_token = Column(Text, nullable=True)
     refresh_token = Column(Text, nullable=True)
     token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    scopes = Column(JSONB, default=list)
+    external_account_id = Column(String(255), nullable=True, index=True)
+    external_account_metadata = Column(JSONB, default=dict)
     
     # Configuration
     config = Column(JSONB, default=dict)  # Channel IDs, folders, etc.
     
     # Status
     is_active = Column(Integer, default=1)
+    sync_status = Column(String(50), nullable=False, default="idle", index=True)
     last_sync_at = Column(DateTime(timezone=True), nullable=True)
+    last_sync_started_at = Column(DateTime(timezone=True), nullable=True)
+    last_sync_completed_at = Column(DateTime(timezone=True), nullable=True)
+    last_sync_error = Column(Text, nullable=True)
+    sync_cursor = Column(JSONB, default=dict)
     
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -425,9 +527,53 @@ class Connector(Base):
     
     # Relationships
     user = relationship("User", back_populates="connectors")
+    workspace = relationship("Workspace")
+    sync_items = relationship("IntegrationSyncItem", back_populates="connector", cascade="all, delete-orphan")
     
     __table_args__ = (
         UniqueConstraint('workspace_id', 'connector_type', name='unique_workspace_connector'),
+    )
+
+
+class IntegrationSyncItem(Base):
+    """Provider external item mapped to local app state for idempotent syncs."""
+
+    __tablename__ = "integration_sync_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    connector_id = Column(UUID(as_uuid=True), ForeignKey("connectors.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String(50), nullable=False, index=True)
+
+    external_type = Column(String(50), nullable=False, index=True)  # page, gmail_message, calendar_event
+    external_id = Column(String(512), nullable=False)
+    external_updated_at = Column(DateTime(timezone=True), nullable=True)
+
+    local_note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="SET NULL"), nullable=True, index=True)
+    local_document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    source_hash = Column(String(64), nullable=True, index=True)
+    sync_direction = Column(String(20), nullable=False, default="pull")  # pull, push, linked
+    sync_status = Column(String(50), nullable=False, default="synced", index=True)
+    last_error = Column(Text, nullable=True)
+    item_metadata = Column("metadata", JSONB, default=dict)
+
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    last_synced_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    connector = relationship("Connector", back_populates="sync_items")
+    workspace = relationship("Workspace")
+    local_note = relationship("Note", foreign_keys=[local_note_id])
+    local_document = relationship("Document", foreign_keys=[local_document_id])
+
+    __table_args__ = (
+        UniqueConstraint("connector_id", "external_type", "external_id", name="uq_integration_sync_item_external"),
+        Index("idx_integration_sync_items_provider_seen", "provider", "last_seen_at"),
+        Index("idx_integration_sync_items_workspace_provider", "workspace_id", "provider", "external_type"),
+        Index("idx_integration_sync_items_note_provider", "local_note_id", "provider"),
     )
 
 
@@ -526,38 +672,63 @@ class Feedback(Base):
     )
 
 
-class AuditLog(Base):
-    """Comprehensive audit log for compliance."""
-    __tablename__ = "audit_logs"
-    
+class AuditEvent(Base):
+    """Immutable audit events written to the append-only audit_log table."""
+
+    __tablename__ = "audit_log"
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    
-    # Who
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
-    
-    # Where
-    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=True, index=True)
-    
-    # What
-    action = Column(String(50), nullable=False, index=True)
-    entity_type = Column(String(50), nullable=True, index=True)
-    entity_id = Column(UUID(as_uuid=True), nullable=True, index=True)
-    
-    # Context
-    audit_metadata = Column(JSONB, default=dict)
-    
-    # Client info
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    actor_user_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    workspace_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    note_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    target_user_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+
+    action_type = Column(String(100), nullable=False, index=True)
+    entity_type = Column(String(50), nullable=False, index=True)
+    entity_id = Column(String(255), nullable=True, index=True)
+
+    metadata_json = Column(JSONB, nullable=False, default=dict)
+    request_id = Column(String(255), nullable=True, index=True)
+    session_id = Column(String(255), nullable=True, index=True)
+    source = Column(String(100), nullable=True, index=True)
     ip_address = Column(String(45), nullable=True)
     user_agent = Column(String(500), nullable=True)
-    
-    # Timestamps
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
-    
-    # Indexes
+
     __table_args__ = (
-        Index('idx_audit_workspace_action', 'workspace_id', 'action', 'created_at'),
-        Index('idx_audit_user_action', 'user_id', 'action', 'created_at'),
-        Index('idx_audit_entity', 'entity_type', 'entity_id'),
+        Index("idx_audit_log_workspace_created_at", "workspace_id", "created_at"),
+        Index("idx_audit_log_actor_created_at", "actor_user_id", "created_at"),
+        Index("idx_audit_log_note_created_at", "note_id", "created_at"),
+        Index("idx_audit_log_action_created_at", "action_type", "created_at"),
+        Index("idx_audit_log_entity_lookup", "entity_type", "entity_id", "created_at"),
+    )
+
+
+class Automation(Base):
+    """Workspace-scoped trigger/action automation configuration."""
+
+    __tablename__ = "automations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    name = Column(String(255), nullable=False)
+    trigger_type = Column(String(100), nullable=False, index=True)
+    conditions = Column(JSONB, nullable=False, default=list)
+    actions = Column(JSONB, nullable=False, default=list)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    workspace = relationship("Workspace", back_populates="automations")
+    created_by = relationship("User", foreign_keys=[created_by_user_id], lazy="joined")
+
+    __table_args__ = (
+        Index("idx_automations_workspace_trigger_enabled", "workspace_id", "trigger_type", "enabled"),
+        Index("idx_automations_workspace_updated", "workspace_id", "updated_at"),
     )
 
 
@@ -597,6 +768,35 @@ class Note(Base):
     
     # Source
     source_url = Column(String(1000), nullable=True)
+
+    # Approval workflow
+    approval_status = Column(
+        Enum(
+            ApprovalWorkflowStatus,
+            name="approvalworkflowstatus",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=ApprovalWorkflowStatus.DRAFT,
+        index=True,
+    )
+    approval_priority = Column(
+        Enum(
+            ApprovalWorkflowPriority,
+            name="approvalworkflowpriority",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=ApprovalWorkflowPriority.NORMAL,
+        index=True,
+    )
+    approval_due_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    approval_submitted_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    approval_submitted_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    approval_decided_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    approval_decided_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
     
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -604,15 +804,39 @@ class Note(Base):
 
     # Relationships
     workspace = relationship("Workspace", back_populates="notes")
-    owner = relationship("User", back_populates="owned_notes")
+    owner = relationship(
+        "User",
+        foreign_keys=[user_id],
+        back_populates="owned_notes",
+    )
     collaborators = relationship("NoteCollaborator", back_populates="note", cascade="all, delete-orphan")
     invites = relationship("NoteInvite", back_populates="note", cascade="all, delete-orphan")
+    comments = relationship("NoteComment", back_populates="note", cascade="all, delete-orphan")
+    notifications = relationship("UserNotification", back_populates="note", cascade="all, delete-orphan")
+    approval_submitted_by = relationship(
+        "User",
+        foreign_keys=[approval_submitted_by_user_id],
+        back_populates="submitted_note_approvals",
+    )
+    approval_decided_by = relationship(
+        "User",
+        foreign_keys=[approval_decided_by_user_id],
+        back_populates="decided_note_approvals",
+    )
+    approval_transitions = relationship(
+        "NoteApprovalTransition",
+        back_populates="note",
+        cascade="all, delete-orphan",
+        order_by="NoteApprovalTransition.created_at.desc()",
+    )
 
     # Indexes
     __table_args__ = (
         Index('idx_note_workspace', 'workspace_id', 'created_at'),
         Index('idx_note_user', 'user_id', 'updated_at'),
         Index('idx_note_type', 'note_type'),
+        Index('idx_note_approval_dashboard', 'workspace_id', 'approval_status', 'approval_due_at', 'approval_priority'),
+        Index('idx_note_approval_submitter', 'approval_submitted_by_user_id', 'approval_status', 'approval_submitted_at'),
     )
 
 
@@ -699,6 +923,180 @@ class NoteInvite(Base):
     )
 
 
+class NoteComment(Base):
+    """Threaded note discussion comment with nested replies and resolution state."""
+
+    __tablename__ = "note_comments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    parent_comment_id = Column(UUID(as_uuid=True), ForeignKey("note_comments.id", ondelete="CASCADE"), nullable=True, index=True)
+    depth = Column(Integer, nullable=False, default=0)
+    body = Column(Text, nullable=False)
+    is_resolved = Column(Boolean, nullable=False, default=False, index=True)
+    resolved_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    note = relationship("Note", back_populates="comments")
+    author = relationship("User", foreign_keys=[author_user_id], back_populates="authored_note_comments", lazy="joined")
+    parent_comment = relationship("NoteComment", remote_side=[id], back_populates="replies")
+    replies = relationship("NoteComment", back_populates="parent_comment", cascade="all, delete-orphan")
+    resolved_by = relationship("User", foreign_keys=[resolved_by_user_id], back_populates="resolved_note_comments", lazy="joined")
+    mentions = relationship("NoteCommentMention", back_populates="comment", cascade="all, delete-orphan")
+    reactions = relationship("NoteCommentReaction", back_populates="comment", cascade="all, delete-orphan")
+    notifications = relationship("UserNotification", back_populates="comment", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_note_comments_note_thread", "note_id", "parent_comment_id", "created_at"),
+        Index("idx_note_comments_note_resolved", "note_id", "is_resolved", "updated_at"),
+        Index("idx_note_comments_parent_created", "parent_comment_id", "created_at"),
+    )
+
+
+class NoteApprovalTransition(Base):
+    """Durable audit-friendly history of note approval workflow state changes."""
+
+    __tablename__ = "note_approval_transitions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=True, index=True)
+    actor_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    from_status = Column(
+        Enum(
+            ApprovalWorkflowStatus,
+            name="approvalworkflowstatus",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    to_status = Column(
+        Enum(
+            ApprovalWorkflowStatus,
+            name="approvalworkflowstatus",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        index=True,
+    )
+    comment = Column(Text, nullable=True)
+    due_at_snapshot = Column(DateTime(timezone=True), nullable=True)
+    priority_snapshot = Column(
+        Enum(
+            ApprovalWorkflowPriority,
+            name="approvalworkflowpriority",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=ApprovalWorkflowPriority.NORMAL,
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    note = relationship("Note", back_populates="approval_transitions")
+    actor = relationship("User", foreign_keys=[actor_user_id], back_populates="note_approval_transitions")
+
+    __table_args__ = (
+        Index("idx_note_approval_transitions_note_created", "note_id", "created_at"),
+        Index("idx_note_approval_transitions_workspace_status", "workspace_id", "to_status", "created_at"),
+    )
+
+
+class NoteCommentMention(Base):
+    """Resolved mention links for one comment."""
+
+    __tablename__ = "note_comment_mentions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    comment_id = Column(UUID(as_uuid=True), ForeignKey("note_comments.id", ondelete="CASCADE"), nullable=False, index=True)
+    mentioned_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    mention_token = Column(String(255), nullable=False)
+    start_offset = Column(Integer, nullable=False)
+    end_offset = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    comment = relationship("NoteComment", back_populates="mentions")
+    mentioned_user = relationship("User", foreign_keys=[mentioned_user_id], back_populates="comment_mentions", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("comment_id", "mentioned_user_id", name="uq_note_comment_mentions_comment_user"),
+        Index("idx_note_comment_mentions_user_created", "mentioned_user_id", "created_at"),
+    )
+
+
+class NoteCommentReaction(Base):
+    """Single reaction instance applied by one user to one comment."""
+
+    __tablename__ = "note_comment_reactions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    comment_id = Column(UUID(as_uuid=True), ForeignKey("note_comments.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    emoji = Column(
+        Enum(
+            NoteCommentReactionType,
+            name="notecommentreactiontype",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    comment = relationship("NoteComment", back_populates="reactions")
+    user = relationship("User", foreign_keys=[user_id], back_populates="comment_reactions", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("comment_id", "user_id", "emoji", name="uq_note_comment_reactions_comment_user_emoji"),
+        Index("idx_note_comment_reactions_comment_emoji", "comment_id", "emoji", "created_at"),
+    )
+
+
+class UserNotification(Base):
+    """Durable user notification record for note comment activity."""
+
+    __tablename__ = "user_notifications"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=True, index=True)
+    note_id = Column(UUID(as_uuid=True), ForeignKey("notes.id", ondelete="CASCADE"), nullable=True, index=True)
+    comment_id = Column(UUID(as_uuid=True), ForeignKey("note_comments.id", ondelete="CASCADE"), nullable=True, index=True)
+    notification_type = Column(
+        Enum(
+            UserNotificationType,
+            name="usernotificationtype",
+            values_callable=_enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        index=True,
+    )
+    payload = Column(JSONB, nullable=False, default=dict)
+    is_read = Column(Boolean, nullable=False, default=False, index=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    user = relationship("User", foreign_keys=[user_id], back_populates="notifications", lazy="joined")
+    actor = relationship("User", foreign_keys=[actor_user_id], back_populates="triggered_notifications", lazy="joined")
+    note = relationship("Note", back_populates="notifications")
+    comment = relationship("NoteComment", back_populates="notifications")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "comment_id", "notification_type", name="uq_user_notifications_comment_type"),
+        Index("idx_user_notifications_user_read_created", "user_id", "is_read", "created_at"),
+        Index("idx_user_notifications_note_created", "note_id", "created_at"),
+    )
+
+
 class ThinkingSession(Base):
     """Persisted Live Thinking Session metadata and current state."""
 
@@ -738,10 +1136,10 @@ class ThinkingSession(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
 
     workspace = relationship("Workspace", back_populates="thinking_sessions")
-    note = relationship("Note", foreign_keys=[note_id], lazy="joined")
-    creator = relationship("User", foreign_keys=[created_by_user_id], lazy="joined")
-    host = relationship("User", foreign_keys=[host_user_id], lazy="joined")
-    last_refined_by = relationship("User", foreign_keys=[last_refined_by_user_id], lazy="joined")
+    note = relationship("Note", foreign_keys=[note_id], lazy="selectin")
+    creator = relationship("User", foreign_keys=[created_by_user_id], lazy="selectin")
+    host = relationship("User", foreign_keys=[host_user_id], lazy="selectin")
+    last_refined_by = relationship("User", foreign_keys=[last_refined_by_user_id], lazy="selectin")
     participants = relationship("ThinkingSessionParticipant", back_populates="session", cascade="all, delete-orphan")
     contributions = relationship("ThinkingSessionContribution", back_populates="session", cascade="all, delete-orphan")
     synthesis_runs = relationship("ThinkingSessionSynthesisRun", back_populates="session", cascade="all, delete-orphan")

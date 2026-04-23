@@ -169,6 +169,35 @@ event.listen(async_engine.sync_engine, "before_cursor_execute", _track_connectio
 event.listen(sync_engine, "before_cursor_execute", _track_connection_sql)
 
 
+@event.listens_for(Session, "after_commit")
+def _dispatch_pending_audit_events_after_commit(session: Session) -> None:
+    session_info = getattr(session, "info", None)
+    if not isinstance(session_info, dict):
+        return
+
+    from app.core.audit import (
+        clear_pending_audit_events,
+        dispatch_pending_audit_events,
+        pop_pending_audit_events,
+    )
+
+    pending_events = pop_pending_audit_events(session_info)
+    clear_pending_audit_events(session_info)
+    if pending_events:
+        dispatch_pending_audit_events(pending_events)
+
+
+@event.listens_for(Session, "after_rollback")
+def _clear_pending_audit_events_after_rollback(session: Session) -> None:
+    session_info = getattr(session, "info", None)
+    if not isinstance(session_info, dict):
+        return
+
+    from app.core.audit import clear_pending_audit_events
+
+    clear_pending_audit_events(session_info)
+
+
 def bind_db_user_context(db: AsyncSession | Session, user_id) -> None:
     session_info = get_session_info(db)
     session_info["app_current_user_id"] = str(user_id)
