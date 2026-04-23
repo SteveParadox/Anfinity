@@ -7,6 +7,7 @@ import {
   Search,
   Users,
   Zap,
+  Brain,
   CreditCard,
   ChevronLeft,
   ChevronRight,
@@ -15,6 +16,7 @@ import {
   LogOut,
   Plus,
   Upload,
+  PlugZap,
 } from 'lucide-react';
 import type { User } from '@/types';
 
@@ -35,7 +37,9 @@ const navigation = [
   { id: 'upload',      label: 'Upload Documents',  icon: Upload          },
   { id: 'graph',       label: 'Knowledge Graph',   icon: Share2          },
   { id: 'search',      label: 'AI Search',         icon: Search, ai: true },
+  { id: 'thinking-sessions', label: 'Thinking Sessions', icon: Brain, ai: true },
   { id: 'workspaces',  label: 'Workspaces',        icon: Users           },
+  { id: 'integrations', label: 'Integrations',      icon: PlugZap         },
   { id: 'workflows',   label: 'Workflows',         icon: Zap             },
   { id: 'pricing',     label: 'Pricing',           icon: CreditCard      },
 ];
