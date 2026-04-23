@@ -12,6 +12,7 @@ from sqlalchemy import Select, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.audit import audit
 from app.core.auth import WorkspaceContext, get_workspace_context
 from app.core.permissions import get_workspace_permissions_for_user
 from app.database.models import (
@@ -169,6 +170,18 @@ async def get_thinking_session_or_404(session_id: UUID, db: AsyncSession) -> Thi
     return session
 
 
+async def get_thinking_session_for_update(session_id: UUID, db: AsyncSession) -> ThinkingSession:
+    result = await db.execute(
+        select(ThinkingSession)
+        .where(ThinkingSession.id == session_id)
+        .with_for_update()
+    )
+    session = result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thinking session not found")
+    return session
+
+
 async def get_thinking_synthesis_run_or_404(
     session_id: UUID,
     run_id: UUID,
@@ -179,6 +192,25 @@ async def get_thinking_synthesis_run_or_404(
             ThinkingSessionSynthesisRun.id == run_id,
             ThinkingSessionSynthesisRun.session_id == session_id,
         )
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thinking synthesis run not found")
+    return run
+
+
+async def get_thinking_synthesis_run_for_update(
+    session_id: UUID,
+    run_id: UUID,
+    db: AsyncSession,
+) -> ThinkingSessionSynthesisRun:
+    result = await db.execute(
+        select(ThinkingSessionSynthesisRun)
+        .where(
+            ThinkingSessionSynthesisRun.id == run_id,
+            ThinkingSessionSynthesisRun.session_id == session_id,
+        )
+        .with_for_update()
     )
     run = result.scalar_one_or_none()
     if run is None:
@@ -302,6 +334,19 @@ async def create_thinking_session(
 
     session.room_id = build_thinking_session_room_id(session.id)
     await mark_thinking_session_participant_seen(session, user, db)
+    await audit.session_started(
+        db,
+        actor_user_id=user.id,
+        workspace_id=workspace_id,
+        thinking_session_id=session.id,
+        note_id=session.note_id,
+        metadata={
+            "title": session.title,
+            "phase": ThinkingSessionPhase.WAITING.value,
+            "prompt_context_present": bool(session.prompt_context),
+            "source": "thinking_sessions.create_thinking_session",
+        },
+    )
     await db.commit()
     await db.refresh(session)
     return session
@@ -495,6 +540,7 @@ async def create_contribution(
     content: str,
     db: AsyncSession,
 ) -> ThinkingSessionContribution:
+    session = await get_thinking_session_for_update(session.id, db)
     await ensure_thinking_session_permission(session, user, db, "participate")
 
     if coerce_phase(session.phase) != ThinkingSessionPhase.GATHERING:
@@ -525,6 +571,19 @@ async def create_contribution(
     db.add(contribution)
     await mark_thinking_session_participant_seen(session, user, db)
     await db.flush()
+    await audit.contribution_submitted(
+        db,
+        actor_user_id=user.id,
+        workspace_id=session.workspace_id,
+        thinking_session_id=session.id,
+        note_id=session.note_id,
+        contribution_id=contribution.id,
+        metadata={
+            "created_phase": ThinkingSessionPhase.GATHERING.value,
+            "content_length": len(cleaned_content),
+            "source": "thinking_sessions.create_contribution",
+        },
+    )
     await db.commit()
     await db.refresh(contribution)
     return contribution
@@ -536,6 +595,7 @@ async def toggle_contribution_vote(
     user: DBUser,
     db: AsyncSession,
 ) -> bool:
+    session = await get_thinking_session_for_update(session.id, db)
     await ensure_thinking_session_permission(session, user, db, "participate")
 
     if coerce_phase(session.phase) != ThinkingSessionPhase.GATHERING:
@@ -576,6 +636,26 @@ async def toggle_contribution_vote(
         voted = False
 
     await mark_thinking_session_participant_seen(session, user, db)
+    if voted:
+        await audit.vote_cast(
+            db,
+            actor_user_id=user.id,
+            workspace_id=session.workspace_id,
+            thinking_session_id=session.id,
+            note_id=session.note_id,
+            contribution_id=contribution.id,
+            metadata={"source": "thinking_sessions.toggle_contribution_vote"},
+        )
+    else:
+        await audit.vote_removed(
+            db,
+            actor_user_id=user.id,
+            workspace_id=session.workspace_id,
+            thinking_session_id=session.id,
+            note_id=session.note_id,
+            contribution_id=contribution.id,
+            metadata={"source": "thinking_sessions.toggle_contribution_vote"},
+        )
     await db.commit()
     return voted
 
@@ -608,6 +688,7 @@ async def transition_thinking_session_phase(
     target_phase: ThinkingSessionPhase,
     db: AsyncSession,
 ) -> tuple[ThinkingSession, Optional[ThinkingSessionSynthesisRun]]:
+    session = await get_thinking_session_for_update(session.id, db)
     access = await ensure_thinking_session_permission(session, user, db, "control")
     current_phase = coerce_phase(session.phase)
 
@@ -617,14 +698,14 @@ async def transition_thinking_session_phase(
             detail=f"Cannot transition thinking session from {current_phase.value} to {target_phase.value}",
         )
 
-    now = utcnow()
-    session.phase = target_phase
-    session.phase_entered_at = now
-    session.updated_at = now
     synthesis_run: Optional[ThinkingSessionSynthesisRun] = None
 
+    now = utcnow()
     if target_phase == ThinkingSessionPhase.GATHERING:
+        session.phase = target_phase
+        session.phase_entered_at = now
         session.gathering_started_at = now
+        session.updated_at = now
     elif target_phase == ThinkingSessionPhase.SYNTHESIZING:
         contribution_snapshot = await build_contribution_snapshot_for_synthesis(session, db)
         if not contribution_snapshot:
@@ -647,10 +728,13 @@ async def transition_thinking_session_phase(
         )
         db.add(synthesis_run)
         await db.flush()
+        session.phase = target_phase
+        session.phase_entered_at = now
         session.active_synthesis_run_id = synthesis_run.id
         session.synthesizing_started_at = now
         session.synthesis_output = ""
         session.refined_output = session.refined_output or ""
+        session.updated_at = now
     elif target_phase == ThinkingSessionPhase.COMPLETED:
         final_output = (session.refined_output or session.synthesis_output or "").strip()
         if not final_output:
@@ -658,10 +742,26 @@ async def transition_thinking_session_phase(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Cannot complete a session without a synthesized or refined result",
             )
+        session.phase = target_phase
+        session.phase_entered_at = now
         session.final_output = final_output
         session.completed_at = now
+        session.updated_at = now
 
     await mark_thinking_session_participant_seen(session, user, db)
+    await audit.session_phase_transitioned(
+        db,
+        actor_user_id=user.id,
+        workspace_id=session.workspace_id,
+        thinking_session_id=session.id,
+        note_id=session.note_id,
+        metadata={
+            "from_phase": current_phase.value,
+            "to_phase": target_phase.value,
+            "active_synthesis_run_id": str(synthesis_run.id) if synthesis_run is not None else str(session.active_synthesis_run_id) if session.active_synthesis_run_id else None,
+            "source": "thinking_sessions.transition_thinking_session_phase",
+        },
+    )
     await db.commit()
     await db.refresh(session)
     if synthesis_run is not None:
@@ -675,6 +775,7 @@ async def claim_synthesis_run_for_streaming(
     user: DBUser,
     db: AsyncSession,
 ) -> ThinkingSessionSynthesisRun:
+    session = await get_thinking_session_for_update(session.id, db)
     await ensure_thinking_session_permission(session, user, db, "control")
 
     if session.active_synthesis_run_id != run_id or coerce_phase(session.phase) != ThinkingSessionPhase.SYNTHESIZING:
@@ -758,11 +859,19 @@ async def persist_synthesis_progress(
     partial_output: str,
     db: AsyncSession,
 ) -> ThinkingSession:
-    if session.active_synthesis_run_id != run.id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This synthesis run is no longer active",
-        )
+    session = await get_thinking_session_for_update(session.id, db)
+    run = await get_thinking_synthesis_run_for_update(session.id, run.id, db)
+
+    if (
+        session.active_synthesis_run_id != run.id
+        or coerce_phase(session.phase) != ThinkingSessionPhase.SYNTHESIZING
+        or coerce_synthesis_status(run.status) != ThinkingSynthesisStatus.STREAMING
+    ):
+        return session
+
+    existing_output = run.output_text or ""
+    if len(partial_output) <= len(existing_output):
+        return session
 
     run.output_text = partial_output
     run.updated_at = utcnow()
@@ -779,6 +888,16 @@ async def complete_synthesis_run(
     full_output: str,
     db: AsyncSession,
 ) -> ThinkingSession:
+    session = await get_thinking_session_for_update(session.id, db)
+    run = await get_thinking_synthesis_run_for_update(session.id, run.id, db)
+    run_status = coerce_synthesis_status(run.status)
+
+    if run_status == ThinkingSynthesisStatus.COMPLETED:
+        return session
+
+    if session.active_synthesis_run_id != run.id or coerce_phase(session.phase) != ThinkingSessionPhase.SYNTHESIZING:
+        return session
+
     now = utcnow()
     run.status = ThinkingSynthesisStatus.COMPLETED
     run.output_text = full_output
@@ -792,6 +911,18 @@ async def complete_synthesis_run(
     if not (session.refined_output or "").strip():
         session.refined_output = full_output
     session.updated_at = now
+    await audit.session_synthesis_completed(
+        db,
+        actor_user_id=run.triggered_by_user_id,
+        workspace_id=session.workspace_id,
+        thinking_session_id=session.id,
+        note_id=session.note_id,
+        run_id=run.id,
+        metadata={
+            "output_length": len(full_output),
+            "source": "thinking_sessions.complete_synthesis_run",
+        },
+    )
     await db.commit()
     await db.refresh(session)
     return session
@@ -803,6 +934,16 @@ async def fail_synthesis_run(
     error_message: str,
     db: AsyncSession,
 ) -> ThinkingSession:
+    session = await get_thinking_session_for_update(session.id, db)
+    run = await get_thinking_synthesis_run_for_update(session.id, run.id, db)
+    run_status = coerce_synthesis_status(run.status)
+
+    if run_status == ThinkingSynthesisStatus.COMPLETED:
+        return session
+
+    if session.active_synthesis_run_id != run.id or coerce_phase(session.phase) != ThinkingSessionPhase.SYNTHESIZING:
+        return session
+
     now = utcnow()
     run.status = ThinkingSynthesisStatus.FAILED
     run.error_message = error_message
@@ -813,6 +954,18 @@ async def fail_synthesis_run(
     session.active_synthesis_run_id = None
     session.synthesis_output = ""
     session.updated_at = now
+    await audit.session_synthesis_failed(
+        db,
+        actor_user_id=run.triggered_by_user_id,
+        workspace_id=session.workspace_id,
+        thinking_session_id=session.id,
+        note_id=session.note_id,
+        run_id=run.id,
+        metadata={
+            "error_message": error_message,
+            "source": "thinking_sessions.fail_synthesis_run",
+        },
+    )
     await db.commit()
     await db.refresh(session)
     return session
@@ -824,6 +977,7 @@ async def update_refined_output(
     refined_output: str,
     db: AsyncSession,
 ) -> ThinkingSession:
+    session = await get_thinking_session_for_update(session.id, db)
     await ensure_thinking_session_permission(session, user, db, "participate")
     if coerce_phase(session.phase) != ThinkingSessionPhase.REFINING:
         raise HTTPException(
@@ -835,6 +989,17 @@ async def update_refined_output(
     session.last_refined_by_user_id = user.id
     session.updated_at = utcnow()
     await mark_thinking_session_participant_seen(session, user, db)
+    await audit.session_refinement_updated(
+        db,
+        actor_user_id=user.id,
+        workspace_id=session.workspace_id,
+        thinking_session_id=session.id,
+        note_id=session.note_id,
+        metadata={
+            "refined_output_length": len(session.refined_output or ""),
+            "source": "thinking_sessions.update_refined_output",
+        },
+    )
     await db.commit()
     await db.refresh(session)
     return session

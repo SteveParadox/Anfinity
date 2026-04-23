@@ -10,10 +10,11 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit import AuditRequestContext, audit
 from app.database.models import (
     Note,
     NoteCollaborator,
@@ -22,7 +23,7 @@ from app.database.models import (
     NoteInviteStatus,
     User as DBUser,
 )
-from app.database.session import bind_db_rls_bypass, bind_db_user_context, get_session_info
+from app.database.session import bind_db_rls_bypass, get_session_info
 from app.services.note_access import NoteAccessContext, resolve_note_access
 
 
@@ -90,25 +91,38 @@ async def temporary_rls_bypass(db: AsyncSession):
     await db.execute(text("select set_config('app.rls_bypass', 'true', true)"))
     await db.execute(text("select set_config('app.current_user_id', '', true)"))
 
-    try:
-        yield
-    finally:
-        if previous_bypass:
-            bind_db_rls_bypass(db, True)
-            await db.execute(text("select set_config('app.rls_bypass', 'true', true)"))
-        else:
-            session_info["app_rls_bypass"] = False
-            await db.execute(text("select set_config('app.rls_bypass', 'false', true)"))
+    async def restore_previous_context(*, suppress_sqlalchemy_errors: bool) -> None:
+        session_info["app_rls_bypass"] = previous_bypass
+        rls_bypass_value = "true" if previous_bypass else "false"
 
         if previous_user_id:
-            bind_db_user_context(db, previous_user_id)
-            await db.execute(
-                text("select set_config('app.current_user_id', :value, true)"),
-                {"value": str(previous_user_id)},
-            )
+            session_info["app_current_user_id"] = str(previous_user_id)
+            current_user_id_value = str(previous_user_id)
         else:
             session_info.pop("app_current_user_id", None)
-            await db.execute(text("select set_config('app.current_user_id', '', true)"))
+            current_user_id_value = ""
+
+        try:
+            await db.execute(
+                text("select set_config('app.rls_bypass', :value, true)"),
+                {"value": rls_bypass_value},
+            )
+            await db.execute(
+                text("select set_config('app.current_user_id', :value, true)"),
+                {"value": current_user_id_value},
+            )
+        except SQLAlchemyError:
+            if suppress_sqlalchemy_errors:
+                return
+            raise
+
+    try:
+        yield
+    except BaseException:
+        await restore_previous_context(suppress_sqlalchemy_errors=True)
+        raise
+    else:
+        await restore_previous_context(suppress_sqlalchemy_errors=False)
 
 
 async def get_note_with_bypass(db: AsyncSession, note_id: UUID) -> Optional[Note]:
@@ -218,6 +232,7 @@ async def create_note_invite(
     *,
     message: Optional[str] = None,
     expires_in: timedelta = DEFAULT_NOTE_INVITE_TTL,
+    audit_context: Optional[AuditRequestContext] = None,
 ) -> CreatedNoteInvite:
     normalized_email = normalize_email(invitee_email)
     target_user = await resolve_invite_target_user(db, normalized_email, invitee_user_id)
@@ -235,6 +250,20 @@ async def create_note_invite(
         collaborator_record.granted_by_user_id = inviter.id
         collaborator_record.updated_at = utc_now()
         await db.flush()
+        await audit.note_collaborator_role_changed(
+            db,
+            actor_user_id=inviter.id,
+            workspace_id=note.workspace_id,
+            note_id=note.id,
+            target_user_id=collaborator_record.user_id,
+            collaborator_id=collaborator_record.id,
+            metadata={
+                "previous_role": existing_role.value,
+                "new_role": collaborator_record.role.value if isinstance(collaborator_record.role, NoteCollaborationRole) else str(collaborator_record.role),
+                "trigger": "create_note_invite",
+            },
+            context=audit_context,
+        )
         return CreatedNoteInvite(
             invite=None,
             token=None,
@@ -279,6 +308,22 @@ async def create_note_invite(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="An active invite for this target already exists",
                 ) from exc
+            await audit.note_collaborator_invited(
+                db,
+                actor_user_id=inviter.id,
+                workspace_id=note.workspace_id,
+                note_id=note.id,
+                target_user_id=target_user.id if target_user is not None else existing_invite.invitee_user_id,
+                invite_id=existing_invite.id,
+                metadata={
+                    "created": False,
+                    "role": role.value,
+                    "invitee_email": normalized_email or existing_invite.invitee_email,
+                    "invitee_user_id": str(target_user.id) if target_user is not None else str(existing_invite.invitee_user_id) if existing_invite.invitee_user_id else None,
+                    "trigger": "create_note_invite",
+                },
+                context=audit_context,
+            )
             return CreatedNoteInvite(invite=existing_invite, token=token, created=False)
 
     token, token_hash = generate_note_invite_token()
@@ -301,6 +346,22 @@ async def create_note_invite(
             status_code=status.HTTP_409_CONFLICT,
             detail="An active invite for this target already exists",
         ) from exc
+    await audit.note_collaborator_invited(
+        db,
+        actor_user_id=inviter.id,
+        workspace_id=note.workspace_id,
+        note_id=note.id,
+        target_user_id=target_user.id if target_user is not None else invite.invitee_user_id,
+        invite_id=invite.id,
+        metadata={
+            "created": True,
+            "role": role.value,
+            "invitee_email": normalized_email,
+            "invitee_user_id": str(target_user.id) if target_user is not None else str(invite.invitee_user_id) if invite.invitee_user_id else None,
+            "trigger": "create_note_invite",
+        },
+        context=audit_context,
+    )
     return CreatedNoteInvite(invite=invite, token=token, created=True)
 
 
@@ -308,6 +369,8 @@ async def accept_note_invite(
     token: str,
     user: DBUser,
     db: AsyncSession,
+    *,
+    audit_context: Optional[AuditRequestContext] = None,
 ) -> tuple[NoteInvite, Note, NoteAccessContext]:
     token_hash = hash_note_invite_token(token)
     invite_result = await db.execute(
@@ -372,6 +435,21 @@ async def accept_note_invite(
             detail="Invite acceptance conflicted with another update; please retry",
         ) from exc
 
+    await audit.note_collaborator_invite_accepted(
+        db,
+        actor_user_id=user.id,
+        workspace_id=getattr(note, "workspace_id", None),
+        note_id=note.id,
+        invite_id=getattr(invite, "id", None) or note.id,
+        target_user_id=user.id,
+        metadata={
+            "role": invite.role.value if isinstance(invite.role, NoteCollaborationRole) else str(invite.role),
+            "inviter_user_id": str(invite.inviter_user_id) if invite.inviter_user_id else None,
+            "trigger": "accept_note_invite",
+        },
+        context=audit_context,
+    )
+
     access = await resolve_note_access(note, user, db)
     return invite, note, access
 
@@ -379,6 +457,10 @@ async def accept_note_invite(
 async def revoke_note_invite(
     invite: NoteInvite,
     db: AsyncSession,
+    *,
+    actor_user_id: Optional[UUID] = None,
+    workspace_id: Optional[UUID] = None,
+    audit_context: Optional[AuditRequestContext] = None,
 ) -> NoteInvite:
     await expire_note_invite_if_needed(invite, db)
 
@@ -399,4 +481,18 @@ async def revoke_note_invite(
     invite.revoked_at = utc_now()
     invite.updated_at = utc_now()
     await db.flush()
+    if actor_user_id is not None:
+        await audit.note_collaborator_invite_revoked(
+            db,
+            actor_user_id=actor_user_id,
+            workspace_id=workspace_id,
+            note_id=invite.note_id,
+            invite_id=invite.id,
+            target_user_id=invite.invitee_user_id,
+            metadata={
+                "invitee_email": invite.invitee_email,
+                "trigger": "revoke_note_invite",
+            },
+            context=audit_context,
+        )
     return invite
