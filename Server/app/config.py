@@ -214,6 +214,10 @@ class Settings(BaseSettings):
     JWT_ISSUER: str = "anfinity-api"
     JWT_AUDIENCE: str = "anfinity-clients"
     ENCRYPTION_KEY: Optional[str] = None
+    AUTOMATION_INTERNAL_TOKEN: Optional[str] = None
+    AUTOMATION_WEBHOOK_SECRET: Optional[str] = None
+    FRONTEND_URL: str = Field(default="http://localhost:5173")
+    INTEGRATIONS_OAUTH_REDIRECT_BASE_URL: Optional[str] = None
     
     # CORS - configure for production
     CORS_ORIGINS: list = Field(default=["http://localhost:3000", "http://localhost:5173"])
@@ -305,6 +309,7 @@ class Settings(BaseSettings):
     NOTION_CLIENT_SECRET: Optional[str] = None
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
+    GOOGLE_REDIRECT_PATH: str = "/connectors/oauth/google/callback"
     GITHUB_CLIENT_ID: Optional[str] = None
     GITHUB_CLIENT_SECRET: Optional[str] = None
     
