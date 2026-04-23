@@ -4,9 +4,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Plus, Search, Filter, Edit2, Trash2, Link2,
-  Sparkles, Brain, Globe, Mic, FileText, X, Check, Tag, Users,
+  Sparkles, Brain, Globe, Mic, FileText, X, Check, Tag, Users, MessageSquare, Reply, CheckCircle2, RotateCcw,
 } from 'lucide-react';
-import type { Note, NoteConnectionSuggestion, NoteVersion, Workspace } from '@/types';
+import type { Note, NoteComment, NoteConnectionSuggestion, NoteContribution, NoteVersion, Workspace } from '@/types';
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
@@ -203,6 +203,13 @@ function formatVersionSnapshotSummary(version: NoteVersion): string {
 
 function formatCountLabel(count: number, singular: string, plural?: string): string {
   return `${count} ${count === 1 ? singular : plural || `${singular}s`}`;
+}
+
+function getMentionExample(member: { full_name?: string; email?: string }): string {
+  const fullNameCandidate = (member.full_name || '').trim().split(/\s+/)[0] || '';
+  const emailCandidate = (member.email || '').split('@')[0] || '';
+  const rawValue = fullNameCandidate || emailCandidate;
+  return rawValue.replace(/[^a-zA-Z0-9._-]/g, '');
 }
 
 /* ─── Shared primitive components ─────────────────────────────────────── */
@@ -439,6 +446,314 @@ function TTDialog({
   );
 }
 
+function renderCommentBody(comment: NoteComment) {
+  const mentions = [...(comment.mentions || [])]
+    .filter((mention) => Number.isFinite(mention.startOffset) && Number.isFinite(mention.endOffset))
+    .sort((left, right) => left.startOffset - right.startOffset);
+
+  if (mentions.length === 0) {
+    return comment.body;
+  }
+
+  const fragments: React.ReactNode[] = [];
+  let cursor = 0;
+
+  mentions.forEach((mention, index) => {
+    if (mention.startOffset > cursor) {
+      fragments.push(
+        <span key={`${comment.id}-text-${index}`}>
+          {comment.body.slice(cursor, mention.startOffset)}
+        </span>
+      );
+    }
+
+    const rawToken = comment.body.slice(mention.startOffset, mention.endOffset) || `@${mention.mentionToken}`;
+    fragments.push(
+      <span
+        key={`${comment.id}-mention-${mention.id}`}
+        style={{
+          color: TT.yolk,
+          background: 'rgba(245,230,66,0.08)',
+          border: '1px solid rgba(245,230,66,0.16)',
+          borderRadius: 3,
+          padding: '1px 4px',
+        }}
+        title={mention.user?.email || rawToken}
+      >
+        {rawToken}
+      </span>
+    );
+
+    cursor = mention.endOffset;
+  });
+
+  if (cursor < comment.body.length) {
+    fragments.push(<span key={`${comment.id}-tail`}>{comment.body.slice(cursor)}</span>);
+  }
+
+  return fragments;
+}
+
+function CommentComposer({
+  value,
+  onChange,
+  onSubmit,
+  disabled,
+  submitLabel,
+  placeholder,
+  helperText,
+  compact = false,
+  onCancel,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  disabled: boolean;
+  submitLabel: string;
+  placeholder: string;
+  helperText?: string;
+  compact?: boolean;
+  onCancel?: () => void;
+}) {
+  return (
+    <div
+      style={{
+        background: compact ? TT.inkRaised : 'rgba(245,230,66,0.04)',
+        border: `1px solid ${TT.inkBorder}`,
+        borderRadius: 3,
+        padding: compact ? '10px 12px' : '12px 14px',
+      }}
+    >
+      <textarea
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        rows={compact ? 3 : 4}
+        style={{
+          width: '100%',
+          background: TT.inkDeep,
+          border: `1px solid ${TT.inkBorder}`,
+          borderRadius: 3,
+          color: TT.snow,
+          fontFamily: TT.fontBody,
+          fontSize: 12.5,
+          lineHeight: 1.6,
+          padding: '10px 12px',
+          outline: 'none',
+          resize: 'vertical',
+          boxSizing: 'border-box',
+        }}
+      />
+      {helperText && (
+        <p style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, marginTop: 7, lineHeight: 1.5 }}>
+          {helperText}
+        </p>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+        {onCancel && (
+          <GhostBtn onClick={onCancel}>
+            <X size={11} /> Cancel
+          </GhostBtn>
+        )}
+        <YellowBtn onClick={onSubmit} disabled={disabled}>
+          <Check size={12} /> {submitLabel}
+        </YellowBtn>
+      </div>
+    </div>
+  );
+}
+
+function CommentThreadNode({
+  comment,
+  canInteract,
+  canResolve,
+  activeReplyId,
+  replyBody,
+  pendingReactionKey,
+  pendingResolveId,
+  onReplyToggle,
+  onReplyBodyChange,
+  onReplySubmit,
+  onReactionToggle,
+  onResolutionToggle,
+}: {
+  comment: NoteComment;
+  canInteract: boolean;
+  canResolve: boolean;
+  activeReplyId: string | null;
+  replyBody: string;
+  pendingReactionKey: string | null;
+  pendingResolveId: string | null;
+  onReplyToggle: (commentId: string) => void;
+  onReplyBodyChange: (commentId: string, value: string) => void;
+  onReplySubmit: (commentId: string) => void;
+  onReactionToggle: (commentId: string, emoji: string) => void;
+  onResolutionToggle: (commentId: string, resolved: boolean) => void;
+}) {
+  const isReplyOpen = activeReplyId === comment.id;
+
+  return (
+    <div
+      style={{
+        border: `1px solid ${comment.isResolved ? 'rgba(52,211,153,0.25)' : TT.inkBorder}`,
+        borderLeft: `3px solid ${comment.isResolved ? '#34D399' : TT.inkBorder}`,
+        borderRadius: 3,
+        background: comment.isResolved ? 'rgba(52,211,153,0.04)' : TT.inkRaised,
+        padding: '12px 14px',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+            <span style={{ fontFamily: TT.fontMono, fontSize: 10.5, color: TT.snow }}>
+              {comment.author?.name || comment.author?.email || 'Unknown'}
+            </span>
+            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: TT.inkMuted, textTransform: 'uppercase' }}>
+              {comment.createdAt ? safeFromNow(comment.createdAt) : 'just now'}
+            </span>
+            {comment.isResolved && (
+              <span
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 4,
+                  padding: '2px 7px',
+                  borderRadius: 999,
+                  border: '1px solid rgba(52,211,153,0.25)',
+                  color: '#34D399',
+                  fontFamily: TT.fontMono,
+                  fontSize: 8.5,
+                  textTransform: 'uppercase',
+                }}
+              >
+                <CheckCircle2 size={10} /> Resolved
+              </span>
+            )}
+          </div>
+          <div style={{ fontFamily: TT.fontBody, fontSize: 12.5, color: TT.snow, lineHeight: 1.65, whiteSpace: 'pre-wrap' }}>
+            {renderCommentBody(comment)}
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {canResolve && (
+            <button
+              onClick={() => onResolutionToggle(comment.id, !comment.isResolved)}
+              disabled={pendingResolveId === comment.id}
+              style={{
+                height: 30,
+                padding: '0 10px',
+                background: 'transparent',
+                border: `1px solid ${comment.isResolved ? 'rgba(52,211,153,0.25)' : TT.inkBorder}`,
+                borderRadius: 3,
+                color: comment.isResolved ? '#34D399' : TT.inkMuted,
+                fontFamily: TT.fontMono,
+                fontSize: 9,
+                cursor: pendingResolveId === comment.id ? 'wait' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+              }}
+            >
+              {comment.isResolved ? <RotateCcw size={11} /> : <CheckCircle2 size={11} />}
+              {comment.isResolved ? 'Unresolve' : 'Resolve'}
+            </button>
+          )}
+          {canInteract && (
+            <button
+              onClick={() => onReplyToggle(comment.id)}
+              style={{
+                height: 30,
+                padding: '0 10px',
+                background: 'transparent',
+                border: `1px solid ${TT.inkBorder}`,
+                borderRadius: 3,
+                color: TT.inkMuted,
+                fontFamily: TT.fontMono,
+                fontSize: 9,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+              }}
+            >
+              <Reply size={11} /> Reply
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 12 }}>
+        {comment.reactions.map((reaction) => {
+          const reactionKey = `${comment.id}:${reaction.emoji}`;
+          const isBusy = pendingReactionKey === reactionKey;
+          return (
+            <button
+              key={reaction.emoji}
+              onClick={() => onReactionToggle(comment.id, reaction.emoji)}
+              disabled={!canInteract || isBusy}
+              style={{
+                height: 30,
+                padding: '0 10px',
+                background: reaction.reactedByCurrentUser ? 'rgba(245,230,66,0.08)' : TT.inkDeep,
+                border: `1px solid ${reaction.reactedByCurrentUser ? 'rgba(245,230,66,0.35)' : TT.inkBorder}`,
+                borderRadius: 999,
+                color: reaction.reactedByCurrentUser ? TT.yolk : TT.inkMuted,
+                fontFamily: TT.fontMono,
+                fontSize: 10,
+                cursor: !canInteract || isBusy ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              <span>{reaction.emojiValue}</span>
+              <span>{reaction.count}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {isReplyOpen && canInteract && (
+        <div style={{ marginTop: 12 }}>
+          <CommentComposer
+            value={replyBody}
+            onChange={(value) => onReplyBodyChange(comment.id, value)}
+            onSubmit={() => onReplySubmit(comment.id)}
+            disabled={!replyBody.trim()}
+            submitLabel="Reply"
+            placeholder="Write a reply. Mentions like @jane or @jane.doe are resolved on the server."
+            compact
+            onCancel={() => onReplyToggle(comment.id)}
+          />
+        </div>
+      )}
+
+      {comment.replies.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 12, paddingLeft: 14, borderLeft: `1px dashed ${TT.inkBorder}` }}>
+          {comment.replies.map((reply) => (
+            <CommentThreadNode
+              key={reply.id}
+              comment={reply}
+              canInteract={canInteract}
+              canResolve={canResolve}
+              activeReplyId={activeReplyId}
+              replyBody={reply.id === activeReplyId ? replyBody : ''}
+              pendingReactionKey={pendingReactionKey}
+              pendingResolveId={pendingResolveId}
+              onReplyToggle={onReplyToggle}
+              onReplyBodyChange={onReplyBodyChange}
+              onReplySubmit={onReplySubmit}
+              onReactionToggle={onReactionToggle}
+              onResolutionToggle={onResolutionToggle}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ─── NotesView ────────────────────────────────────────────────────────── */
 
 export function NotesView({
@@ -470,6 +785,17 @@ export function NotesView({
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [selectedNoteWorkspace, setSelectedNoteWorkspace] = useState<Workspace | null>(null);
   const [selectedNoteWorkspaceMembers, setSelectedNoteWorkspaceMembers] = useState<any[]>([]);
+  const [noteComments, setNoteComments] = useState<NoteComment[]>([]);
+  const [noteCommentsLoading, setNoteCommentsLoading] = useState(false);
+  const [noteCommentsError, setNoteCommentsError] = useState<string | null>(null);
+  const [newCommentBody, setNewCommentBody] = useState('');
+  const [activeReplyId, setActiveReplyId] = useState<string | null>(null);
+  const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
+  const [submittingComment, setSubmittingComment] = useState(false);
+  const [pendingReactionKey, setPendingReactionKey] = useState<string | null>(null);
+  const [pendingResolveId, setPendingResolveId] = useState<string | null>(null);
+  const [noteContributions, setNoteContributions] = useState<NoteContribution[]>([]);
+  const [noteContributionsLoading, setNoteContributionsLoading] = useState(false);
   const [noteVersions, setNoteVersions] = useState<NoteVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
@@ -489,6 +815,16 @@ export function NotesView({
   const canViewWorkspaceNotes = Boolean(workspaceId && hasPermission(workspaceId, 'notes', 'view'));
   const canCreateWorkspaceNotes = Boolean(defaultWorkspaceId && hasPermission(defaultWorkspaceId, 'notes', 'create'));
   const canUpdateSelectedNote = Boolean(selectedNote?.workspaceId && hasPermission(selectedNote.workspaceId, 'notes', 'update'));
+  const canCommentOnSelectedNote = Boolean(
+    selectedNote?.workspaceId
+      ? hasPermission(selectedNote.workspaceId, 'notes', 'view')
+      : selectedNote?.userId === user?.id
+  );
+  const canResolveSelectedNote = Boolean(
+    selectedNote?.workspaceId
+      ? hasPermission(selectedNote.workspaceId, 'notes', 'update')
+      : selectedNote?.userId === user?.id
+  );
   const collaborationToken = api.getToken();
 
   const createEmptyNote = (targetWorkspaceId = '') => ({
@@ -578,6 +914,7 @@ export function NotesView({
       try {
         const syncedNote = normalizeNote(
           await api.syncCollaborativeNoteContent(editingNote.id, editingNote.content, {
+            baseContent: lastPersistedContent,
             signal: abortController.signal,
           })
         );
@@ -712,7 +1049,7 @@ export function NotesView({
     };
 
     loadConnectionSuggestions();
-  }, [selectedNote?.id]);
+  }, [selectedNote?.id, selectedNote?.updatedAt?.getTime()]);
 
   useEffect(() => {
     const loadVersions = async () => {
@@ -742,6 +1079,56 @@ export function NotesView({
     };
 
     loadVersions();
+  }, [selectedNote?.id]);
+
+  useEffect(() => {
+    const loadContributions = async () => {
+      if (!selectedNote?.id) {
+        setNoteContributions([]);
+        return;
+      }
+
+      try {
+        setNoteContributionsLoading(true);
+        const contributions = await api.getNoteContributions(selectedNote.id);
+        setNoteContributions(contributions);
+      } catch (err) {
+        console.error('Failed to load note contributions:', err);
+        setNoteContributions([]);
+      } finally {
+        setNoteContributionsLoading(false);
+      }
+    };
+
+    loadContributions();
+  }, [selectedNote?.id]);
+
+  useEffect(() => {
+    const loadComments = async () => {
+      if (!selectedNote?.id) {
+        setNoteComments([]);
+        setNoteCommentsError(null);
+        setNewCommentBody('');
+        setActiveReplyId(null);
+        setReplyDrafts({});
+        return;
+      }
+
+      try {
+        setNoteCommentsLoading(true);
+        setNoteCommentsError(null);
+        const comments = await api.getNoteComments(selectedNote.id);
+        setNoteComments(comments);
+      } catch (err) {
+        console.error('Failed to load note comments:', err);
+        setNoteComments([]);
+        setNoteCommentsError('Failed to load comments right now.');
+      } finally {
+        setNoteCommentsLoading(false);
+      }
+    };
+
+    loadComments();
   }, [selectedNote?.id]);
 
   const filteredNotes = notes.filter((note) => {
@@ -947,6 +1334,93 @@ export function NotesView({
       setEditingNote({ ...editingNote, tags: editingNote.tags.filter((t) => t !== tag) });
     } else {
       setNewNote({ ...newNote, tags: newNote.tags.filter((t) => t !== tag) });
+    }
+  };
+
+  const refreshSelectedNoteComments = async (noteId: string) => {
+    const comments = await api.getNoteComments(noteId);
+    setNoteComments(comments);
+  };
+
+  const handleSubmitComment = async () => {
+    if (!selectedNote?.id || !newCommentBody.trim() || !canCommentOnSelectedNote) return;
+
+    try {
+      setSubmittingComment(true);
+      setNoteCommentsError(null);
+      await api.createNoteComment(selectedNote.id, newCommentBody.trim());
+      setNewCommentBody('');
+      await refreshSelectedNoteComments(selectedNote.id);
+    } catch (err) {
+      console.error('Create comment error:', err);
+      setNoteCommentsError('Failed to post your comment.');
+    } finally {
+      setSubmittingComment(false);
+    }
+  };
+
+  const handleReplyToggle = (commentId: string) => {
+    setActiveReplyId((current) => (current === commentId ? null : commentId));
+  };
+
+  const handleReplyDraftChange = (commentId: string, value: string) => {
+    setReplyDrafts((current) => ({ ...current, [commentId]: value }));
+  };
+
+  const handleSubmitReply = async (commentId: string) => {
+    if (!selectedNote?.id || !canCommentOnSelectedNote) return;
+    const body = (replyDrafts[commentId] || '').trim();
+    if (!body) return;
+
+    try {
+      setSubmittingComment(true);
+      setNoteCommentsError(null);
+      await api.createNoteReply(selectedNote.id, commentId, body);
+      setReplyDrafts((current) => ({ ...current, [commentId]: '' }));
+      setActiveReplyId(null);
+      await refreshSelectedNoteComments(selectedNote.id);
+    } catch (err) {
+      console.error('Create reply error:', err);
+      setNoteCommentsError('Failed to post your reply.');
+    } finally {
+      setSubmittingComment(false);
+    }
+  };
+
+  const handleToggleReaction = async (commentId: string, emoji: string) => {
+    if (!selectedNote?.id || !canCommentOnSelectedNote) return;
+    const reactionKey = `${commentId}:${emoji}`;
+
+    try {
+      setPendingReactionKey(reactionKey);
+      setNoteCommentsError(null);
+      await api.toggleNoteCommentReaction(selectedNote.id, commentId, emoji);
+      await refreshSelectedNoteComments(selectedNote.id);
+    } catch (err) {
+      console.error('Toggle comment reaction error:', err);
+      setNoteCommentsError('Failed to update the reaction.');
+    } finally {
+      setPendingReactionKey(null);
+    }
+  };
+
+  const handleToggleResolution = async (commentId: string, resolved: boolean) => {
+    if (!selectedNote?.id || !canResolveSelectedNote) return;
+
+    try {
+      setPendingResolveId(commentId);
+      setNoteCommentsError(null);
+      if (resolved) {
+        await api.resolveNoteComment(selectedNote.id, commentId);
+      } else {
+        await api.unresolveNoteComment(selectedNote.id, commentId);
+      }
+      await refreshSelectedNoteComments(selectedNote.id);
+    } catch (err) {
+      console.error('Toggle comment resolution error:', err);
+      setNoteCommentsError('Failed to update the comment status.');
+    } finally {
+      setPendingResolveId(null);
     }
   };
 
@@ -2048,6 +2522,144 @@ export function NotesView({
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            )}
+
+            {selectedNote && (
+              <div style={{ background: 'rgba(245,230,66,0.05)', border: '1px solid rgba(245,230,66,0.15)', borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '12px 14px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                  <Users size={11} color={TT.yolk} />
+                  <span style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.yolk }}>
+                    Contributions
+                  </span>
+                </div>
+
+                {noteContributionsLoading ? (
+                  <p style={{ fontFamily: TT.fontMono, fontSize: 10.5, color: TT.inkMuted }}>
+                    Loading attribution…
+                  </p>
+                ) : noteContributions.length === 0 ? (
+                  <p style={{ fontFamily: TT.fontMono, fontSize: 10.5, color: TT.inkMuted }}>
+                    No tracked contributions yet.
+                  </p>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {noteContributions.map((entry) => {
+                      const displayName = entry.contributorName || entry.contributorEmail || 'Unknown contributor';
+                      const breakdownParts = [
+                        entry.breakdown.noteCreated ? `${entry.breakdown.noteCreated} created` : null,
+                        entry.breakdown.noteUpdated ? `${entry.breakdown.noteUpdated} updated` : null,
+                        entry.breakdown.noteRestored ? `${entry.breakdown.noteRestored} restored` : null,
+                        entry.breakdown.thinkingContributions ? `${entry.breakdown.thinkingContributions} thinking` : null,
+                        entry.breakdown.votesCast ? `${entry.breakdown.votesCast} votes` : null,
+                      ].filter(Boolean);
+
+                      return (
+                        <div key={entry.contributorUserId} style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, borderTop: `1px solid ${TT.inkBorder}`, paddingTop: 8 }}>
+                          <div>
+                            <p style={{ fontFamily: TT.fontMono, fontSize: 10.5, color: TT.snow }}>
+                              {displayName}
+                            </p>
+                            <p style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, lineHeight: 1.6 }}>
+                              {breakdownParts.join(' • ') || 'Contribution tracked'}
+                            </p>
+                          </div>
+                          <div style={{ textAlign: 'right' }}>
+                            <p style={{ fontFamily: TT.fontDisplay, fontSize: 18, color: TT.yolk, lineHeight: 1 }}>
+                              {entry.contributionCount}
+                            </p>
+                            <p style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: TT.inkMuted, textTransform: 'uppercase' }}>
+                              {entry.lastContributionAt ? safeFromNow(entry.lastContributionAt) : 'tracked'}
+                            </p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {selectedNote && (
+              <div style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '14px 16px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                      <MessageSquare size={11} color={TT.yolk} />
+                      <span style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.yolk }}>
+                        Discussion
+                      </span>
+                    </div>
+                    <p style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.55 }}>
+                      Comments stay attached to this note, support nested replies, and resolve typed @mentions against workspace members on the server.
+                    </p>
+                  </div>
+                  <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, textTransform: 'uppercase' }}>
+                    {noteComments.length} thread{noteComments.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+
+                {canCommentOnSelectedNote ? (
+                  <CommentComposer
+                    value={newCommentBody}
+                    onChange={setNewCommentBody}
+                    onSubmit={handleSubmitComment}
+                    disabled={!newCommentBody.trim() || submittingComment}
+                    submitLabel={submittingComment ? 'Posting' : 'Comment'}
+                    placeholder="Add context, ask a question, or mention a teammate with @name or @email."
+                    helperText={
+                      selectedNoteWorkspaceMembers.length > 0
+                        ? `Mentions resolve against workspace members like ${selectedNoteWorkspaceMembers
+                            .slice(0, 3)
+                            .map((member: any) => getMentionExample(member))
+                            .filter(Boolean)
+                            .map((token: string) => `@${token}`)
+                            .filter(Boolean)
+                            .join(', ')}.`
+                        : 'Mentions are resolved server-side against workspace members to avoid tagging the wrong person.'
+                    }
+                  />
+                ) : (
+                  <div style={{ padding: '12px 14px', borderRadius: 3, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, color: TT.inkMuted, fontSize: 11.5 }}>
+                    You can view this note, but your current access does not allow participating in its discussion.
+                  </div>
+                )}
+
+                {noteCommentsError && (
+                  <div style={{ marginTop: 10, padding: '10px 12px', borderRadius: 3, background: TT.errorDim, border: '1px solid rgba(255,69,69,0.22)', color: '#FF9B9B', fontFamily: TT.fontMono, fontSize: 10.5 }}>
+                    {noteCommentsError}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 14 }}>
+                  {noteCommentsLoading ? (
+                    <div style={{ padding: '12px 14px', borderRadius: 3, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, color: TT.inkMuted, fontFamily: TT.fontMono, fontSize: 10.5 }}>
+                      Loading discussion…
+                    </div>
+                  ) : noteComments.length === 0 ? (
+                    <div style={{ padding: '12px 14px', borderRadius: 3, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, color: TT.inkMuted, fontSize: 11.5 }}>
+                      No comments yet. Start the thread with context, questions, or review notes for collaborators.
+                    </div>
+                  ) : (
+                    noteComments.map((comment) => (
+                      <CommentThreadNode
+                        key={comment.id}
+                        comment={comment}
+                        canInteract={canCommentOnSelectedNote && !submittingComment}
+                        canResolve={canResolveSelectedNote}
+                        activeReplyId={activeReplyId}
+                        replyBody={replyDrafts[activeReplyId || ''] || ''}
+                        pendingReactionKey={pendingReactionKey}
+                        pendingResolveId={pendingResolveId}
+                        onReplyToggle={handleReplyToggle}
+                        onReplyBodyChange={handleReplyDraftChange}
+                        onReplySubmit={handleSubmitReply}
+                        onReactionToggle={handleToggleReaction}
+                        onResolutionToggle={handleToggleResolution}
+                      />
+                    ))
+                  )}
                 </div>
               </div>
             )}

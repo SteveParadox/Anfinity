@@ -1,390 +1,601 @@
-import { useState } from 'react';
-import { motion } from 'framer-motion';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { useCallback, useContext, useEffect, useMemo, useState, type ComponentType } from 'react';
+import { format, formatDistanceToNow } from 'date-fns';
 import {
-  Zap, Plus, Edit2, Trash2, Clock, FileText, Bell,
-  Webhook, Brain, ArrowRight, CheckCircle2,
+  AlertTriangle,
+  CheckCircle2,
+  CircleDot,
+  Clock3,
+  Loader2,
+  RefreshCw,
+  Send,
+  ShieldCheck,
+  XCircle,
 } from 'lucide-react';
-import type { Workflow } from '@/types';
 
-const TT = {
-  inkBlack:  '#0A0A0A',
-  inkDeep:   '#111111',
-  inkRaised: '#1A1A1A',
-  inkBorder: '#252525',
-  inkMid:    '#3A3A3A',
-  inkMuted:  '#5A5A5A',
-  inkSubtle: '#888888',
-  snow:      '#F5F5F5',
-  yolk:      '#F5E642',
-  yolkBright:'#FFF176',
-  error:     '#FF4545',
-  fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif",
-  fontMono:    "'IBM Plex Mono', monospace",
-  fontBody:    "'IBM Plex Sans', sans-serif",
-};
+import { ApprovalPriorityBadge } from '@/components/approvals/ApprovalPriorityBadge';
+import { ApprovalReviewDialog } from '@/components/approvals/ApprovalReviewDialog';
+import { ApprovalStatusBadge } from '@/components/approvals/ApprovalStatusBadge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from '@/components/ui/empty';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { AuthContext } from '@/contexts/AuthContext';
+import { api } from '@/lib/api';
+import type {
+  ApprovalWorkflowItem,
+  ApprovalWorkflowPriority,
+  ApprovalWorkflowStatus,
+  ApprovalWorkflowSummary,
+} from '@/types';
 
-const mockWorkflows: Workflow[] = [
-  {
-    id: 'wf-1',
-    name: 'Auto-summarize Daily Notes',
-    trigger: { type: 'scheduled', config: { cron: '0 18 * * *' } },
-    actions: [
-      { type: 'ai-summarize', config: {} },
-      { type: 'send-notification', config: { channel: 'email' } },
-    ],
-    isActive: true,
-    createdAt: new Date('2025-02-10'),
-  },
-  {
-    id: 'wf-2',
-    name: 'New Note to Slack',
-    trigger: { type: 'note-created', config: { workspace: 'ws-1' } },
-    actions: [{ type: 'webhook', config: { url: 'https://hooks.slack.com/...' } }],
-    isActive: true,
-    createdAt: new Date('2025-02-12'),
-  },
-  {
-    id: 'wf-3',
-    name: 'Weekly Knowledge Report',
-    trigger: { type: 'scheduled', config: { cron: '0 9 * * 1' } },
-    actions: [
-      { type: 'export', config: { format: 'pdf' } },
-      { type: 'send-notification', config: { channel: 'email' } },
-    ],
-    isActive: false,
-    createdAt: new Date('2025-02-14'),
-  },
+
+type TabValue = 'all' | ApprovalWorkflowStatus;
+type DialogMode = 'submit' | 'resubmit' | 'reject' | 'request_changes';
+
+const TAB_ORDER: TabValue[] = [
+  'all',
+  'submitted',
+  'needs_changes',
+  'draft',
+  'approved',
+  'rejected',
+  'cancelled',
 ];
 
-const triggerIcons: Record<string, React.ElementType> = {
-  'note-created': FileText,
-  'tag-added':    CheckCircle2,
-  'scheduled':    Clock,
-  'webhook':      Webhook,
+const TAB_LABELS: Record<TabValue, string> = {
+  all: 'All',
+  draft: 'Draft',
+  submitted: 'Submitted',
+  needs_changes: 'Needs Changes',
+  approved: 'Approved',
+  rejected: 'Rejected',
+  cancelled: 'Cancelled',
 };
 
-const actionIcons: Record<string, React.ElementType> = {
-  'send-notification': Bell,
-  'create-task':       CheckCircle2,
-  'export':            FileText,
-  'webhook':           Webhook,
-  'ai-summarize':      Brain,
-};
 
-const templates = [
-  { name: 'Daily Summary', description: 'Get AI summaries of your daily notes', Icon: Brain    },
-  { name: 'Team Sync',     description: 'Share new notes with your team on Slack', Icon: Bell  },
-  { name: 'Weekly Export', description: 'Export your knowledge base weekly',    Icon: FileText },
-];
-
-/* Toggle switch — pure CSS, no Switch component */
-function TTToggle({ checked, onChange }: { checked: boolean; onChange: () => void }) {
-  return (
-    <button
-      onClick={onChange}
-      style={{
-        width: 36, height: 20,
-        borderRadius: 10,
-        background: checked ? TT.yolk : TT.inkMid,
-        border: 'none',
-        cursor: 'pointer',
-        position: 'relative',
-        transition: 'background 0.2s',
-        flexShrink: 0,
-      }}
-    >
-      <span
-        style={{
-          position: 'absolute',
-          top: 2, left: checked ? 18 : 2,
-          width: 16, height: 16,
-          borderRadius: '50%',
-          background: checked ? TT.inkBlack : TT.inkMuted,
-          transition: 'left 0.2s',
-        }}
-      />
-    </button>
-  );
+function buildEmptySummary(): ApprovalWorkflowSummary {
+  return {
+    countsByStatus: {
+      draft: 0,
+      submitted: 0,
+      needs_changes: 0,
+      approved: 0,
+      rejected: 0,
+      cancelled: 0,
+    },
+    total: 0,
+    overdue: 0,
+  };
 }
 
-function SmallBtn({ onClick, danger, children }: { onClick?: () => void; danger?: boolean; children: React.ReactNode }) {
+function formatDueDate(value?: Date, overdue?: boolean): string {
+  if (!value) return 'No due date';
+  const label = format(value, 'MMM d, yyyy');
+  return overdue ? `${label} - overdue` : label;
+}
+
+function formatRelativeDate(value?: Date): string {
+  if (!value) return 'Not set';
+  return formatDistanceToNow(value, { addSuffix: true });
+}
+
+function DashboardStat({
+  label,
+  value,
+  icon: Icon,
+  accentClass,
+}: {
+  label: string;
+  value: string | number;
+  icon: ComponentType<{ className?: string }>;
+  accentClass: string;
+}) {
   return (
-    <button
-      onClick={onClick}
-      className="wf-action"
-      style={{
-        background: 'none', border: `1px solid ${TT.inkBorder}`,
-        borderRadius: 2, cursor: 'pointer', padding: '4px 6px',
-        color: TT.inkMuted, display: 'flex', alignItems: 'center',
-        transition: 'all 0.15s', opacity: 0,
-      }}
-      onMouseEnter={(e) => {
-        (e.currentTarget as HTMLElement).style.color = danger ? TT.error : TT.yolk;
-        (e.currentTarget as HTMLElement).style.borderColor = danger ? 'rgba(255,69,69,0.3)' : 'rgba(245,230,66,0.3)';
-      }}
-      onMouseLeave={(e) => {
-        (e.currentTarget as HTMLElement).style.color = TT.inkMuted;
-        (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder;
-      }}
-    >
-      {children}
-    </button>
+    <Card className="border-zinc-800 bg-zinc-950">
+      <CardContent className="flex items-center justify-between px-6 py-5">
+        <div className="space-y-1">
+          <div className="text-2xl font-semibold text-zinc-50">{value}</div>
+          <div className="text-sm text-zinc-400">{label}</div>
+        </div>
+        <div className={`rounded-lg border p-2 ${accentClass}`}>
+          <Icon className="size-5" />
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
 export function WorkflowsView() {
-  const [workflows, setWorkflows] = useState<Workflow[]>(mockWorkflows);
-  const [isCreating, setIsCreating] = useState(false);
+  const authContext = useContext(AuthContext);
+  const currentWorkspaceId = authContext?.currentWorkspaceId ?? null;
+  const hasPermission = authContext?.hasPermission ?? (() => false);
+  const canViewDashboard = Boolean(
+    currentWorkspaceId && hasPermission(currentWorkspaceId, 'workflows', 'view'),
+  );
 
-  const toggleWorkflow = (id: string) =>
-    setWorkflows((prev) => prev.map((wf) => (wf.id === id ? { ...wf, isActive: !wf.isActive } : wf)));
+  const [selectedTab, setSelectedTab] = useState<TabValue>('submitted');
+  const [items, setItems] = useState<ApprovalWorkflowItem[]>([]);
+  const [summary, setSummary] = useState<ApprovalWorkflowSummary>(buildEmptySummary);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busyNoteId, setBusyNoteId] = useState<string | null>(null);
+  const [dialogState, setDialogState] = useState<{
+    mode: DialogMode;
+    item: ApprovalWorkflowItem;
+  } | null>(null);
 
-  const deleteWorkflow = (id: string) =>
-    setWorkflows((prev) => prev.filter((wf) => wf.id !== id));
+  const loadData = useCallback(async () => {
+    if (!currentWorkspaceId || !canViewDashboard) {
+      setItems([]);
+      setSummary(buildEmptySummary());
+      return;
+    }
 
-  const stats = [
-    { label: 'Total',       value: workflows.length                            },
-    { label: 'Active',      value: workflows.filter((w) => w.isActive).length  },
-    { label: 'Runs / mo',   value: '1,247'                                     },
-    { label: 'Success',     value: '98.5%'                                     },
-  ];
+    try {
+      setLoading(true);
+      setError(null);
+      const [summaryResult, itemsResult] = await Promise.all([
+        api.getApprovalWorkflowSummary(currentWorkspaceId),
+        api.listApprovalWorkflows(currentWorkspaceId, {
+          status: selectedTab === 'all' ? undefined : selectedTab,
+          limit: 100,
+        }),
+      ]);
+      setSummary(summaryResult);
+      setItems(itemsResult);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to load approval workflows';
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  }, [canViewDashboard, currentWorkspaceId, selectedTab]);
+
+  useEffect(() => {
+    void loadData();
+  }, [loadData]);
+
+  const stats = useMemo(
+    () => [
+      {
+        label: 'Total Items',
+        value: summary.total,
+        icon: CircleDot,
+        accentClass: 'border-zinc-800 bg-zinc-900 text-zinc-200',
+      },
+      {
+        label: 'Awaiting Review',
+        value: summary.countsByStatus.submitted,
+        icon: ShieldCheck,
+        accentClass: 'border-amber-500/30 bg-amber-500/10 text-amber-300',
+      },
+      {
+        label: 'Needs Changes',
+        value: summary.countsByStatus.needs_changes,
+        icon: AlertTriangle,
+        accentClass: 'border-orange-500/30 bg-orange-500/10 text-orange-300',
+      },
+      {
+        label: 'Overdue',
+        value: summary.overdue,
+        icon: Clock3,
+        accentClass: 'border-rose-500/30 bg-rose-500/10 text-rose-300',
+      },
+    ],
+    [summary],
+  );
+
+  const handleRefresh = async () => {
+    await loadData();
+  };
+
+  const runAction = useCallback(
+    async (
+      item: ApprovalWorkflowItem,
+      action: () => Promise<ApprovalWorkflowItem>,
+    ): Promise<boolean> => {
+      try {
+        setBusyNoteId(item.noteId);
+        setError(null);
+        await action();
+        await loadData();
+        return true;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Workflow action failed';
+        setError(message);
+        try {
+          await loadData();
+        } catch {
+          // Keep the original action error visible when refresh also fails.
+        }
+        return false;
+      } finally {
+        setBusyNoteId(null);
+      }
+    },
+    [loadData],
+  );
+
+  const handleApprove = async (item: ApprovalWorkflowItem) => {
+    await runAction(item, () =>
+      api.approveApprovalWorkflow(item.noteId, {
+        currentStatus: item.approvalStatus,
+      }),
+    );
+  };
+
+  const handleCancel = async (item: ApprovalWorkflowItem) => {
+    await runAction(item, () =>
+      api.cancelApprovalWorkflow(item.noteId, {
+        currentStatus: item.approvalStatus,
+      }),
+    );
+  };
+
+  const openDialog = (mode: DialogMode, item: ApprovalWorkflowItem) => {
+    setDialogState({ mode, item });
+  };
+
+  const handleDialogConfirm = async (payload: {
+    comment?: string;
+    priority?: ApprovalWorkflowPriority;
+    dueAt?: Date | null;
+  }) => {
+    if (!dialogState) return;
+    const { item, mode } = dialogState;
+    const succeeded = await runAction(item, async () => {
+      if (mode === 'submit') {
+        return api.submitApprovalWorkflow(item.noteId, {
+          currentStatus: item.approvalStatus,
+          priority: payload.priority,
+          dueAt: payload.dueAt,
+          comment: payload.comment,
+        });
+      }
+      if (mode === 'resubmit') {
+        return api.resubmitApprovalWorkflow(item.noteId, {
+          currentStatus: item.approvalStatus,
+          priority: payload.priority,
+          dueAt: payload.dueAt,
+          comment: payload.comment,
+        });
+      }
+      if (mode === 'reject') {
+        return api.rejectApprovalWorkflow(item.noteId, {
+          currentStatus: item.approvalStatus,
+          comment: payload.comment || '',
+        });
+      }
+      return api.requestChangesApprovalWorkflow(item.noteId, {
+        currentStatus: item.approvalStatus,
+        comment: payload.comment || '',
+      });
+    });
+    if (succeeded) {
+      setDialogState(null);
+    }
+  };
+
+  if (!currentWorkspaceId) {
+    return (
+      <div className="min-h-screen bg-zinc-950 p-8">
+        <Empty className="border-zinc-800 bg-zinc-950 text-zinc-50">
+          <EmptyHeader>
+            <EmptyMedia variant="icon" className="bg-zinc-900 text-zinc-200">
+              <CircleDot />
+            </EmptyMedia>
+            <EmptyTitle>Select a workspace</EmptyTitle>
+            <EmptyDescription>
+              Approval workflows are scoped to a workspace. Pick one to load the dashboard.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      </div>
+    );
+  }
+
+  if (!canViewDashboard) {
+    return (
+      <div className="min-h-screen bg-zinc-950 p-8">
+        <Empty className="border-zinc-800 bg-zinc-950 text-zinc-50">
+          <EmptyHeader>
+            <EmptyMedia variant="icon" className="bg-zinc-900 text-zinc-200">
+              <ShieldCheck />
+            </EmptyMedia>
+            <EmptyTitle>You do not have workflow access</EmptyTitle>
+            <EmptyDescription>
+              Ask a workspace admin to grant `workflows:view` if you need access to the approvals dashboard.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ padding: 32, background: TT.inkBlack, minHeight: '100vh', fontFamily: TT.fontMono }}>
-
-      {/* ── CSS to reveal action buttons on card hover ─────────── */}
-      <style>{`
-        .wf-card:hover .wf-action { opacity: 1 !important; }
-      `}</style>
-
-      {/* ── Header ──────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 28, flexWrap: 'wrap', gap: 16 }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-            <span style={{ width: 4, height: 4, borderRadius: '50%', background: TT.yolk, display: 'inline-block', boxShadow: '0 0 6px rgba(245,230,66,0.8)' }} />
-            <span style={{ fontSize: 9.5, letterSpacing: '0.1em', textTransform: 'uppercase', color: TT.inkMuted }}>Automation</span>
-          </div>
-          <h1 style={{ fontFamily: TT.fontDisplay, fontSize: 44, letterSpacing: '0.04em', color: TT.snow, lineHeight: 0.9, textTransform: 'uppercase' }}>
-            <span style={{ color: TT.yolk }}>W</span>ORKFLOWS
-          </h1>
-          <div style={{ width: 36, height: 3, background: TT.yolk, marginTop: 10 }} />
-        </div>
-        <button
-          onClick={() => setIsCreating(true)}
-          style={{
-            height: 38, padding: '0 18px',
-            background: TT.yolk, border: `2px solid ${TT.yolk}`, borderRadius: 3,
-            color: TT.inkBlack, fontFamily: TT.fontDisplay, fontSize: 15,
-            letterSpacing: '0.1em', textTransform: 'uppercase',
-            cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, transition: 'all 0.15s',
-          }}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = TT.yolkBright; (e.currentTarget as HTMLElement).style.borderColor = TT.yolkBright; }}
-          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = TT.yolk; (e.currentTarget as HTMLElement).style.borderColor = TT.yolk; }}
-        >
-          <Plus size={13} /> Create Workflow
-        </button>
-      </div>
-
-      {/* ── Stats ───────────────────────────────────────────────── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 24 }}>
-        {stats.map(({ label, value }, i) => (
-          <div
-            key={label}
-            style={{
-              background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`,
-              borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '12px 16px',
-            }}
-          >
-            <div style={{ fontFamily: TT.fontDisplay, fontSize: 32, color: i === 1 ? TT.yolk : TT.snow, letterSpacing: '0.02em', lineHeight: 1 }}>{value}</div>
-            <div style={{ fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginTop: 3 }}>{label}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* ── Workflow list ────────────────────────────────────────── */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 32 }}>
-        {workflows.map((wf, index) => {
-          const TriggerIcon = triggerIcons[wf.trigger.type] ?? Zap;
-          return (
-            <motion.div
-              key={wf.id}
-              initial={{ opacity: 0, y: 14 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: index * 0.07 }}
-            >
-              <div
-                className="wf-card"
-                style={{
-                  background: TT.inkDeep,
-                  border: `1px solid ${TT.inkBorder}`,
-                  borderLeft: `3px solid ${wf.isActive ? TT.yolk : TT.inkBorder}`,
-                  borderRadius: 3,
-                  padding: '14px 16px',
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                  gap: 16, transition: 'border-color 0.15s',
-                }}
-              >
-                {/* Left: icon + info */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                  <div
-                    style={{
-                      width: 38, height: 38, borderRadius: 3,
-                      background: wf.isActive ? 'rgba(245,230,66,0.08)' : TT.inkRaised,
-                      border: `1px solid ${wf.isActive ? 'rgba(245,230,66,0.2)' : TT.inkBorder}`,
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      flexShrink: 0,
-                    }}
-                  >
-                    <Zap size={16} color={wf.isActive ? TT.yolk : TT.inkMuted} />
-                  </div>
-
-                  <div>
-                    {/* Name + status chip */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
-                      <span style={{ fontFamily: TT.fontMono, fontSize: 13, fontWeight: 500, color: TT.snow, letterSpacing: '0.02em' }}>
-                        {wf.name}
-                      </span>
-                      <span
-                        style={{
-                          fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.08em', textTransform: 'uppercase',
-                          padding: '1px 6px',
-                          background: wf.isActive ? 'rgba(245,230,66,0.08)' : TT.inkRaised,
-                          color: wf.isActive ? TT.yolk : TT.inkMuted,
-                          border: `1px solid ${wf.isActive ? 'rgba(245,230,66,0.2)' : TT.inkBorder}`,
-                          borderRadius: 2,
-                        }}
-                      >
-                        {wf.isActive ? 'Active' : 'Paused'}
-                      </span>
-                    </div>
-
-                    {/* Trigger → Actions pipeline */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 5, color: TT.inkMuted }}>
-                        <TriggerIcon size={11} />
-                        <span style={{ fontSize: 10, letterSpacing: '0.05em', textTransform: 'capitalize' }}>
-                          {wf.trigger.type.replace('-', ' ')}
-                        </span>
-                      </div>
-                      <ArrowRight size={10} color={TT.inkMid} />
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        {wf.actions.map((action, i) => {
-                          const ActionIcon = actionIcons[action.type] ?? Zap;
-                          return (
-                            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4, color: TT.inkMuted }}>
-                              <ActionIcon size={11} />
-                              <span style={{ fontSize: 10, letterSpacing: '0.04em', textTransform: 'capitalize' }}>
-                                {action.type.replace('-', ' ')}
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </div>
+    <div className="min-h-screen bg-zinc-950 px-6 py-8 text-zinc-50 md:px-8">
+      <div className="mx-auto flex max-w-7xl flex-col gap-6">
+        <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+          <div className="space-y-2">
+            <div className="text-xs uppercase tracking-[0.22em] text-zinc-400">Approval Workflows</div>
+            <div className="flex items-center gap-3">
+              <h1 className="text-4xl font-semibold tracking-tight text-zinc-50">Reviews Dashboard</h1>
+              {summary.overdue > 0 ? (
+                <div className="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-1 text-xs font-medium text-rose-300">
+                  {summary.overdue} overdue
                 </div>
-
-                {/* Right: toggle + actions */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-                  <TTToggle checked={wf.isActive} onChange={() => toggleWorkflow(wf.id)} />
-                  <SmallBtn onClick={() => {}}><Edit2 size={11} /></SmallBtn>
-                  <SmallBtn danger onClick={() => deleteWorkflow(wf.id)}><Trash2 size={11} /></SmallBtn>
-                </div>
-              </div>
-            </motion.div>
-          );
-        })}
-      </div>
-
-      {/* ── Empty state ──────────────────────────────────────────── */}
-      {workflows.length === 0 && (
-        <div style={{ textAlign: 'center', padding: '60px 0' }}>
-          <div style={{ width: 56, height: 56, borderRadius: 3, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-            <Zap size={22} color={TT.inkMid} />
-          </div>
-          <div style={{ fontFamily: TT.fontDisplay, fontSize: 26, letterSpacing: '0.06em', color: TT.snow, marginBottom: 8 }}>
-            NO WORKFLOWS YET
-          </div>
-          <p style={{ fontSize: 10.5, letterSpacing: '0.05em', color: TT.inkMuted, textTransform: 'uppercase', marginBottom: 20 }}>
-            Automate your knowledge management
-          </p>
-          <button
-            onClick={() => setIsCreating(true)}
-            style={{ height: 38, padding: '0 18px', background: TT.yolk, border: `2px solid ${TT.yolk}`, borderRadius: 3, color: TT.inkBlack, fontFamily: TT.fontDisplay, fontSize: 15, letterSpacing: '0.1em', textTransform: 'uppercase', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }}
-          >
-            <Plus size={13} /> Create Workflow
-          </button>
-        </div>
-      )}
-
-      {/* ── Templates ───────────────────────────────────────────── */}
-      <div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-          <span style={{ width: 4, height: 4, borderRadius: '50%', background: TT.yolk, display: 'inline-block' }} />
-          <span style={{ fontSize: 9.5, letterSpacing: '0.1em', textTransform: 'uppercase', color: TT.inkMuted }}>Templates</span>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
-          {templates.map(({ name, description, Icon }) => (
-            <div
-              key={name}
-              onClick={() => setIsCreating(true)}
-              style={{
-                background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3,
-                padding: '16px', cursor: 'pointer', transition: 'border-color 0.15s, background 0.15s',
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLElement).style.borderColor = 'rgba(245,230,66,0.22)';
-                (e.currentTarget as HTMLElement).style.background = 'rgba(245,230,66,0.03)';
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder;
-                (e.currentTarget as HTMLElement).style.background = TT.inkDeep;
-              }}
-            >
-              <div style={{ width: 30, height: 30, borderRadius: 2, background: 'rgba(245,230,66,0.08)', border: '1px solid rgba(245,230,66,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 10 }}>
-                <Icon size={14} color={TT.yolk} />
-              </div>
-              <div style={{ fontFamily: TT.fontMono, fontSize: 12, color: TT.snow, marginBottom: 5, letterSpacing: '0.02em' }}>{name}</div>
-              <div style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.5 }}>{description}</div>
+              ) : null}
             </div>
+            <p className="max-w-3xl text-sm text-zinc-400">
+              Track every workspace note through draft, submission, review, and final decision with strict server-side transition checks.
+            </p>
+          </div>
+
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              void handleRefresh();
+            }}
+            disabled={loading}
+            className="border-zinc-800 bg-zinc-950 text-zinc-100 hover:bg-zinc-900"
+          >
+            {loading ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            Refresh
+          </Button>
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          {stats.map((stat) => (
+            <DashboardStat key={stat.label} {...stat} />
           ))}
         </div>
+
+        <Card className="border-zinc-800 bg-zinc-950">
+          <CardHeader className="gap-4 border-b border-zinc-800 pb-4">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <CardTitle className="text-zinc-50">Review Queue</CardTitle>
+                <CardDescription className="text-zinc-400">
+                  Filter by workflow state, then review items inline without leaving the dashboard.
+                </CardDescription>
+              </div>
+
+              <Tabs value={selectedTab} onValueChange={(value) => setSelectedTab(value as TabValue)}>
+                <TabsList className="h-auto flex-wrap gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2">
+                  {TAB_ORDER.map((tab) => {
+                    const count = tab === 'all'
+                      ? summary.total
+                      : summary.countsByStatus[tab];
+                    return (
+                      <TabsTrigger
+                        key={tab}
+                        value={tab}
+                        className="rounded-lg border border-transparent px-3 py-1.5 text-xs font-medium uppercase tracking-[0.14em] data-[state=active]:border-amber-400/40 data-[state=active]:bg-amber-500/10 data-[state=active]:text-amber-200"
+                      >
+                        {TAB_LABELS[tab]} ({count})
+                      </TabsTrigger>
+                    );
+                  })}
+                </TabsList>
+              </Tabs>
+            </div>
+          </CardHeader>
+
+          <CardContent className="space-y-4 px-6 py-6">
+            {error ? (
+              <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                {error}
+              </div>
+            ) : null}
+
+            {loading ? (
+              <div className="flex min-h-[240px] items-center justify-center rounded-lg border border-dashed border-zinc-800 bg-zinc-950">
+                <div className="flex items-center gap-3 text-sm text-zinc-400">
+                  <Loader2 className="size-4 animate-spin" />
+                  Loading approval items...
+                </div>
+              </div>
+            ) : items.length === 0 ? (
+              <Empty className="border-zinc-800 bg-zinc-950 text-zinc-50">
+                <EmptyHeader>
+                  <EmptyMedia variant="icon" className="bg-zinc-900 text-zinc-200">
+                    <Send />
+                  </EmptyMedia>
+                  <EmptyTitle>No {TAB_LABELS[selectedTab].toLowerCase()} items</EmptyTitle>
+                  <EmptyDescription>
+                    {selectedTab === 'draft'
+                      ? 'Draft notes will appear here when they are ready to be submitted for review.'
+                      : 'There are no items in this workflow state right now.'}
+                  </EmptyDescription>
+                </EmptyHeader>
+                <EmptyContent className="text-zinc-400">
+                  Use the draft tab to submit notes, or switch filters to inspect past decisions.
+                </EmptyContent>
+              </Empty>
+            ) : (
+              <div className="space-y-3">
+                {items.map((item) => {
+                  const isBusy = busyNoteId === item.noteId;
+                  return (
+                    <div
+                      key={item.noteId}
+                      className="grid gap-4 rounded-xl border border-zinc-800 bg-zinc-950 p-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_auto]"
+                    >
+                      <div className="space-y-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <ApprovalStatusBadge status={item.approvalStatus} />
+                          <ApprovalPriorityBadge priority={item.approvalPriority} />
+                          {item.isOverdue ? (
+                            <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2.5 py-0.5 text-xs font-medium text-rose-300">
+                              Overdue
+                            </span>
+                          ) : null}
+                        </div>
+
+                        <div className="space-y-1">
+                          <div className="text-lg font-semibold text-zinc-50">{item.title}</div>
+                          <div className="text-sm text-zinc-400">
+                            {item.summary?.trim() || 'No summary available yet.'}
+                          </div>
+                        </div>
+
+                        <div className="grid gap-2 text-sm text-zinc-400 sm:grid-cols-2">
+                          <div>
+                            <span className="text-zinc-500">Author:</span>{' '}
+                            {item.author?.name || item.author?.email || item.authorUserId}
+                          </div>
+                          <div>
+                            <span className="text-zinc-500">Submitted:</span>{' '}
+                            {formatRelativeDate(item.approvalSubmittedAt)}
+                          </div>
+                          <div>
+                            <span className="text-zinc-500">Due:</span>{' '}
+                            <span className={item.isOverdue ? 'text-rose-300' : 'text-zinc-300'}>
+                              {formatDueDate(item.approvalDueAt, item.isOverdue)}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-zinc-500">Last decision:</span>{' '}
+                            {item.approvalDecidedAt ? formatRelativeDate(item.approvalDecidedAt) : 'Pending'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid gap-2 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 text-sm text-zinc-400">
+                        <div>
+                          <div className="text-xs uppercase tracking-[0.14em] text-zinc-500">Submitted By</div>
+                          <div className="mt-1 text-zinc-200">
+                            {item.submittedBy?.name || item.submittedBy?.email || 'Not submitted'}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs uppercase tracking-[0.14em] text-zinc-500">Decided By</div>
+                          <div className="mt-1 text-zinc-200">
+                            {item.decidedBy?.name || item.decidedBy?.email || 'Awaiting review'}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs uppercase tracking-[0.14em] text-zinc-500">Due Date</div>
+                          <div className="mt-1 text-zinc-200">
+                            {item.approvalDueAt ? format(item.approvalDueAt, 'MMM d, yyyy') : 'Not set'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex min-w-[220px] flex-col gap-2">
+                        {item.availableActions.submit ? (
+                          <Button
+                            type="button"
+                            onClick={() => openDialog('submit', item)}
+                            disabled={isBusy}
+                            className="justify-start"
+                          >
+                            <Send className="size-4" />
+                            Submit for review
+                          </Button>
+                        ) : null}
+
+                        {item.availableActions.resubmit ? (
+                          <Button
+                            type="button"
+                            onClick={() => openDialog('resubmit', item)}
+                            disabled={isBusy}
+                            className="justify-start"
+                          >
+                            <RefreshCw className="size-4" />
+                            Resubmit
+                          </Button>
+                        ) : null}
+
+                        {item.availableActions.approve ? (
+                          <Button
+                            type="button"
+                            onClick={() => {
+                              void handleApprove(item);
+                            }}
+                            disabled={isBusy}
+                            className="justify-start bg-emerald-600 text-white hover:bg-emerald-500"
+                          >
+                            {isBusy ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
+                            Approve
+                          </Button>
+                        ) : null}
+
+                        {item.availableActions.request_changes ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => openDialog('request_changes', item)}
+                            disabled={isBusy}
+                            className="justify-start border-orange-500/30 bg-orange-500/10 text-orange-200 hover:bg-orange-500/20"
+                          >
+                            <AlertTriangle className="size-4" />
+                            Request changes
+                          </Button>
+                        ) : null}
+
+                        {item.availableActions.reject ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => openDialog('reject', item)}
+                            disabled={isBusy}
+                            className="justify-start border-rose-500/30 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20"
+                          >
+                            <XCircle className="size-4" />
+                            Reject
+                          </Button>
+                        ) : null}
+
+                        {item.availableActions.cancel ? (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            onClick={() => {
+                              void handleCancel(item);
+                            }}
+                            disabled={isBusy}
+                            className="justify-start text-zinc-300 hover:bg-zinc-900 hover:text-zinc-50"
+                          >
+                            {isBusy ? <Loader2 className="size-4 animate-spin" /> : <XCircle className="size-4" />}
+                            Cancel
+                          </Button>
+                        ) : null}
+
+                        {!Object.values(item.availableActions).some(Boolean) ? (
+                          <div className="rounded-lg border border-dashed border-zinc-800 px-3 py-4 text-sm text-zinc-500">
+                            No actions available in the current state.
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
-      {/* ── Create dialog ────────────────────────────────────────── */}
-      <Dialog open={isCreating} onOpenChange={setIsCreating}>
-        <DialogContent
-          style={{
-            background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`,
-            borderTop: `3px solid ${TT.yolk}`, borderRadius: 4,
-            maxWidth: 480, fontFamily: TT.fontMono, color: TT.snow,
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle style={{ fontFamily: TT.fontDisplay, fontSize: 28, letterSpacing: '0.06em', color: TT.snow }}>
-              <span style={{ color: TT.yolk }}>N</span>EW WORKFLOW
-            </DialogTitle>
-          </DialogHeader>
-          <div style={{ padding: '24px 0 8px', textAlign: 'center' }}>
-            <div style={{ width: 52, height: 52, borderRadius: 3, background: 'rgba(245,230,66,0.08)', border: '1px solid rgba(245,230,66,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-              <Zap size={22} color={TT.yolk} />
-            </div>
-            <div style={{ fontFamily: TT.fontDisplay, fontSize: 22, letterSpacing: '0.06em', color: TT.snow, marginBottom: 10 }}>COMING SOON</div>
-            <p style={{ fontFamily: TT.fontBody, fontSize: 13, color: TT.inkMuted, lineHeight: 1.65, maxWidth: 320, margin: '0 auto 24px' }}>
-              The workflow builder is being enhanced with AI capabilities. Stay tuned for the full release.
-            </p>
-            <button
-              onClick={() => setIsCreating(false)}
-              style={{ height: 38, padding: '0 24px', background: 'transparent', border: `1px solid ${TT.inkBorder}`, borderRadius: 3, color: TT.inkMuted, fontFamily: TT.fontDisplay, fontSize: 15, letterSpacing: '0.1em', textTransform: 'uppercase', cursor: 'pointer', transition: 'all 0.15s' }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'rgba(245,230,66,0.3)'; (e.currentTarget as HTMLElement).style.color = TT.yolk; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder; (e.currentTarget as HTMLElement).style.color = TT.inkMuted; }}
-            >
-              Got It
-            </button>
-          </div>
-        </DialogContent>
-      </Dialog>
+      <ApprovalReviewDialog
+        open={dialogState !== null}
+        onOpenChange={(open) => {
+          if (!open) setDialogState(null);
+        }}
+        mode={dialogState?.mode || 'submit'}
+        isSubmitting={Boolean(dialogState && busyNoteId === dialogState.item.noteId)}
+        initialPriority={dialogState?.item.approvalPriority}
+        initialDueAt={dialogState?.item.approvalDueAt}
+        onConfirm={handleDialogConfirm}
+      />
     </div>
   );
 }

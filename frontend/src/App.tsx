@@ -29,11 +29,13 @@ const NotesView = lazy(() => import('./sections/NotesView').then((module) => ({ 
 const SearchView = lazy(() => import('./sections/SearchView').then((module) => ({ default: module.SearchView })));
 const WorkspacesView = lazy(() => import('./sections/WorkspacesView').then((module) => ({ default: module.WorkspacesView })));
 const WorkflowsView = lazy(() => import('./sections/WorkflowsView').then((module) => ({ default: module.WorkflowsView })));
+const IntegrationsView = lazy(() => import('./sections/IntegrationsView').then((module) => ({ default: module.IntegrationsView })));
 const PricingView = lazy(() => import('./sections/PricingView').then((module) => ({ default: module.PricingView })));
 const DocumentUploadView = lazy(() => import('./sections/UploadView').then((module) => ({ default: module.DocumentUploadView })));
 const DocumentsView = lazy(() => import('./sections/DocumentsView').then((module) => ({ default: module.DocumentsView })));
 const AIInsightsPanel = lazy(() => import('./components/AIInsightsPanel').then((module) => ({ default: module.AIInsightsPanel })));
 const AskPastSelf = lazy(() => import('./components/chat/AskPastSelf').then((module) => ({ default: module.AskPastSelf })));
+const ThinkingSessionsView = lazy(() => import('./sections/ThinkingSessionsView').then((module) => ({ default: module.ThinkingSessionsView })));
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -42,7 +44,9 @@ type View =
   | 'notes'
   | 'graph'
   | 'search'
+  | 'thinking-sessions'
   | 'workspaces'
+  | 'integrations'
   | 'workflows'
   | 'pricing'
   | 'upload'
@@ -180,7 +184,9 @@ function App() {
   const canViewGraph = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'knowledge_graph', 'view'));
   const canUseSearch = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'search', 'view'));
   const canOpenWorkspaceScopedChat = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'chat', 'create'));
+  const canViewThinkingSessions = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'chat', 'view'));
   const canViewWorkflows = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'workflows', 'view'));
+  const canManageIntegrations = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'settings', 'view'));
   const availableViews = useMemo<View[]>(() => {
     const views: View[] = ['dashboard', 'workspaces', 'pricing'];
     if (canViewNotes) views.push('notes');
@@ -188,9 +194,11 @@ function App() {
     if (canCreateDocuments) views.push('upload');
     if (canViewGraph) views.push('graph');
     if (canUseSearch) views.push('search');
+    if (canViewThinkingSessions) views.push('thinking-sessions');
+    if (canManageIntegrations) views.push('integrations');
     if (canViewWorkflows) views.push('workflows');
     return views;
-  }, [canCreateDocuments, canUseSearch, canViewDocuments, canViewGraph, canViewNotes, canViewWorkflows]);
+  }, [canCreateDocuments, canManageIntegrations, canUseSearch, canViewDocuments, canViewGraph, canViewNotes, canViewThinkingSessions, canViewWorkflows]);
 
   useEffect(() => {
     if (!availableViews.includes(currentView)) {
@@ -215,7 +223,9 @@ function App() {
       notes:      <NotesView />,
       graph:      <KnowledgeGraphView />,
       search:     <SearchView />,
+      'thinking-sessions': <ThinkingSessionsView />,
       workspaces: <WorkspacesView user={contextUser} />,
+      integrations: <IntegrationsView />,
       workflows:  <WorkflowsView />,
       pricing:    <PricingView currentPlan={contextUser.plan ?? 'free'} />,
       upload:     <DocumentUploadView />,

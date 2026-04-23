@@ -4,18 +4,43 @@
  */
 
 import {
+  transformApprovalWorkflowItemFromAPI,
+  transformApprovalWorkflowSummaryFromAPI,
+  transformApprovalWorkflowTransitionFromAPI,
+  transformNoteCommentFromAPI,
+  transformNoteContributionFromAPI,
   transformNoteFromAPI,
   transformPaginatedNotes,
   transformPaginatedDocuments,
+  transformThinkingSessionAccessFromAPI,
+  transformThinkingSessionFromAPI,
+  transformThinkingSessionSummaryFromAPI,
+  transformUserNotificationFromAPI,
 } from './transformers';
 import type {
+  ApprovalWorkflowItem,
+  ApprovalWorkflowPriority,
+  ApprovalWorkflowStatus,
+  ApprovalWorkflowSummary,
+  ApprovalWorkflowTransition,
   KnowledgeGraph,
   KnowledgeGraphFilters,
   Note as AppNote,
   NoteAccess,
+  NoteComment,
+  NoteContribution,
   NoteConnectionSuggestion,
   NoteInvite,
   NoteVersion,
+  ThinkingSession,
+  ThinkingSessionAccess,
+  ThinkingSessionPhase,
+  ThinkingSessionSummary,
+  UserNotification,
+  Workflow,
+  WorkflowAction,
+  WorkflowCondition,
+  WorkflowTriggerType,
   WorkspacePermissions,
   WorkspacePermissionSection,
 } from '@/types';
@@ -40,6 +65,20 @@ function transformNoteInviteFromAPI(invite: any): NoteInvite {
     message: invite.message || undefined,
     createdAt: invite.created_at ? new Date(invite.created_at) : new Date(),
     updatedAt: invite.updated_at ? new Date(invite.updated_at) : new Date(),
+  };
+}
+
+function transformAutomationFromAPI(item: any): Workflow {
+  return {
+    id: item.id,
+    workspaceId: item.workspace_id || item.workspaceId,
+    name: item.name,
+    triggerType: item.trigger_type || item.triggerType,
+    conditions: item.conditions || [],
+    actions: item.actions || [],
+    isActive: Boolean(item.enabled ?? item.isActive),
+    createdAt: item.created_at ? new Date(item.created_at) : new Date(),
+    updatedAt: item.updated_at ? new Date(item.updated_at) : undefined,
   };
 }
 
@@ -715,6 +754,53 @@ class ApiClient {
     return transformNoteFromAPI(response);
   }
 
+  async getNoteComments(noteId: string): Promise<NoteComment[]> {
+    const response = await this.request<any[]>(`/notes/${noteId}/comments`);
+    return (response || []).map(transformNoteCommentFromAPI);
+  }
+
+  async createNoteComment(noteId: string, body: string): Promise<NoteComment> {
+    const response = await this.request<any>(`/notes/${noteId}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({ body }),
+    });
+    return transformNoteCommentFromAPI(response);
+  }
+
+  async createNoteReply(noteId: string, commentId: string, body: string): Promise<NoteComment> {
+    const response = await this.request<any>(`/notes/${noteId}/comments/${commentId}/replies`, {
+      method: 'POST',
+      body: JSON.stringify({ body }),
+    });
+    return transformNoteCommentFromAPI(response);
+  }
+
+  async toggleNoteCommentReaction(noteId: string, commentId: string, emoji: string): Promise<NoteComment> {
+    const response = await this.request<any>(`/notes/${noteId}/comments/${commentId}/reactions/${encodeURIComponent(emoji)}`, {
+      method: 'POST',
+    });
+    return transformNoteCommentFromAPI(response);
+  }
+
+  async resolveNoteComment(noteId: string, commentId: string): Promise<NoteComment> {
+    const response = await this.request<any>(`/notes/${noteId}/comments/${commentId}/resolve`, {
+      method: 'POST',
+    });
+    return transformNoteCommentFromAPI(response);
+  }
+
+  async unresolveNoteComment(noteId: string, commentId: string): Promise<NoteComment> {
+    const response = await this.request<any>(`/notes/${noteId}/comments/${commentId}/unresolve`, {
+      method: 'POST',
+    });
+    return transformNoteCommentFromAPI(response);
+  }
+
+  async getNoteContributions(noteId: string): Promise<NoteContribution[]> {
+    const response = await this.request<any[]>(`/notes/${noteId}/contributions`);
+    return (response || []).map(transformNoteContributionFromAPI);
+  }
+
   async getNoteAccess(noteId: string): Promise<NoteAccess> {
     const response: any = await this.request(`/notes/${noteId}/access`);
     return {
@@ -819,11 +905,14 @@ class ApiClient {
   async syncCollaborativeNoteContent(
     noteId: string,
     content: string,
-    options?: { signal?: AbortSignal }
+    options?: { signal?: AbortSignal; baseContent?: string }
   ): Promise<AppNote> {
     const response = await this.request(`/notes/${noteId}/collaboration`, {
       method: 'PATCH',
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({
+        content,
+        ...(options?.baseContent !== undefined ? { base_content: options.baseContent } : {}),
+      }),
       signal: options?.signal,
     });
     return transformNoteFromAPI(response);
@@ -963,6 +1052,57 @@ class ApiClient {
     return this.request(`/notes/${noteId}/connection-suggestions/${suggestionId}/dismiss`, {
       method: 'POST',
     });
+  }
+
+  // ==================== Live Thinking Sessions ====================
+
+  async createThinkingSession(payload: {
+    workspaceId: string;
+    title: string;
+    promptContext?: string;
+    noteId?: string | null;
+  }): Promise<ThinkingSession> {
+    const response = await this.request('/thinking-sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        workspace_id: payload.workspaceId,
+        title: payload.title,
+        prompt_context: payload.promptContext,
+        note_id: payload.noteId ?? undefined,
+      }),
+    });
+
+    return transformThinkingSessionFromAPI(response);
+  }
+
+  async listThinkingSessions(workspaceId: string): Promise<ThinkingSessionSummary[]> {
+    const response = await this.request<any[]>(`/thinking-sessions/workspace/${workspaceId}`);
+    return (response || []).map(transformThinkingSessionSummaryFromAPI);
+  }
+
+  async getThinkingSession(sessionId: string): Promise<ThinkingSession> {
+    const response = await this.request(`/thinking-sessions/${sessionId}`);
+    return transformThinkingSessionFromAPI(response);
+  }
+
+  async getThinkingSessionAccess(sessionId: string): Promise<ThinkingSessionAccess> {
+    const response = await this.request(`/thinking-sessions/${sessionId}/access`);
+    return transformThinkingSessionAccessFromAPI(response);
+  }
+
+  async transitionThinkingSession(
+    sessionId: string,
+    targetPhase: ThinkingSessionPhase,
+  ): Promise<{ session: ThinkingSession; synthesisRunId?: string | null }> {
+    const response: any = await this.request(`/thinking-sessions/${sessionId}/transitions`, {
+      method: 'POST',
+      body: JSON.stringify({ target_phase: targetPhase }),
+    });
+
+    return {
+      session: transformThinkingSessionFromAPI(response.session),
+      synthesisRunId: response.synthesis_run_id || response.synthesisRunId || null,
+    };
   }
 
   // ==================== Workspaces Endpoints ====================
@@ -1294,6 +1434,209 @@ class ApiClient {
     return this.request(`/answers/${workspaceId}/evaluation-metrics`);
   }
 
+  async getNotifications(limit: number = 50): Promise<UserNotification[]> {
+    const response = await this.request<any[]>(`/notifications?limit=${encodeURIComponent(String(limit))}`);
+    return (response || []).map(transformUserNotificationFromAPI);
+  }
+
+  async markNotificationRead(notificationId: string): Promise<UserNotification> {
+    const response = await this.request<any>(`/notifications/${notificationId}/read`, {
+      method: 'POST',
+    });
+    return transformUserNotificationFromAPI(response);
+  }
+
+  async listApprovalWorkflows(
+    workspaceId: string,
+    params?: {
+      status?: ApprovalWorkflowStatus;
+      limit?: number;
+    }
+  ): Promise<ApprovalWorkflowItem[]> {
+    const queryParams = new URLSearchParams({ workspace_id: workspaceId });
+    if (params?.status) queryParams.append('status', params.status);
+    if (params?.limit) queryParams.append('limit', String(params.limit));
+    const response = await this.request<any[]>(`/approval-workflows?${queryParams.toString()}`);
+    return (response || []).map(transformApprovalWorkflowItemFromAPI);
+  }
+
+  async getApprovalWorkflowSummary(workspaceId: string): Promise<ApprovalWorkflowSummary> {
+    const response = await this.request<any>(`/approval-workflows/summary?workspace_id=${encodeURIComponent(workspaceId)}`);
+    return transformApprovalWorkflowSummaryFromAPI(response);
+  }
+
+  async getApprovalWorkflowHistory(noteId: string): Promise<ApprovalWorkflowTransition[]> {
+    const response = await this.request<any[]>(`/approval-workflows/notes/${noteId}/history`);
+    return (response || []).map(transformApprovalWorkflowTransitionFromAPI);
+  }
+
+  async submitApprovalWorkflow(
+    noteId: string,
+    payload: {
+      currentStatus: ApprovalWorkflowStatus;
+      priority?: ApprovalWorkflowPriority;
+      dueAt?: Date | null;
+      comment?: string;
+    }
+  ): Promise<ApprovalWorkflowItem> {
+    const response = await this.request<any>(`/approval-workflows/notes/${noteId}/submit`, {
+      method: 'POST',
+      body: JSON.stringify({
+        current_status: payload.currentStatus,
+        priority: payload.priority,
+        due_at: payload.dueAt ? payload.dueAt.toISOString() : null,
+        comment: payload.comment,
+      }),
+    });
+    return transformApprovalWorkflowItemFromAPI(response);
+  }
+
+  async resubmitApprovalWorkflow(
+    noteId: string,
+    payload: {
+      currentStatus: ApprovalWorkflowStatus;
+      priority?: ApprovalWorkflowPriority;
+      dueAt?: Date | null;
+      comment?: string;
+    }
+  ): Promise<ApprovalWorkflowItem> {
+    const response = await this.request<any>(`/approval-workflows/notes/${noteId}/resubmit`, {
+      method: 'POST',
+      body: JSON.stringify({
+        current_status: payload.currentStatus,
+        priority: payload.priority,
+        due_at: payload.dueAt ? payload.dueAt.toISOString() : null,
+        comment: payload.comment,
+      }),
+    });
+    return transformApprovalWorkflowItemFromAPI(response);
+  }
+
+  async approveApprovalWorkflow(
+    noteId: string,
+    payload: {
+      currentStatus: ApprovalWorkflowStatus;
+      comment?: string;
+    }
+  ): Promise<ApprovalWorkflowItem> {
+    const response = await this.request<any>(`/approval-workflows/notes/${noteId}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({
+        current_status: payload.currentStatus,
+        comment: payload.comment,
+      }),
+    });
+    return transformApprovalWorkflowItemFromAPI(response);
+  }
+
+  async rejectApprovalWorkflow(
+    noteId: string,
+    payload: {
+      currentStatus: ApprovalWorkflowStatus;
+      comment: string;
+    }
+  ): Promise<ApprovalWorkflowItem> {
+    const response = await this.request<any>(`/approval-workflows/notes/${noteId}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({
+        current_status: payload.currentStatus,
+        comment: payload.comment,
+      }),
+    });
+    return transformApprovalWorkflowItemFromAPI(response);
+  }
+
+  async requestChangesApprovalWorkflow(
+    noteId: string,
+    payload: {
+      currentStatus: ApprovalWorkflowStatus;
+      comment: string;
+    }
+  ): Promise<ApprovalWorkflowItem> {
+    const response = await this.request<any>(`/approval-workflows/notes/${noteId}/request-changes`, {
+      method: 'POST',
+      body: JSON.stringify({
+        current_status: payload.currentStatus,
+        comment: payload.comment,
+      }),
+    });
+    return transformApprovalWorkflowItemFromAPI(response);
+  }
+
+  async cancelApprovalWorkflow(
+    noteId: string,
+    payload: {
+      currentStatus: ApprovalWorkflowStatus;
+      comment?: string;
+    }
+  ): Promise<ApprovalWorkflowItem> {
+    const response = await this.request<any>(`/approval-workflows/notes/${noteId}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({
+        current_status: payload.currentStatus,
+        comment: payload.comment,
+      }),
+    });
+    return transformApprovalWorkflowItemFromAPI(response);
+  }
+
+  // ==================== Trigger/Action Automations ====================
+
+  async listAutomations(workspaceId: string): Promise<Workflow[]> {
+    const response = await this.request<any[]>(`/automations?workspace_id=${encodeURIComponent(workspaceId)}`);
+    return (response || []).map(transformAutomationFromAPI);
+  }
+
+  async createAutomation(payload: {
+    workspaceId: string;
+    name: string;
+    triggerType: WorkflowTriggerType;
+    conditions?: WorkflowCondition[];
+    actions: WorkflowAction[];
+    enabled?: boolean;
+  }): Promise<Workflow> {
+    const response = await this.request<any>('/automations', {
+      method: 'POST',
+      body: JSON.stringify({
+        workspace_id: payload.workspaceId,
+        name: payload.name,
+        trigger_type: payload.triggerType,
+        conditions: payload.conditions || [],
+        actions: payload.actions,
+        enabled: payload.enabled ?? true,
+      }),
+    });
+    return transformAutomationFromAPI(response);
+  }
+
+  async updateAutomation(
+    automationId: string,
+    payload: Partial<{
+      name: string;
+      triggerType: WorkflowTriggerType;
+      conditions: WorkflowCondition[];
+      actions: WorkflowAction[];
+      enabled: boolean;
+    }>
+  ): Promise<Workflow> {
+    const body: Record<string, unknown> = {};
+    if (payload.name !== undefined) body.name = payload.name;
+    if (payload.triggerType !== undefined) body.trigger_type = payload.triggerType;
+    if (payload.conditions !== undefined) body.conditions = payload.conditions;
+    if (payload.actions !== undefined) body.actions = payload.actions;
+    if (payload.enabled !== undefined) body.enabled = payload.enabled;
+
+    const response = await this.request<any>(`/automations/${automationId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    });
+    return transformAutomationFromAPI(response);
+  }
+
+  async deleteAutomation(automationId: string): Promise<void> {
+    await this.request(`/automations/${automationId}`, { method: 'DELETE' });
+  }
+
   // ==================== Workspace Member Endpoints ====================
 
   async getWorkspaceMembers(workspaceId: string): Promise<Array<{
@@ -1322,12 +1665,103 @@ class ApiClient {
     workspace_id: string;
     connector_type: string;
     access_token: string;
+    refresh_token?: string;
     config?: Record<string, any>;
   }): Promise<any> {
     return this.request('/connectors', {
       method: 'POST',
       body: JSON.stringify(connector),
     });
+  }
+
+  async listIntegrationProviders(): Promise<Array<{
+    provider: string;
+    label: string;
+    required_scopes: string[];
+    capabilities: string[];
+  }>> {
+    return this.request('/connectors/providers');
+  }
+
+  async getIntegrationOAuthUrl(provider: string, workspaceId: string): Promise<{ authorization_url: string }> {
+    return this.request(
+      `/connectors/oauth/${encodeURIComponent(provider)}/authorize?workspace_id=${encodeURIComponent(workspaceId)}`
+    );
+  }
+
+  async listConnectors(workspaceId: string): Promise<{ connectors: any[] }> {
+    return this.request(`/connectors/workspace/${encodeURIComponent(workspaceId)}`);
+  }
+
+  async syncConnector(connectorId: string, workspaceId: string): Promise<any> {
+    return this.request(
+      `/connectors/${encodeURIComponent(connectorId)}/sync?workspace_id=${encodeURIComponent(workspaceId)}`,
+      { method: 'POST' }
+    );
+  }
+
+  async syncConnectorInline(connectorId: string, workspaceId: string): Promise<any> {
+    return this.request(
+      `/connectors/${encodeURIComponent(connectorId)}/sync?workspace_id=${encodeURIComponent(workspaceId)}&run_inline=true`,
+      { method: 'POST', timeout: 120000 }
+    );
+  }
+
+  async updateConnector(
+    connectorId: string,
+    workspaceId: string,
+    payload: {
+      config?: Record<string, any>;
+      is_active?: boolean;
+    }
+  ): Promise<any> {
+    return this.request(
+      `/connectors/${encodeURIComponent(connectorId)}?workspace_id=${encodeURIComponent(workspaceId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  async deleteConnector(connectorId: string, workspaceId: string): Promise<void> {
+    await this.request(
+      `/connectors/${encodeURIComponent(connectorId)}?workspace_id=${encodeURIComponent(workspaceId)}`,
+      { method: 'DELETE' }
+    );
+  }
+
+  async listConnectorSyncItems(
+    connectorId: string,
+    workspaceId: string,
+    limit: number = 20
+  ): Promise<{ items: any[] }> {
+    return this.request(
+      `/connectors/${encodeURIComponent(connectorId)}/sync-items?workspace_id=${encodeURIComponent(workspaceId)}&limit=${encodeURIComponent(String(limit))}`
+    );
+  }
+
+  async postSlackMessage(
+    connectorId: string,
+    workspaceId: string,
+    payload: {
+      channel_id?: string;
+      channel?: string;
+      title: string;
+      body?: string;
+      message?: string;
+      context?: string[];
+      buttons?: Array<Record<string, any>>;
+      unfurl_links?: boolean;
+    }
+  ): Promise<any> {
+    return this.request(
+      `/connectors/${encodeURIComponent(connectorId)}/slack/post?workspace_id=${encodeURIComponent(workspaceId)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    );
   }
 }
 

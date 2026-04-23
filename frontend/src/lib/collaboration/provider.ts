@@ -14,6 +14,7 @@ import type {
   CursorState,
   SelectionState,
 } from "./protocol";
+import { parseCollaborationServerMessage } from "./protocol";
 import { getPartykitHost, getNoteRoomId } from "./noteRoom";
 
 type ProviderStatus = "idle" | "connecting" | "connected" | "disconnected";
@@ -47,23 +48,6 @@ function createEmptyTransientState() {
     remoteCursors: {} as Record<string, CursorState>,
     remoteSelections: {} as Record<string, SelectionState>,
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function parseServerMessage(rawMessage: string): CollaborationServerMessage | null {
-  try {
-    const parsed = JSON.parse(rawMessage) as unknown;
-    if (!isRecord(parsed) || typeof parsed.type !== "string" || !isRecord(parsed.payload)) {
-      return null;
-    }
-
-    return parsed as CollaborationServerMessage;
-  } catch {
-    return null;
-  }
 }
 
 function upsertCollaborator(
@@ -194,7 +178,7 @@ export function useNoteCollaborationSession({
         return;
       }
 
-      const message = parseServerMessage(event.data);
+      const message = parseCollaborationServerMessage(event.data);
       if (!message) {
         return;
       }

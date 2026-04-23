@@ -26,6 +26,13 @@ export interface Note {
   word_count?: number;
   embedding?: string;
   access?: NoteAccess;
+  approvalStatus?: ApprovalWorkflowStatus;
+  approvalPriority?: ApprovalWorkflowPriority;
+  approvalDueAt?: Date;
+  approvalSubmittedAt?: Date;
+  approvalSubmittedByUserId?: string;
+  approvalDecidedAt?: Date;
+  approvalDecidedByUserId?: string;
 }
 
 export interface NoteAccess {
@@ -52,6 +59,160 @@ export interface NoteInvite {
   message?: string;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface NoteContributionBreakdown {
+  noteCreated: number;
+  noteUpdated: number;
+  noteRestored: number;
+  thinkingContributions: number;
+  votesCast: number;
+}
+
+export interface NoteContribution {
+  noteId: string;
+  workspaceId?: string;
+  contributorUserId: string;
+  contributorName?: string;
+  contributorEmail?: string;
+  contributionCount: number;
+  breakdown: NoteContributionBreakdown;
+  firstContributionAt?: Date;
+  lastContributionAt?: Date;
+}
+
+export type NoteCommentReactionType =
+  | 'thumbs_up'
+  | 'heart'
+  | 'laugh'
+  | 'hooray'
+  | 'eyes'
+  | 'rocket';
+
+export interface NoteCommentUser {
+  id: string;
+  email: string;
+  name: string;
+}
+
+export interface NoteCommentMention {
+  id: string;
+  commentId: string;
+  mentionedUserId: string;
+  mentionToken: string;
+  startOffset: number;
+  endOffset: number;
+  user?: NoteCommentUser | null;
+}
+
+export interface NoteCommentReactionSummary {
+  emoji: NoteCommentReactionType;
+  emojiValue: string;
+  count: number;
+  reactedByCurrentUser: boolean;
+}
+
+export interface NoteComment {
+  id: string;
+  noteId: string;
+  authorUserId: string;
+  parentCommentId?: string;
+  depth: number;
+  body: string;
+  isResolved: boolean;
+  resolvedByUserId?: string;
+  resolvedAt?: Date;
+  createdAt?: Date;
+  updatedAt?: Date;
+  author?: NoteCommentUser | null;
+  resolvedBy?: NoteCommentUser | null;
+  mentions: NoteCommentMention[];
+  reactions: NoteCommentReactionSummary[];
+  replies: NoteComment[];
+}
+
+export type ApprovalWorkflowStatus =
+  | 'draft'
+  | 'submitted'
+  | 'needs_changes'
+  | 'approved'
+  | 'rejected'
+  | 'cancelled';
+
+export type ApprovalWorkflowPriority = 'low' | 'normal' | 'high' | 'critical';
+
+export interface ApprovalWorkflowAvailableActions {
+  submit: boolean;
+  resubmit: boolean;
+  cancel: boolean;
+  approve: boolean;
+  reject: boolean;
+  request_changes: boolean;
+}
+
+export interface ApprovalWorkflowItem {
+  noteId: string;
+  workspaceId?: string;
+  title: string;
+  summary?: string;
+  noteType: string;
+  authorUserId: string;
+  approvalStatus: ApprovalWorkflowStatus;
+  approvalPriority: ApprovalWorkflowPriority;
+  approvalDueAt?: Date;
+  approvalSubmittedAt?: Date;
+  approvalSubmittedByUserId?: string;
+  approvalDecidedAt?: Date;
+  approvalDecidedByUserId?: string;
+  isOverdue: boolean;
+  availableActions: ApprovalWorkflowAvailableActions;
+  author?: NoteCommentUser | null;
+  submittedBy?: NoteCommentUser | null;
+  decidedBy?: NoteCommentUser | null;
+}
+
+export interface ApprovalWorkflowSummary {
+  countsByStatus: Record<ApprovalWorkflowStatus, number>;
+  total: number;
+  overdue: number;
+}
+
+export interface ApprovalWorkflowTransition {
+  id: string;
+  noteId: string;
+  workspaceId?: string;
+  actorUserId?: string;
+  fromStatus: ApprovalWorkflowStatus;
+  toStatus: ApprovalWorkflowStatus;
+  comment?: string;
+  dueAtSnapshot?: Date;
+  prioritySnapshot: ApprovalWorkflowPriority;
+  createdAt?: Date;
+  actor?: NoteCommentUser | null;
+}
+
+export type UserNotificationType =
+  | 'automation'
+  | 'comment_mention'
+  | 'comment_reply'
+  | 'approval_submitted'
+  | 'approval_approved'
+  | 'approval_rejected'
+  | 'approval_needs_changes';
+
+export interface UserNotification {
+  id: string;
+  userId: string;
+  actorUserId?: string;
+  workspaceId?: string;
+  noteId?: string;
+  commentId?: string;
+  notificationType: UserNotificationType;
+  payload: Record<string, unknown>;
+  isRead: boolean;
+  readAt?: Date;
+  createdAt?: Date;
+  actor?: NoteCommentUser | null;
 }
 
 export type NoteConnectionSuggestionStatus = 'pending' | 'confirmed' | 'dismissed';
@@ -100,6 +261,139 @@ export interface NoteVersion {
   diffSegments: NoteVersionDiffSegment[];
   metadata: Record<string, unknown>;
   createdAt: Date;
+}
+
+export type ThinkingSessionPhase =
+  | 'waiting'
+  | 'gathering'
+  | 'synthesizing'
+  | 'refining'
+  | 'completed';
+
+export type ThinkingSynthesisStatus =
+  | 'pending'
+  | 'streaming'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface ThinkingParticipant {
+  id: string;
+  userId: string;
+  user?: {
+    id: string;
+    email: string;
+    name: string;
+  } | null;
+  joinedAt?: Date;
+  lastSeenAt?: Date;
+}
+
+export interface ThinkingContribution {
+  id: string;
+  sessionId: string;
+  authorUserId: string;
+  author?: {
+    id: string;
+    email: string;
+    name: string;
+  } | null;
+  content: string;
+  createdPhase: ThinkingSessionPhase;
+  voteCount: number;
+  voterUserIds: string[];
+  rank: number;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export interface ThinkingSynthesisRun {
+  id: string;
+  sessionId: string;
+  triggeredByUserId?: string;
+  triggeredBy?: {
+    id: string;
+    email: string;
+    name: string;
+  } | null;
+  status: ThinkingSynthesisStatus;
+  model: string;
+  contributionCount: number;
+  outputText: string;
+  errorMessage?: string | null;
+  startedAt?: Date;
+  completedAt?: Date;
+  failedAt?: Date;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export interface ThinkingSession {
+  id: string;
+  workspaceId: string;
+  noteId?: string | null;
+  roomId: string;
+  title: string;
+  promptContext?: string | null;
+  createdByUserId: string;
+  hostUserId: string;
+  creator?: {
+    id: string;
+    email: string;
+    name: string;
+  } | null;
+  host?: {
+    id: string;
+    email: string;
+    name: string;
+  } | null;
+  phase: ThinkingSessionPhase;
+  phaseEnteredAt?: Date;
+  waitingStartedAt?: Date;
+  gatheringStartedAt?: Date;
+  synthesizingStartedAt?: Date;
+  refiningStartedAt?: Date;
+  completedAt?: Date;
+  activeSynthesisRunId?: string | null;
+  synthesisOutput: string;
+  refinedOutput: string;
+  finalOutput: string;
+  lastRefinedByUserId?: string | null;
+  lastRefinedBy?: {
+    id: string;
+    email: string;
+    name: string;
+  } | null;
+  createdAt?: Date;
+  updatedAt?: Date;
+  participants: ThinkingParticipant[];
+  contributions: ThinkingContribution[];
+  synthesisRuns: ThinkingSynthesisRun[];
+  activeSynthesisRun?: ThinkingSynthesisRun | null;
+}
+
+export interface ThinkingSessionSummary {
+  id: string;
+  workspaceId: string;
+  noteId?: string | null;
+  roomId: string;
+  title: string;
+  phase: ThinkingSessionPhase;
+  hostUserId: string;
+  activeSynthesisRunId?: string | null;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+export interface ThinkingSessionAccess {
+  sessionId: string;
+  workspaceId: string;
+  roomId: string;
+  canView: boolean;
+  canParticipate: boolean;
+  canControl: boolean;
+  isHost: boolean;
+  phase: ThinkingSessionPhase;
 }
 
 export type GraphNodeType = 'workspace' | 'note' | 'entity' | 'tag';
@@ -285,19 +579,70 @@ export interface AIInsight {
 export interface Workflow {
   id: string;
   name: string;
-  trigger: WorkflowTrigger;
+  workspaceId: string;
+  triggerType: WorkflowTriggerType;
+  conditions: WorkflowCondition[];
   actions: WorkflowAction[];
   isActive: boolean;
   createdAt: Date;
+  updatedAt?: Date;
+}
+
+export type WorkflowTriggerType =
+  | 'note.created'
+  | 'note.updated'
+  | 'note.deleted'
+  | 'note.approval_submitted'
+  | 'note.approval_approved'
+  | 'note.approval_rejected'
+  | 'note.approval_needs_changes'
+  | 'document.completed'
+  | 'thinking_session.completed'
+  | 'webhook.received';
+
+export type WorkflowConditionOperator =
+  | 'equals'
+  | 'not_equals'
+  | 'contains'
+  | 'not_contains'
+  | 'matches_regex'
+  | 'greater_than'
+  | 'less_than'
+  | 'exists';
+
+export interface WorkflowCondition {
+  path?: string;
+  operator?: WorkflowConditionOperator;
+  value?: unknown;
+  all?: WorkflowCondition[];
+  any?: WorkflowCondition[];
+  not?: WorkflowCondition;
 }
 
 export interface WorkflowTrigger {
-  type: 'note-created' | 'tag-added' | 'scheduled' | 'webhook';
+  type: WorkflowTriggerType;
   config: Record<string, any>;
 }
 
+export type WorkflowActionType =
+  | 'send_notification'
+  | 'create_note'
+  | 'update_note'
+  | 'append_note_content'
+  | 'add_note_tags'
+  | 'remove_note_tags'
+  | 'set_note_type'
+  | 'link_notes'
+  | 'submit_for_approval'
+  | 'approve_note'
+  | 'reject_note'
+  | 'request_approval_changes'
+  | 'call_webhook'
+  | 'send_email';
+
 export interface WorkflowAction {
-  type: 'send-notification' | 'create-task' | 'export' | 'webhook' | 'ai-summarize';
+  id?: string;
+  type: WorkflowActionType;
   config: Record<string, any>;
 }
 

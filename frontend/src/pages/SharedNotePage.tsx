@@ -88,6 +88,7 @@ export function SharedNotePage() {
       try {
         setSyncState('saving');
         const response = await api.syncCollaborativeNoteContent(note.id, note.content, {
+          baseContent: lastPersistedContentRef.current,
           signal: controller.signal,
         });
         lastPersistedContentRef.current = response.content;
