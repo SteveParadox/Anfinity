@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.audit import AuditAction
 from app.database.models import NoteCollaborationRole, NoteInviteStatus
 from app.services import note_invites as service
 
@@ -35,7 +37,21 @@ class FakeDb:
     async def _execute(self, *_args, **_kwargs):
         if not self._results:
             raise AssertionError("Unexpected execute() call")
-        return FakeResult(self._results.pop(0))
+        result = self._results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return FakeResult(result)
+
+
+@pytest.mark.asyncio
+async def test_temporary_rls_bypass_does_not_mask_transaction_error():
+    db = FakeDb(None, None, SQLAlchemyError("transaction is aborted"))
+
+    with pytest.raises(RuntimeError, match="original failure"):
+        async with service.temporary_rls_bypass(db):
+            raise RuntimeError("original failure")
+
+    assert db.info["app_rls_bypass"] is False
 
 
 @pytest.mark.asyncio
@@ -121,3 +137,33 @@ async def test_accept_note_invite_creates_collaborator_for_pending_invite(monkey
     assert resolved_access is access
     db.add.assert_called_once()
     db.flush.assert_awaited_once()
+    pending_events = db.info.get("pending_audit_events") or []
+    assert len(pending_events) == 1
+    assert pending_events[0].action_type == AuditAction.NOTE_COLLABORATOR_INVITE_ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_revoke_note_invite_stages_audit_event():
+    invite = SimpleNamespace(
+        id="invite-1",
+        note_id="note-1",
+        invitee_user_id="user-2",
+        invitee_email="invitee@example.com",
+        status=NoteInviteStatus.PENDING,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        revoked_at=None,
+        updated_at=None,
+    )
+    db = FakeDb()
+
+    revoked_invite = await service.revoke_note_invite(
+        invite,
+        db,
+        actor_user_id="owner-1",
+        workspace_id="workspace-1",
+    )
+
+    assert revoked_invite.status == NoteInviteStatus.REVOKED
+    pending_events = db.info.get("pending_audit_events") or []
+    assert len(pending_events) == 1
+    assert pending_events[0].action_type == AuditAction.NOTE_COLLABORATOR_INVITE_REVOKED
