@@ -23,7 +23,7 @@ from app.database.models import (
     IngestionLog,
     SourceType,
 )
-from app.database.session import SyncSessionLocal
+from app.database.session import AsyncSessionLocal, SyncSessionLocal
 from app.events import (
     broadcast_ingestion_completed_sync,
     broadcast_ingestion_failed_sync,
@@ -867,17 +867,26 @@ def delete_document_vectors(self, document_id: str, workspace_id: str) -> dict:
         return {"status": "failed", "document_id": document_id, "error": str(exc)}
 
 
-@celery_app.task
-def sync_connector(connector_id: str) -> dict:
-    """Sync an external connector (stub)."""
+@celery_app.task(bind=True, max_retries=3)
+def sync_connector(self, connector_id: str) -> dict:
+    """Sync an external connector through the shared integrations orchestrator."""
     logger.info("🔌 [TASK START] sync_connector - Connector ID: %s", connector_id)
     try:
         logger.debug("🔄 [CONNECTOR] Starting sync for connector: %s", connector_id)
-        result = {"status": "success", "connector_id": connector_id, "message": "Sync started"}
+        import asyncio
+        from app.services.integrations.orchestrator import sync_connector as run_connector_sync
+
+        async def _run() -> dict:
+            async with AsyncSessionLocal() as db:
+                return dict(await run_connector_sync(db, UUID(connector_id)))
+
+        result = asyncio.run(_run())
         logger.info("✅ [TASK SUCCESS] sync_connector completed - Connector: %s", connector_id)
         return result
     except Exception as exc:
         logger.error("❌ [TASK ERROR] sync_connector failed - Connector: %s - Error: %s", connector_id, exc, exc_info=True)
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries))
         return {"status": "failed", "connector_id": connector_id, "error": str(exc)}
 
 
@@ -1431,7 +1440,11 @@ def sync_all_connectors() -> dict:
     from app.database.models import Connector
 
     with get_db_session() as db:
-        connectors = db.query(Connector).filter(Connector.is_active == 1).all()
+        connectors = (
+            db.query(Connector)
+            .filter(Connector.is_active == 1, Connector.connector_type.in_(["notion", "google"]))
+            .all()
+        )
         for connector in connectors:
             sync_connector.delay(str(connector.id))
         return {"status": "success", "connectors_queued": len(connectors)}
