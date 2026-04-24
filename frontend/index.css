@@ -1,0 +1,828 @@
+/* Bringing the flair: bold headlines with Bebas Neue, sleek code vibes with IBM Plex Mono, and smooth readability with IBM Plex Sans */
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Design Tokens ──────────────────────────────────────────────────────── */
+/*
+  PALETTE: "Tokyo Taxi"
+  ─────────────────────────────────────────────────────
+  --ink-black   : #0A0A0A  — near-pure black background
+  --ink-deep    : #111111  — slightly lifted surface (cards)
+  --ink-raised  : #1A1A1A  — elevated surfaces (inputs)
+  --ink-border  : #252525  — subtle border / separator
+  --ink-mid     : #3A3A3A  — muted borders
+  --ink-muted   : #5A5A5A  — muted text / placeholders
+  --ink-subtle  : #888888  — secondary text
+
+  --yolk        : #F5E642  — pastel yellow hero
+  --yolk-bright : #FFF176  — highlight / hover lift
+  --yolk-muted  : #C4B830  — pressed / shadow tone
+  --yolk-glow   : rgba(245,230,66,0.12) — ambient glow
+
+  --snow        : #F5F5F5  — primary text on dark
+  --error       : #FF4545  — error state
+  --error-dim   : rgba(255,69,69,0.08)
+  ─────────────────────────────────────────────────────
+*/
+
+@layer base {
+  :root {
+    /* Map to shadcn/Tailwind system for component compatibility */
+    --background: 0 0% 4%;           /* #0A0A0A */
+    --foreground: 0 0% 96%;          /* #F5F5F5 */
+    --card: 0 0% 7%;                 /* #111111 */
+    --card-foreground: 0 0% 96%;
+    --popover: 0 0% 7%;
+    --popover-foreground: 0 0% 96%;
+    --primary: 55 90% 61%;           /* #F5E642 yolk */
+    --primary-foreground: 0 0% 4%;   /* black text on yellow */
+    --secondary: 0 0% 10%;
+    --secondary-foreground: 0 0% 96%;
+    --muted: 0 0% 10%;
+    --muted-foreground: 0 0% 53%;    /* #888 */
+    --accent: 55 90% 61%;
+    --accent-foreground: 0 0% 4%;
+    --destructive: 0 100% 63%;       /* #FF4545 */
+    --destructive-foreground: 0 0% 96%;
+    --border: 0 0% 15%;              /* #252525 */
+    --input: 0 0% 10%;
+    --ring: 55 90% 61%;              /* focus ring = yellow */
+    --radius: 0.25rem;               /* tight radius — editorial feel */
+
+    /* Sidebar tokens */
+    --sidebar-background: 0 0% 7%;
+    --sidebar-foreground: 0 0% 96%;
+    --sidebar-primary: 55 90% 61%;
+    --sidebar-primary-foreground: 0 0% 4%;
+    --sidebar-accent: 0 0% 10%;
+    --sidebar-accent-foreground: 0 0% 96%;
+    --sidebar-border: 0 0% 15%;
+    --sidebar-ring: 55 90% 61%;
+
+    /* Raw palette values for custom components */
+    --yolk: #F5E642;
+    --yolk-bright: #FFF176;
+    --yolk-muted: #C4B830;
+    --yolk-glow: rgba(245, 230, 66, 0.10);
+    --yolk-glow-strong: rgba(245, 230, 66, 0.22);
+
+    --ink-black: #0A0A0A;
+    --ink-deep: #111111;
+    --ink-raised: #1A1A1A;
+    --ink-border: #252525;
+    --ink-mid: #3A3A3A;
+    --ink-muted: #5A5A5A;
+    --ink-subtle: #888888;
+
+    --snow: #F5F5F5;
+    --error: #FF4545;
+    --error-dim: rgba(255, 69, 69, 0.08);
+
+    /* Typography scale */
+    --font-display: 'Bebas Neue', 'Impact', sans-serif;
+    --font-body: 'IBM Plex Sans', 'Open Sans', sans-serif;
+    --font-mono: 'Fira Code', monospace;
+  }
+
+  /* No light mode variant — this design is dark-only by intent */
+  /* If light mode is required, swap ink/snow values here */
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Ensure consistent box model */
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+}
+
+/* ─── Auth Pages ─────────────────────────────────────────────────────────── */
+
+.login-root {
+  font-family: var(--font-body);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--ink-black);
+  background-image:
+    /* Noise grain overlay for richness */
+    url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.035'/%3E%3C/svg%3E"),
+    /* Subtle grid — narrower, editorial */
+    linear-gradient(rgba(245,230,66,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(245,230,66,0.02) 1px, transparent 1px);
+  background-size: 256px 256px, 32px 32px, 32px 32px;
+  padding: 1.5rem;
+  overflow: hidden;
+  position: relative;
+  cursor: default;
+}
+
+/* Ambient yellow glow — bottom-right origin point */
+.login-root::after {
+  content: '';
+  position: absolute;
+  width: 600px;
+  height: 600px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(245,230,66,0.07) 0%, transparent 65%);
+  bottom: -200px;
+  right: -150px;
+  pointer-events: none;
+}
+
+/* Top-left corner accent: a hard yellow bracket */
+.login-root::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 180px;
+  height: 180px;
+  border-top: 2px solid var(--yolk);
+  border-left: 2px solid var(--yolk);
+  opacity: 0.18;
+  pointer-events: none;
+}
+
+/* ─── Ambient Orbs — reimagined as stark yellow spots ─────────────────────── */
+
+/* We repurpose .orb classes for backward compat but redesign them */
+.orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.06;
+  pointer-events: none;
+  animation: orb-drift 16s ease-in-out infinite alternate;
+}
+
+.orb-1 {
+  width: 520px; height: 520px;
+  background: radial-gradient(circle, #F5E642, transparent 65%);
+  top: -180px; left: -180px;
+  animation-delay: 0s;
+}
+
+.orb-2 {
+  width: 360px; height: 360px;
+  background: radial-gradient(circle, #F5E642, transparent 65%);
+  bottom: -120px; right: -100px;
+  animation-delay: -6s;
+  opacity: 0.05;
+}
+
+.orb-3 {
+  display: none; /* Three orbs is one too many for this aesthetic */
+}
+
+@keyframes orb-drift {
+  from { transform: translate(0, 0) scale(1); }
+  to   { transform: translate(40px, 25px) scale(1.1); }
+}
+
+/* ─── Grid Overlay ───────────────────────────────────────────────────────── */
+
+/* grid-overlay class kept for HTML compatibility — handled in login-root bg */
+.grid-overlay {
+  display: none;
+}
+
+/* ─── Login Wrapper ──────────────────────────────────────────────────────── */
+
+.login-wrapper {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  width: 100%;
+  max-width: 880px;
+  min-height: 560px;
+  border-radius: 4px;           /* Near-flat corners — brutalist */
+  overflow: hidden;
+  /* Hard border instead of soft glow */
+  border: 1px solid var(--ink-border);
+  box-shadow:
+    0 0 0 1px rgba(245,230,66,0.06),           /* faint yellow halo */
+    0 32px 80px rgba(0, 0, 0, 0.75),
+    0 0 80px rgba(245,230,66,0.04);
+  animation: fade-up 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ─── Brand Panel ────────────────────────────────────────────────────────── */
+
+.brand-panel {
+  flex: 0 0 260px;
+  background-color: var(--ink-deep);
+  /* The signature: thick yellow left-border stripe */
+  border-left: 4px solid var(--yolk);
+  border-right: 1px solid var(--ink-border);
+  padding: 44px 32px 44px 36px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Top-right decorative chevron lines */
+.brand-panel::before {
+  content: '//';
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--yolk);
+  opacity: 0.15;
+  letter-spacing: -2px;
+  pointer-events: none;
+}
+
+/* Bottom yellow corner accent */
+.brand-panel::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 3px;
+  background: linear-gradient(90deg, var(--yolk) 0%, transparent 80%);
+  opacity: 0.3;
+}
+
+.brand-logo-mark {
+  width: 40px;
+  height: 40px;
+  border-radius: 3px;            /* editorial: almost square */
+  background-color: var(--yolk);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    0 0 0 1px rgba(245,230,66,0.3),
+    0 6px 20px rgba(245,230,66,0.2);
+  margin-bottom: 18px;
+  transition: box-shadow 0.2s, transform 0.2s;
+}
+
+.brand-logo-mark:hover {
+  box-shadow: 0 0 0 2px var(--yolk), 0 8px 28px rgba(245,230,66,0.3);
+  transform: scale(1.04);
+}
+
+/* SVG icon inside logo mark should be black */
+.brand-logo-mark svg,
+.brand-logo-mark * {
+  color: var(--ink-black) !important;
+  fill: var(--ink-black) !important;
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-size: 38px;
+  font-weight: 400;              /* Bebas Neue is inherently bold */
+  color: var(--snow);
+  letter-spacing: 0.03em;
+  line-height: 0.95;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+}
+
+/* Accent: first letter in yellow */
+.brand-name span,
+.brand-name::first-letter {
+  color: var(--yolk);
+}
+
+.brand-tagline {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-muted);
+  line-height: 1.7;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-left: 2px solid var(--ink-border);
+  padding-left: 10px;
+}
+
+.brand-features {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: auto;
+}
+
+.brand-feature {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--ink-raised);
+  border: 1px solid var(--ink-border);
+  border-radius: 3px;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.brand-feature:hover {
+  border-color: rgba(245,230,66,0.25);
+  background: rgba(245,230,66,0.04);
+}
+
+.brand-feature-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--yolk);
+  margin-top: 7px;
+  flex-shrink: 0;
+  box-shadow: 0 0 6px rgba(245,230,66,0.8);
+}
+
+.brand-feature-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-subtle);
+  line-height: 1.55;
+  letter-spacing: 0.01em;
+}
+
+.brand-footer-text {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--ink-muted);
+  line-height: 1.6;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* ─── Form Panel ─────────────────────────────────────────────────────────── */
+
+.form-panel {
+  flex: 1;
+  background-color: var(--ink-black);
+  padding: 52px 52px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  position: relative;
+}
+
+/* Decorative ">" prompt character — top right */
+.form-panel::before {
+  content: '_';
+  position: absolute;
+  top: 28px;
+  right: 36px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--yolk);
+  opacity: 0.35;
+  animation: cursor-blink 1.2s step-end infinite;
+  pointer-events: none;
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 0.35; }
+  50%       { opacity: 0; }
+}
+
+.form-heading {
+  font-family: var(--font-display);
+  font-size: 44px;
+  font-weight: 400;
+  color: var(--snow);
+  letter-spacing: 0.04em;
+  line-height: 0.9;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+/* Underline accent: short yellow bar below heading */
+.form-heading::after {
+  content: '';
+  display: block;
+  width: 36px;
+  height: 3px;
+  background: var(--yolk);
+  margin-top: 10px;
+  border-radius: 0;
+}
+
+.form-subheading {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  margin-top: 14px;
+  margin-bottom: 36px;
+  line-height: 1.6;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* ─── Field Groups ───────────────────────────────────────────────────────── */
+
+.field-group {
+  margin-bottom: 18px;
+}
+
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--ink-muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 7px;
+}
+
+/* Yellow dot chip before label */
+.field-label::before {
+  content: '';
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--yolk);
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.field-wrap {
+  position: relative;
+}
+
+.field-input {
+  width: 100%;
+  height: 46px;
+  background: var(--ink-raised);
+  border: 1px solid var(--ink-border);
+  border-radius: 3px;
+  color: var(--snow);
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  font-weight: 400;
+  padding: 0 14px;
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    background 0.15s ease;
+  letter-spacing: 0.02em;
+}
+
+.field-input::placeholder {
+  color: var(--ink-muted);
+  font-weight: 300;
+}
+
+.field-input:hover:not(:focus) {
+  border-color: var(--ink-mid);
+}
+
+.field-input:focus {
+  border-color: var(--yolk);
+  box-shadow:
+    0 0 0 3px var(--yolk-glow),
+    inset 0 1px 0 rgba(245,230,66,0.04);
+  background: rgba(245,230,66,0.02);
+}
+
+.field-input.error {
+  border-color: var(--error);
+  box-shadow: 0 0 0 3px var(--error-dim);
+}
+
+.field-error {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--error);
+  margin-top: 6px;
+  padding-left: 2px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  letter-spacing: 0.02em;
+}
+
+/* ─── Error Alert ────────────────────────────────────────────────────────── */
+
+.error-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: var(--error-dim);
+  border: 1px solid rgba(255, 69, 69, 0.25);
+  border-left: 3px solid var(--error);
+  border-radius: 3px;
+  padding: 12px 14px;
+  margin-bottom: 28px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #ff8080;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+}
+
+/* ─── Submit Button ──────────────────────────────────────────────────────── */
+
+.submit-btn {
+  width: 100%;
+  height: 50px;
+  border-radius: 3px;
+  background: var(--yolk);
+  border: 2px solid var(--yolk);
+  color: var(--ink-black);
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 400;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 28px;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.12s ease,
+    color 0.15s ease;
+  box-shadow: 0 4px 24px rgba(245,230,66,0.18);
+  position: relative;
+  overflow: hidden;
+}
+
+/* Shimmer sweep on hover */
+.submit-btn::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 60%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255,255,255,0.18) 50%,
+    transparent 100%
+  );
+  transform: skewX(-20deg);
+  transition: left 0.4s ease;
+  pointer-events: none;
+}
+
+.submit-btn:hover:not(:disabled)::before {
+  left: 160%;
+}
+
+.submit-btn:hover:not(:disabled) {
+  background: var(--yolk-bright);
+  border-color: var(--yolk-bright);
+  box-shadow:
+    0 6px 32px rgba(245,230,66,0.28),
+    0 0 0 1px rgba(245,230,66,0.35);
+  transform: translateY(-1px);
+}
+
+.submit-btn:active:not(:disabled) {
+  background: var(--yolk-muted);
+  border-color: var(--yolk-muted);
+  transform: translateY(1px);
+  box-shadow: 0 2px 12px rgba(245,230,66,0.1);
+}
+
+.submit-btn:disabled {
+  background: var(--ink-raised);
+  border-color: var(--ink-border);
+  color: var(--ink-muted);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* Loading spinner inside button — for :disabled + loading state */
+.submit-btn .btn-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--ink-muted);
+  border-top-color: var(--yolk);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ─── Divider ────────────────────────────────────────────────────────────── */
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 24px 0;
+}
+
+.divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--ink-border);
+}
+
+.divider-text {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--ink-muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* ─── Signup Row ─────────────────────────────────────────────────────────── */
+
+.signup-row {
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  letter-spacing: 0.03em;
+}
+
+.signup-link {
+  color: var(--yolk);
+  text-decoration: none;
+  font-weight: 500;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.signup-link:hover {
+  color: var(--yolk-bright);
+  border-bottom-color: var(--yolk-bright);
+}
+
+/* ─── Page Footer ────────────────────────────────────────────────────────── */
+
+.page-footer {
+  position: absolute;
+  bottom: 18px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--ink-border);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  z-index: 10;
+}
+
+/* ─── Responsive ─────────────────────────────────────────────────────────── */
+
+@media (max-width: 700px) {
+  .brand-panel {
+    display: none;
+  }
+
+  .form-panel {
+    padding: 44px 28px;
+    /* On mobile, reintroduce the left-stripe on the form panel */
+    border-left: 4px solid var(--yolk);
+  }
+
+  .login-wrapper {
+    max-width: 460px;
+    border-radius: 4px;
+  }
+
+  .form-heading {
+    font-size: 38px;
+  }
+}
+
+@media (max-width: 400px) {
+  .form-panel {
+    padding: 36px 20px;
+  }
+
+  .form-heading {
+    font-size: 32px;
+  }
+}
+
+/* ─── Entrance Animation ─────────────────────────────────────────────────── */
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ─── Utility: Focus-visible ring override ───────────────────────────────── */
+/* Ensures keyboard navigation shows yellow ring globally */
+
+:focus-visible {
+  outline: 2px solid var(--yolk);
+  outline-offset: 3px;
+}
+
+/* ─── Utility: Selection color ───────────────────────────────────────────── */
+
+::selection {
+  background: rgba(245,230,66,0.25);
+  color: var(--snow);
+}
+
+/* ─── Scrollbar (Webkit) ─────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--ink-black);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--ink-border);
+  border-radius: 0;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--yolk);
+}
+
+/* Collaboration editor */
+.anfinity-collaboration-editor {
+  min-height: 240px;
+  padding: 14px 16px;
+  color: var(--snow);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.75;
+  outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.anfinity-collaboration-editor .ProseMirror {
+  min-height: 210px;
+  outline: none;
+}
+
+.anfinity-collaboration-editor .ProseMirror p {
+  margin: 0 0 0.7rem;
+}
+
+.anfinity-collaboration-editor .ProseMirror p:last-child {
+  margin-bottom: 0;
+}
+
+.anfinity-collaboration-cursor {
+  position: relative;
+  margin-left: -1px;
+  margin-right: -1px;
+  border-left: 2px solid var(--yolk);
+  border-right: 0;
+  pointer-events: none;
+}
+
+.anfinity-collaboration-cursor__label {
+  position: absolute;
+  top: -1.5em;
+  left: -1px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  color: var(--ink-black);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.anfinity-collaboration-selection {
+  border-radius: 2px;
+}
