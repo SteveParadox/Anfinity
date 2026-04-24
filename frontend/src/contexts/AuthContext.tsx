@@ -13,6 +13,11 @@ export interface Workspace {
   id: string;
   name: string;
   role: WorkspaceRole;
+  description?: string;
+  member_count?: number;
+  members?: unknown[];
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface User {
@@ -141,6 +146,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
         id: String(workspace.id),
         name: String(workspace.name),
         role: (workspace.role || 'member') as WorkspaceRole,
+        description: typeof workspace.description === 'string' ? workspace.description : undefined,
+        member_count:
+          typeof workspace.member_count === 'number'
+            ? workspace.member_count
+            : typeof workspace.memberCount === 'number'
+              ? workspace.memberCount
+              : Array.isArray(workspace.members)
+                ? workspace.members.length
+                : undefined,
+        members: Array.isArray(workspace.members) ? workspace.members : [],
+        created_at: typeof workspace.created_at === 'string' ? workspace.created_at : undefined,
+        updated_at: typeof workspace.updated_at === 'string' ? workspace.updated_at : undefined,
       }));
   }, []);
 
