@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 
 from app.config import get_ollama_request_headers, settings
 from app.database.session import init_db
-from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions, notifications, approval_workflows, automations
+from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions, notifications, approval_workflows, automations, onboarding, competitive_intelligence
 from app.events import websocket_router
 from app.middleware.logging import RequestLoggingMiddleware
 
@@ -206,6 +206,7 @@ app.include_router(documents.router)
 app.include_router(notes.router)
 app.include_router(approval_workflows.router)
 app.include_router(automations.router)
+app.include_router(competitive_intelligence.router)
 app.include_router(notifications.router)
 app.include_router(conflicts.router)
 app.include_router(query.router)
@@ -219,6 +220,7 @@ app.include_router(connectors.router)
 app.include_router(ingestion.router)
 app.include_router(embeddings.router)
 app.include_router(search.router)  # Semantic search
+app.include_router(onboarding.router)  # Onboarding Accelerator
 app.include_router(capture.router)  # Content capture (URLs, code, data)
 app.include_router(dlq.router)  # Dead Letter Queue management
 app.include_router(monitoring.router)  # System monitoring

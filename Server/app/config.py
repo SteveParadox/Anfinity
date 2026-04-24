@@ -276,6 +276,8 @@ class Settings(BaseSettings):
     LLM_USE_FALLBACK: bool = True  # Enable fallback on provider errors
     THINKING_SESSION_SYNTHESIS_MODEL: str = "gpt-4o"
     THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS: int = 90
+    ONBOARDING_ACCELERATOR_MODEL: str = "gpt-4o"
+    ONBOARDING_ACCELERATOR_MAX_TOKENS: int = 2800
     GRAPH_CLUSTER_SYNC_TOKEN: Optional[str] = None
     
     # Embeddings
@@ -312,6 +314,16 @@ class Settings(BaseSettings):
     GOOGLE_REDIRECT_PATH: str = "/connectors/oauth/google/callback"
     GITHUB_CLIENT_ID: Optional[str] = None
     GITHUB_CLIENT_SECRET: Optional[str] = None
+
+    # Competitive Intelligence
+    COMPETITIVE_JINA_READER_BASE_URL: str = "https://r.jina.ai"
+    COMPETITIVE_JINA_TIMEOUT_SECONDS: int = 20
+    COMPETITIVE_JINA_MAX_RETRIES: int = 2
+    COMPETITIVE_ANALYSIS_MODEL: str = "gpt-4o-mini"
+    COMPETITIVE_HIGH_URGENCY_THRESHOLD: float = 0.75
+    COMPETITIVE_MEDIUM_URGENCY_THRESHOLD: float = 0.45
+    COMPETITIVE_MONITOR_INTERVAL_SECONDS: int = 3600
+    COMPETITIVE_SOURCE_LEASE_MINUTES: int = 10
     
     # Rate Limiting
     RATE_LIMIT_ENABLED: bool = True

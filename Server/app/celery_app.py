@@ -99,6 +99,7 @@ try:
     from app.tasks import note_embeddings as note_embeddings_tasks
     from app.tasks import note_summaries as note_summaries_tasks
     from app.tasks import connection_suggestions as connection_suggestions_tasks
+    from app.tasks import competitive_intelligence as competitive_intelligence_tasks
 except ImportError as e:
     import logging
     logger = logging.getLogger(__name__)
