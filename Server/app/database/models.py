@@ -108,6 +108,7 @@ class UserNotificationType(str, PyEnum):
     """Durable in-app notification types."""
 
     AUTOMATION = "automation"
+    NOTE_COMMENT = "note_comment"
     COMMENT_MENTION = "comment_mention"
     COMMENT_REPLY = "comment_reply"
     APPROVAL_SUBMITTED = "approval_submitted"
@@ -210,6 +211,7 @@ class Workspace(Base):
     documents = relationship("Document", back_populates="workspace")
     notes = relationship("Note", back_populates="workspace")
     automations = relationship("Automation", back_populates="workspace", cascade="all, delete-orphan")
+    competitive_sources = relationship("CompetitiveSource", back_populates="workspace", cascade="all, delete-orphan")
     thinking_sessions = relationship("ThinkingSession", back_populates="workspace", cascade="all, delete-orphan")
 
 
@@ -574,6 +576,117 @@ class IntegrationSyncItem(Base):
         Index("idx_integration_sync_items_provider_seen", "provider", "last_seen_at"),
         Index("idx_integration_sync_items_workspace_provider", "workspace_id", "provider", "external_type"),
         Index("idx_integration_sync_items_note_provider", "local_note_id", "provider"),
+    )
+
+
+class CompetitiveSource(Base):
+    """Workspace-scoped competitor page monitored for content changes."""
+
+    __tablename__ = "competitive_sources"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    name = Column(String(255), nullable=False)
+    url = Column(String(1000), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    check_interval_minutes = Column(Integer, nullable=False, default=1440)
+
+    last_content_hash = Column(String(64), nullable=True, index=True)
+    last_processed_hash = Column(String(64), nullable=True, index=True)
+    last_successful_fetch_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    last_changed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    last_error = Column(Text, nullable=True)
+
+    run_status = Column(String(50), nullable=False, default="idle", index=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True, index=True)
+    config = Column(JSONB, nullable=False, default=dict)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    workspace = relationship("Workspace", back_populates="competitive_sources")
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
+    snapshots = relationship("CompetitiveSnapshot", back_populates="source", cascade="all, delete-orphan")
+    analyses = relationship("CompetitiveAnalysis", back_populates="source", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "url", name="uq_competitive_sources_workspace_url"),
+        Index("idx_competitive_sources_due", "is_active", "last_checked_at"),
+        Index("idx_competitive_sources_workspace_active", "workspace_id", "is_active"),
+    )
+
+
+class CompetitiveSnapshot(Base):
+    """A single extraction attempt for a competitive source."""
+
+    __tablename__ = "competitive_snapshots"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id = Column(UUID(as_uuid=True), ForeignKey("competitive_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    url = Column(String(1000), nullable=False)
+    reader_url = Column(String(1500), nullable=True)
+    content_hash = Column(String(64), nullable=True, index=True)
+    extraction_status = Column(String(50), nullable=False, index=True)
+    is_changed = Column(Boolean, nullable=False, default=False, index=True)
+    normalized_content = Column(Text, nullable=True)
+    content_length = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    source = relationship("CompetitiveSource", back_populates="snapshots")
+    workspace = relationship("Workspace")
+
+    __table_args__ = (
+        Index("idx_competitive_snapshots_source_hash", "source_id", "content_hash"),
+        Index("idx_competitive_snapshots_source_created", "source_id", "created_at"),
+    )
+
+
+class CompetitiveAnalysis(Base):
+    """Structured strategic analysis for a changed competitive snapshot."""
+
+    __tablename__ = "competitive_analyses"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id = Column(UUID(as_uuid=True), ForeignKey("competitive_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    snapshot_id = Column(UUID(as_uuid=True), ForeignKey("competitive_snapshots.id", ondelete="CASCADE"), nullable=False, index=True)
+    previous_snapshot_id = Column(UUID(as_uuid=True), ForeignKey("competitive_snapshots.id", ondelete="SET NULL"), nullable=True, index=True)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    content_hash = Column(String(64), nullable=False, index=True)
+    previous_content_hash = Column(String(64), nullable=True, index=True)
+    diff_payload = Column(JSONB, nullable=False, default=dict)
+    analysis_payload = Column(JSONB, nullable=False, default=dict)
+    findings = Column(JSONB, nullable=False, default=list)
+    headline_summary = Column(Text, nullable=True)
+
+    overall_urgency = Column(Float, nullable=False, default=0.0, index=True)
+    urgency_label = Column(String(50), nullable=False, default="low", index=True)
+    should_trigger_immediate_workflow = Column(Boolean, nullable=False, default=False, index=True)
+    workflow_dispatch_status = Column(String(50), nullable=False, default="not_required", index=True)
+    slack_dispatch_status = Column(String(50), nullable=False, default="not_required", index=True)
+    alert_dedupe_key = Column(String(128), nullable=True, unique=True, index=True)
+
+    model_used = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    source = relationship("CompetitiveSource", back_populates="analyses")
+    snapshot = relationship("CompetitiveSnapshot", foreign_keys=[snapshot_id])
+    previous_snapshot = relationship("CompetitiveSnapshot", foreign_keys=[previous_snapshot_id])
+    workspace = relationship("Workspace")
+
+    __table_args__ = (
+        UniqueConstraint("source_id", "content_hash", name="uq_competitive_analyses_source_hash"),
+        Index("idx_competitive_analyses_workspace_created", "workspace_id", "created_at"),
+        Index("idx_competitive_analyses_source_urgency", "source_id", "overall_urgency"),
     )
 
 
