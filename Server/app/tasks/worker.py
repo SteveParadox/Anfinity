@@ -1419,9 +1419,18 @@ def setup_periodic_tasks(sender, **kwargs) -> None:
         cleanup_old_resolved_conflicts,
         run_conflict_detection_for_all_workspaces,
     )
+    from app.tasks.competitive_intelligence import (
+        competitive_monitor_interval_seconds,
+        run_competitive_intelligence_monitoring,
+    )
     import app.tasks.embeddings  # noqa: F401 – registers embedding tasks
 
     sender.add_periodic_task(3600.0, sync_all_connectors.s(), name="sync-all-connectors")
+    sender.add_periodic_task(
+        float(competitive_monitor_interval_seconds()),
+        run_competitive_intelligence_monitoring.s(),
+        name="competitive-intelligence-monitoring",
+    )
     sender.add_periodic_task(
         crontab(hour=2, minute=0),
         run_conflict_detection_for_all_workspaces.s(),
