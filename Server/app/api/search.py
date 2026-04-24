@@ -82,6 +82,11 @@ class SemanticSearchResultPayload(BaseModel):
     usage_score: float = Field(..., ge=0, le=1)
     final_score: float = Field(..., ge=0, le=1)
     highlight: str
+    highlights: List[Dict[str, Any]] = Field(default_factory=list)
+    matched_chunks: List[Dict[str, Any]] = Field(default_factory=list)
+    confidence: str = "low"
+    confidence_score: float = Field(default=0.0, ge=0, le=1)
+    match_summary: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SemanticSearchResponse(BaseModel):
@@ -122,7 +127,7 @@ def _build_cache_key(user_id: UUID, workspace_id: UUID, query: str, filters: Dic
         sort_keys=True,
         default=str,
     )
-    return f"search:v2:{hashlib.sha256(payload.encode()).hexdigest()}"
+    return f"search:v3:{hashlib.sha256(payload.encode()).hexdigest()}"
 
 
 async def _run_semantic_search(

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Backgrou
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database.session import bind_db_user_context, get_db
 from app.database.models import User as DBUser, Workspace, WorkspaceMember, WorkspaceRole
@@ -50,9 +50,23 @@ async def get_user_workspaces(user: DBUser, db: AsyncSession) -> List[dict]:
     Returns:
         List of workspace info with roles
     """
+    member_count_subquery = (
+        select(
+            WorkspaceMember.workspace_id.label("workspace_id"),
+            func.count(WorkspaceMember.id).label("member_count"),
+        )
+        .group_by(WorkspaceMember.workspace_id)
+        .subquery()
+    )
+
     result = await db.execute(
-        select(WorkspaceMember, Workspace)
+        select(
+            WorkspaceMember,
+            Workspace,
+            func.coalesce(member_count_subquery.c.member_count, 0).label("member_count"),
+        )
         .join(Workspace, Workspace.id == WorkspaceMember.workspace_id)
+        .outerjoin(member_count_subquery, member_count_subquery.c.workspace_id == Workspace.id)
         .where(WorkspaceMember.user_id == user.id)
         .order_by(Workspace.created_at.desc())
     )
@@ -60,7 +74,7 @@ async def get_user_workspaces(user: DBUser, db: AsyncSession) -> List[dict]:
     workspaces = []
     seen_workspace_ids: set[str] = set()
 
-    for member, ws in result.all():
+    for member, ws, member_count in result.all():
         workspace_id = str(ws.id)
         if workspace_id in seen_workspace_ids:
             continue
@@ -69,6 +83,7 @@ async def get_user_workspaces(user: DBUser, db: AsyncSession) -> List[dict]:
             "id": workspace_id,
             "name": ws.name,
             "role": member.role.value if isinstance(member.role, WorkspaceRole) else member.role,
+            "member_count": int(member_count or 0),
         })
 
     return workspaces
@@ -117,6 +132,7 @@ class WorkspaceInfo(BaseModel):
     id: str
     name: str
     role: str  # owner, admin, member, viewer
+    member_count: int = 0
 
 
 class UserWorkspacesResponse(BaseModel):
