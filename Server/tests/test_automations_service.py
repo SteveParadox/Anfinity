@@ -13,7 +13,7 @@ from app.services.automations import (
 
 
 def test_automation_registry_contract_counts() -> None:
-    assert len(SUPPORTED_TRIGGER_TYPES) == 10
+    assert len(SUPPORTED_TRIGGER_TYPES) == 11
     assert len(SUPPORTED_ACTION_TYPES) == 14
     assert SUPPORTED_CONDITION_OPERATORS == {
         "equals",
@@ -26,7 +26,8 @@ def test_automation_registry_contract_counts() -> None:
         "exists",
     }
     registry = automation_registry_payload()
-    assert len(registry["trigger_types"]) == 10
+    assert len(registry["trigger_types"]) == 11
+    assert "competitive_intelligence.urgent_finding" in registry["trigger_types"]
     assert len(registry["action_types"]) == 14
     assert set(registry["backend_action_types"]).isdisjoint(set(registry["http_action_types"]))
 

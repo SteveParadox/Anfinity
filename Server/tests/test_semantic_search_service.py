@@ -97,6 +97,7 @@ class _FakeDB:
 class SemanticSearchServiceTests(unittest.TestCase):
     def _load_semantic_search_module(self, postgres_service, retriever):
         fake_app = types.ModuleType("app")
+        fake_app.__path__ = []
 
         fake_database = types.ModuleType("app.database")
         fake_models = types.ModuleType("app.database.models")
@@ -106,6 +107,7 @@ class SemanticSearchServiceTests(unittest.TestCase):
         fake_database.models = fake_models
 
         fake_services = types.ModuleType("app.services")
+        fake_services.__path__ = []
 
         fake_embeddings = types.ModuleType("app.services.embeddings")
 
@@ -148,6 +150,22 @@ class SemanticSearchServiceTests(unittest.TestCase):
                 "app.services": fake_services,
             },
         )
+        fake_vector_db = types.ModuleType("app.services.vector_db")
+
+        def cosine_similarity(left, right):
+            return 0.0
+
+        fake_vector_db.cosine_similarity = cosine_similarity
+        search_highlights_module = _load_module(
+            "app.services.search_highlights",
+            "app/services/search_highlights.py",
+            {
+                "app": fake_app,
+                "app.services": fake_services,
+                "app.services.retrieval_relevance": relevance_module,
+                "app.services.vector_db": fake_vector_db,
+            },
+        )
 
         fake_sqlalchemy = types.ModuleType("sqlalchemy")
         fake_sqlalchemy.text = lambda sql: sql
@@ -168,6 +186,8 @@ class SemanticSearchServiceTests(unittest.TestCase):
                 "app.services.postgresql_search": fake_postgresql,
                 "app.services.rag_retriever": fake_rag,
                 "app.services.retrieval_relevance": relevance_module,
+                "app.services.vector_db": fake_vector_db,
+                "app.services.search_highlights": search_highlights_module,
                 "sqlalchemy": fake_sqlalchemy,
                 "sqlalchemy.ext": fake_sqlalchemy_ext,
                 "sqlalchemy.ext.asyncio": fake_sqlalchemy_ext_asyncio,
@@ -422,6 +442,220 @@ class SemanticSearchServiceTests(unittest.TestCase):
         self.assertEqual(len(execution.results), 1)
         self.assertEqual(execution.results[0].source_kind, "note")
         self.assertFalse(retriever.called)
+
+    def test_narrow_query_drops_whole_note_candidate_without_chunk_evidence(self):
+        workspace_id = uuid4()
+        user_id = uuid4()
+        note_id = uuid4()
+
+        class FakePostgresService:
+            async def hybrid_search(self, **kwargs):
+                return [
+                    {
+                        "note_id": str(note_id),
+                        "title": "Generic operations",
+                        "content": (
+                            "The workspace update covers team rituals, office planning, "
+                            "and weekly status report formatting."
+                        ),
+                        "note_type": "note",
+                        "created_at": "2026-04-01T00:00:00",
+                        "embedding_similarity": 0.92,
+                        "text_score": 0.0,
+                        "interaction_score": 0.9,
+                        "highlight": "The workspace update covers team rituals",
+                    }
+                ]
+
+        class FakeRetriever:
+            def retrieve(self, **kwargs):
+                return types.SimpleNamespace(chunks=[])
+
+        retriever = FakeRetriever()
+        module = self._load_semantic_search_module(FakePostgresService(), retriever)
+        service = module.SemanticSearchService(retriever, module.get_embedding_service())
+        db = _FakeDB(rows=[(note_id, ["operations"])])
+
+        execution = asyncio.run(
+            service.search(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                query="oauth callback timeout",
+                limit=5,
+                filters={},
+                db=db,
+                include_retriever=False,
+            )
+        )
+
+        self.assertEqual(execution.results, [])
+
+    def test_narrow_query_drops_document_chunk_without_highlight_evidence(self):
+        workspace_id = uuid4()
+        user_id = uuid4()
+        chunk_id = uuid4()
+        document_id = uuid4()
+
+        class FakePostgresService:
+            async def hybrid_search(self, **kwargs):
+                return []
+
+        class FakeRetriever:
+            def retrieve(self, **kwargs):
+                chunk = types.SimpleNamespace(
+                    chunk_id=chunk_id,
+                    document_id=document_id,
+                    document_title="Team handbook",
+                    text="This section describes desk booking, lunch planning, and weekly office rituals.",
+                    source_type="document",
+                    chunk_index=0,
+                    similarity=0.91,
+                    token_count=18,
+                    context_before=None,
+                    context_after=None,
+                    metadata={"created_at": "2026-04-02T00:00:00", "interaction_count": 10},
+                )
+                return types.SimpleNamespace(chunks=[chunk])
+
+        retriever = FakeRetriever()
+        module = self._load_semantic_search_module(FakePostgresService(), retriever)
+        service = module.SemanticSearchService(retriever, module.get_embedding_service())
+        db = _FakeDB()
+
+        execution = asyncio.run(
+            service.search(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                query="oauth callback timeout",
+                limit=5,
+                filters={},
+                db=db,
+                include_postgresql=False,
+            )
+        )
+
+        self.assertEqual(execution.results, [])
+
+    def test_final_results_cap_duplicate_chunks_from_same_document(self):
+        workspace_id = uuid4()
+        user_id = uuid4()
+        document_a = uuid4()
+        document_b = uuid4()
+
+        class FakePostgresService:
+            async def hybrid_search(self, **kwargs):
+                return []
+
+        class FakeRetriever:
+            def retrieve(self, **kwargs):
+                chunks = []
+                for similarity in (0.95, 0.94, 0.93):
+                    chunks.append(
+                        types.SimpleNamespace(
+                            chunk_id=uuid4(),
+                            document_id=document_a,
+                            document_title="OAuth handbook",
+                            text="OAuth callback timeout handling requires retry limits and request tracing.",
+                            source_type="document",
+                            chunk_index=len(chunks),
+                            similarity=similarity,
+                            token_count=12,
+                            context_before=None,
+                            context_after=None,
+                            metadata={"created_at": "2026-04-02T00:00:00", "interaction_count": 0},
+                        )
+                    )
+                chunks.append(
+                    types.SimpleNamespace(
+                        chunk_id=uuid4(),
+                        document_id=document_b,
+                        document_title="API runbook",
+                        text="The API runbook explains OAuth callback timeout diagnostics and alerting.",
+                        source_type="document",
+                        chunk_index=0,
+                        similarity=0.92,
+                        token_count=11,
+                        context_before=None,
+                        context_after=None,
+                        metadata={"created_at": "2026-04-02T00:00:00", "interaction_count": 0},
+                    )
+                )
+                return types.SimpleNamespace(chunks=chunks)
+
+        retriever = FakeRetriever()
+        module = self._load_semantic_search_module(FakePostgresService(), retriever)
+        service = module.SemanticSearchService(retriever, module.get_embedding_service())
+        db = _FakeDB()
+
+        execution = asyncio.run(
+            service.search(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                query="oauth callback timeout",
+                limit=3,
+                filters={},
+                db=db,
+                include_postgresql=False,
+            )
+        )
+
+        document_ids = [str(result.document_id) for result in execution.results]
+        self.assertEqual(len(document_ids), 3)
+        self.assertEqual(document_ids.count(str(document_a)), 2)
+        self.assertEqual(document_ids.count(str(document_b)), 1)
+
+    def test_chunk_refinement_embedding_failure_does_not_break_search_response(self):
+        workspace_id = uuid4()
+        user_id = uuid4()
+        note_id = uuid4()
+
+        class FakePostgresService:
+            async def hybrid_search(self, **kwargs):
+                return [
+                    {
+                        "note_id": str(note_id),
+                        "title": "Runbook",
+                        "content": (
+                            "OAuth callback timeout troubleshooting steps include checking redirect URLs, "
+                            "provider secrets, and replay-safe retry handling."
+                        ),
+                        "note_type": "note",
+                        "created_at": "2026-04-01T00:00:00",
+                        "embedding_similarity": 0.84,
+                        "text_score": 0.44,
+                        "interaction_score": 0.12,
+                        "highlight": "OAuth callback timeout troubleshooting steps",
+                    }
+                ]
+
+        class FakeRetriever:
+            def retrieve(self, **kwargs):
+                return types.SimpleNamespace(chunks=[])
+
+        retriever = FakeRetriever()
+        module = self._load_semantic_search_module(FakePostgresService(), retriever)
+        service = module.SemanticSearchService(retriever, module.get_embedding_service())
+        service.embedding_service = types.SimpleNamespace(
+            embed_query=lambda text: [0.1, 0.2, 0.3],
+            embed_batch=lambda texts: (_ for _ in ()).throw(RuntimeError("input exceeds maximum context length")),
+        )
+        db = _FakeDB(rows=[(note_id, ["oauth"])])
+
+        execution = asyncio.run(
+            service.search(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                query="oauth callback timeout",
+                limit=5,
+                filters={},
+                db=db,
+                include_retriever=False,
+            )
+        )
+
+        self.assertEqual(len(execution.results), 1)
+        self.assertEqual(str(execution.results[0].document_id), str(note_id))
+        self.assertEqual(execution.results[0].source_kind, "note")
 
     def test_log_search_execution_survives_missing_query_embedding_vector_column(self):
         workspace_id = uuid4()

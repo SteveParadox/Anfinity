@@ -173,6 +173,137 @@ async def test_create_note_comment_creates_mentions_and_dedupes_reply_notificati
     assert all(notification.notification_type == UserNotificationType.COMMENT_MENTION for notification in notifications)
 
 
+@pytest.mark.asyncio
+async def test_create_top_level_comment_notifies_owner_and_explicit_collaborators(monkeypatch: pytest.MonkeyPatch):
+    author = _make_user("author@example.com", "Author")
+    owner = _make_user("owner@example.com", "Owner")
+    collaborator = _make_user("collab@example.com", "Collaborator")
+    note = SimpleNamespace(id=uuid4(), workspace_id=uuid4(), title="Planning note", user_id=owner.id)
+    db = FakeDb([collaborator.id, owner.id, author.id])
+
+    async def fake_load(db_obj, *, note_id, comment_id):
+        comment = next(item for item in db_obj.added if isinstance(item, NoteComment) and item.id == comment_id)
+        comment.author = author
+        comment.resolved_by = None
+        comment.mentions = []
+        comment.reactions = []
+        return comment
+
+    monkeypatch.setattr(service, "load_note_comment_or_404", fake_load)
+
+    created = await service.create_note_comment(
+        db,
+        note=note,
+        author=author,
+        body="Fresh context for the plan.",
+    )
+
+    notifications = [item for item in db.added if isinstance(item, UserNotification)]
+
+    assert created.parent_comment_id is None
+    assert len(notifications) == 2
+    assert {notification.user_id for notification in notifications} == {owner.id, collaborator.id}
+    assert all(notification.notification_type == UserNotificationType.NOTE_COMMENT for notification in notifications)
+    assert all(notification.user_id != author.id for notification in notifications)
+
+
+@pytest.mark.asyncio
+async def test_create_top_level_comment_prefers_mention_notification_over_note_comment(monkeypatch: pytest.MonkeyPatch):
+    author = _make_user("author@example.com", "Author")
+    owner = _make_user("owner@example.com", "Owner")
+    note = SimpleNamespace(id=uuid4(), workspace_id=uuid4(), title="Planning note", user_id=owner.id)
+    db = FakeDb([owner.id])
+
+    monkeypatch.setattr(
+        service,
+        "list_note_mention_candidates",
+        AsyncMock(return_value=[service.build_workspace_mention_candidate(owner)]),
+    )
+
+    async def fake_load(db_obj, *, note_id, comment_id):
+        comment = next(item for item in db_obj.added if isinstance(item, NoteComment) and item.id == comment_id)
+        comment.author = author
+        comment.resolved_by = None
+        comment.mentions = [item for item in db_obj.added if isinstance(item, NoteCommentMention)]
+        for mention in comment.mentions:
+            mention.mentioned_user = owner
+        comment.reactions = []
+        return comment
+
+    monkeypatch.setattr(service, "load_note_comment_or_404", fake_load)
+
+    await service.create_note_comment(
+        db,
+        note=note,
+        author=author,
+        body="Can you review this, @owner?",
+    )
+
+    notifications = [item for item in db.added if isinstance(item, UserNotification)]
+
+    assert len(notifications) == 1
+    assert notifications[0].user_id == owner.id
+    assert notifications[0].notification_type == UserNotificationType.COMMENT_MENTION
+
+
+@pytest.mark.asyncio
+async def test_create_reply_notifies_parent_author(monkeypatch: pytest.MonkeyPatch):
+    author = _make_user("author@example.com", "Author")
+    parent_author = _make_user("parent@example.com", "Parent")
+    note = SimpleNamespace(id=uuid4(), workspace_id=uuid4(), title="Planning note", user_id=author.id)
+    parent_comment = NoteComment(
+        id=uuid4(),
+        note_id=note.id,
+        author_user_id=parent_author.id,
+        depth=0,
+        body="Original thread",
+    )
+    db = FakeDb(parent_comment)
+
+    async def fake_load(db_obj, *, note_id, comment_id):
+        comment = next(item for item in db_obj.added if isinstance(item, NoteComment) and item.id == comment_id)
+        comment.author = author
+        comment.resolved_by = None
+        comment.mentions = []
+        comment.reactions = []
+        return comment
+
+    monkeypatch.setattr(service, "load_note_comment_or_404", fake_load)
+
+    await service.create_note_comment(
+        db,
+        note=note,
+        author=author,
+        body="Following up here.",
+        parent_comment_id=parent_comment.id,
+    )
+
+    notifications = [item for item in db.added if isinstance(item, UserNotification)]
+
+    assert len(notifications) == 1
+    assert notifications[0].user_id == parent_author.id
+    assert notifications[0].notification_type == UserNotificationType.COMMENT_REPLY
+    assert notifications[0].payload["parent_comment_id"] == str(parent_comment.id)
+
+
+@pytest.mark.asyncio
+async def test_create_reply_rejects_missing_or_cross_note_parent():
+    author = _make_user("author@example.com", "Author")
+    note = SimpleNamespace(id=uuid4(), workspace_id=uuid4(), title="Planning note", user_id=author.id)
+    db = FakeDb(None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.create_note_comment(
+            db,
+            note=note,
+            author=author,
+            body="Reply to nowhere.",
+            parent_comment_id=uuid4(),
+        )
+
+    assert exc_info.value.status_code == 404
+
+
 def test_build_note_comment_tree_nests_replies_and_sets_reaction_state():
     author = _make_user("author@example.com", "Author")
     reacter = _make_user("reacter@example.com", "Reacter")
@@ -303,6 +434,7 @@ async def test_set_comment_resolution_updates_entire_thread_with_single_bulk_loa
         author_user_id=actor.id,
         body="Other root",
         depth=0,
+        is_resolved=False,
         created_at=datetime.now(timezone.utc),
     )
     db = FakeDb([root, reply, cousin])
