@@ -303,6 +303,7 @@ class OllamaEmbedder(EmbeddingProvider):
         self._session.headers.update(get_ollama_request_headers())
         self._fallback_provider = fallback_provider
         self._actual_provider_used = "ollama"  # Track which provider was actually used
+        self._embedding_service = None
         
         logger.info(f"🔧 OllamaEmbedder initializing with base_url={self._base_url}, model={self._model}")
         
@@ -335,43 +336,18 @@ class OllamaEmbedder(EmbeddingProvider):
         if not texts:
             return []
 
-        batch_size = max(1, min(getattr(settings, "EMBEDDING_BATCH_SIZE", 48), 64))
-        all_embeddings: List[List[float]] = []
-
         try:
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i : i + batch_size]
-                try:
-                    response = self._session.post(
-                        f"{self._base_url}/api/embed",
-                        json={"model": self._model, "input": batch},
-                        timeout=settings.OLLAMA_TIMEOUT,
-                    )
-                    if response.status_code == 404:
-                        raise RuntimeError("/api/embed unsupported")
-                    response.raise_for_status()
-                    batch_embeddings = self._normalise_embeddings_payload(response.json(), len(batch))
-                except Exception as batch_error:
-                    logger.warning(
-                        "Batch Ollama embedding failed for %d texts, falling back to legacy mode: %s",
-                        len(batch),
-                        batch_error,
-                    )
-                    batch_embeddings = []
-                    for text in batch:
-                        response = self._session.post(
-                            f"{self._base_url}/api/embeddings",
-                            json={"model": self._model, "prompt": text},
-                            timeout=settings.OLLAMA_TIMEOUT,
-                        )
-                        response.raise_for_status()
-                        batch_embeddings.extend(self._normalise_embeddings_payload(response.json(), 1))
+            if self._embedding_service is None:
+                from app.services.embeddings import EmbeddingService
 
-                for embedding in batch_embeddings:
-                    if self._dimension != len(embedding):
-                        self._dimension = len(embedding)
-                all_embeddings.extend(batch_embeddings)
+                self._embedding_service = EmbeddingService(provider="ollama")
 
+            self._embedding_service.model = self._model
+            embeddings = self._embedding_service.embed_batch(texts)
+            for embedding in embeddings:
+                if self._dimension != len(embedding):
+                    self._dimension = len(embedding)
+            return embeddings
         except Exception as ollama_err:
             if self._fallback_provider:
                 logger.warning(
@@ -391,7 +367,7 @@ class OllamaEmbedder(EmbeddingProvider):
                     ) from fallback_err
             raise RuntimeError(f"Ollama embedding failed and no fallback provider configured: {ollama_err}") from ollama_err
 
-        return all_embeddings
+        return []
 
     @property
     def dimension(self) -> int:
