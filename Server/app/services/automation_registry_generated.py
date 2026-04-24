@@ -2,7 +2,7 @@
 
 # Do not edit by hand.
 
-TRIGGER_TYPE_IDS = ('note.created', 'note.updated', 'note.deleted', 'note.approval_submitted', 'note.approval_approved', 'note.approval_rejected', 'note.approval_needs_changes', 'document.completed', 'thinking_session.completed', 'webhook.received')
+TRIGGER_TYPE_IDS = ('note.created', 'note.updated', 'note.deleted', 'note.approval_submitted', 'note.approval_approved', 'note.approval_rejected', 'note.approval_needs_changes', 'document.completed', 'thinking_session.completed', 'webhook.received', 'competitive_intelligence.urgent_finding')
 ACTION_TYPE_IDS = ('send_notification', 'create_note', 'update_note', 'append_note_content', 'add_note_tags', 'remove_note_tags', 'set_note_type', 'link_notes', 'submit_for_approval', 'approve_note', 'reject_note', 'request_approval_changes', 'call_webhook', 'send_email')
 CONDITION_OPERATOR_IDS = ('equals', 'not_equals', 'contains', 'not_contains', 'matches_regex', 'greater_than', 'less_than', 'exists')
 NOTE_TYPE_IDS = ('note', 'web-clip', 'document', 'voice', 'ai-generated')

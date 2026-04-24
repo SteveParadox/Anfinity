@@ -173,6 +173,66 @@ def resolve_mentions(
     return resolved
 
 
+async def list_note_comment_notification_recipient_ids(db: AsyncSession, note: Note) -> set[UUID]:
+    """Return explicit note followers for broad comment notifications."""
+    recipient_ids: set[UUID] = {note.user_id}
+
+    result = await db.execute(
+        select(NoteCollaborator.user_id).where(NoteCollaborator.note_id == note.id)
+    )
+    for user_id in result.scalars().all():
+        recipient_ids.add(user_id)
+
+    return recipient_ids
+
+
+def add_comment_notifications(
+    db: AsyncSession,
+    *,
+    note: Note,
+    comment: NoteComment,
+    actor: DBUser,
+    recipient_ids: Iterable[UUID],
+    notification_type: UserNotificationType,
+    body: str,
+    parent_comment_id: Optional[UUID] = None,
+    skip_user_ids: Optional[Iterable[UUID]] = None,
+    payload_extra: Optional[Mapping[str, str]] = None,
+) -> set[UUID]:
+    skipped = set(skip_user_ids or [])
+    notified_user_ids: set[UUID] = set()
+
+    for recipient_id in recipient_ids:
+        if recipient_id == actor.id or recipient_id in skipped or recipient_id in notified_user_ids:
+            continue
+
+        payload = {
+            "comment_id": str(comment.id),
+            "note_id": str(note.id),
+            "note_title": note.title,
+            "comment_excerpt": build_comment_excerpt(body),
+        }
+        if parent_comment_id is not None:
+            payload["parent_comment_id"] = str(parent_comment_id)
+        if payload_extra:
+            payload.update(payload_extra)
+
+        db.add(
+            UserNotification(
+                user_id=recipient_id,
+                actor_user_id=actor.id,
+                workspace_id=note.workspace_id,
+                note_id=note.id,
+                comment_id=comment.id,
+                notification_type=notification_type,
+                payload=payload,
+            )
+        )
+        notified_user_ids.add(recipient_id)
+
+    return notified_user_ids
+
+
 def _resolve_single_mention(
     token: ParsedMentionToken,
     candidates: Sequence[WorkspaceMentionCandidate],
@@ -392,47 +452,40 @@ async def create_note_comment(
                     )
                 )
                 mentioned_user_ids.add(mention.user_id)
-                if mention.user_id == author.id:
-                    continue
-                db.add(
-                    UserNotification(
-                        user_id=mention.user_id,
-                        actor_user_id=author.id,
-                        workspace_id=note.workspace_id,
-                        note_id=note.id,
-                        comment_id=comment.id,
-                        notification_type=UserNotificationType.COMMENT_MENTION,
-                        payload={
-                            "comment_id": str(comment.id),
-                            "note_id": str(note.id),
-                            "note_title": note.title,
-                            "comment_excerpt": build_comment_excerpt(normalized_body),
-                            "mention_token": mention.token,
-                        },
-                    )
+                add_comment_notifications(
+                    db,
+                    note=note,
+                    comment=comment,
+                    actor=author,
+                    recipient_ids={mention.user_id},
+                    notification_type=UserNotificationType.COMMENT_MENTION,
+                    body=normalized_body,
+                    payload_extra={"mention_token": mention.token},
                 )
 
-        if (
-            parent_comment is not None
-            and parent_comment.author_user_id != author.id
-            and parent_comment.author_user_id not in mentioned_user_ids
-        ):
-            db.add(
-                UserNotification(
-                    user_id=parent_comment.author_user_id,
-                    actor_user_id=author.id,
-                    workspace_id=note.workspace_id,
-                    note_id=note.id,
-                    comment_id=comment.id,
-                    notification_type=UserNotificationType.COMMENT_REPLY,
-                    payload={
-                        "comment_id": str(comment.id),
-                        "parent_comment_id": str(parent_comment.id),
-                        "note_id": str(note.id),
-                        "note_title": note.title,
-                        "comment_excerpt": build_comment_excerpt(normalized_body),
-                    },
-                )
+        if parent_comment is None:
+            recipient_ids = await list_note_comment_notification_recipient_ids(db, note)
+            add_comment_notifications(
+                db,
+                note=note,
+                comment=comment,
+                actor=author,
+                recipient_ids=recipient_ids,
+                notification_type=UserNotificationType.NOTE_COMMENT,
+                body=normalized_body,
+                skip_user_ids=mentioned_user_ids,
+            )
+        else:
+            add_comment_notifications(
+                db,
+                note=note,
+                comment=comment,
+                actor=author,
+                recipient_ids={parent_comment.author_user_id},
+                notification_type=UserNotificationType.COMMENT_REPLY,
+                body=normalized_body,
+                parent_comment_id=parent_comment.id,
+                skip_user_ids=mentioned_user_ids,
             )
 
         try:

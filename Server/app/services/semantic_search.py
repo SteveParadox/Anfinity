@@ -26,6 +26,7 @@ from app.services.embeddings import get_embedding_service
 from app.services.postgresql_search import get_postgresql_search_service
 from app.services.rag_retriever import RAGRetriever, RetrievedChunk, get_rag_retriever
 from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
+from app.services.search_highlights import SearchHighlightExtractor, SearchTextChunk, stable_content_fingerprint
 try:
     from app.ingestion.source_locations import enrich_citation_metadata, source_location_payload
 except Exception:  # pragma: no cover - isolated tests stub the app package
@@ -72,6 +73,11 @@ class SemanticSearchResult:
         context_before: Optional[str] = None,
         context_after: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        highlights: Optional[List[Dict[str, Any]]] = None,
+        matched_chunks: Optional[List[Dict[str, Any]]] = None,
+        confidence: str = "low",
+        confidence_score: float = 0.0,
+        match_summary: Optional[Dict[str, Any]] = None,
     ):
         self.chunk_id = chunk_id
         self.document_id = document_id
@@ -94,6 +100,11 @@ class SemanticSearchResult:
         self.context_before = context_before
         self.context_after = context_after
         self.metadata = metadata or {}
+        self.highlights = highlights or []
+        self.matched_chunks = matched_chunks or []
+        self.confidence = confidence
+        self.confidence_score = confidence_score
+        self.match_summary = match_summary or {}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -112,6 +123,11 @@ class SemanticSearchResult:
             "usage_score": round(self.usage_score, 4),
             "final_score": round(self.final_score, 4),
             "highlight": self.highlight,
+            "highlights": self.highlights,
+            "matched_chunks": self.matched_chunks,
+            "confidence": self.confidence,
+            "confidence_score": round(max(0.0, min(float(self.confidence_score or 0.0), 1.0)), 4),
+            "match_summary": self.match_summary,
             "tags": self.tags,
             "token_count": int(self.token_count or 0),
             "context_before": self.context_before,
@@ -153,6 +169,11 @@ class SemanticSearchResult:
             context_before=data.get("context_before"),
             context_after=data.get("context_after"),
             metadata=dict(data.get("metadata", {}) or {}),
+            highlights=list(data.get("highlights", []) or []),
+            matched_chunks=list(data.get("matched_chunks", []) or []),
+            confidence=data.get("confidence", "low"),
+            confidence_score=float(data.get("confidence_score", 0.0) or 0.0),
+            match_summary=dict(data.get("match_summary", {}) or {}),
         )
 
 
@@ -182,6 +203,7 @@ class SemanticSearchService:
         self.retriever = rag_retriever
         self.embedding_service = embedding_service
         self.postgresql_service = get_postgresql_search_service()
+        self.highlight_extractor = SearchHighlightExtractor()
 
     async def search(
         self,
@@ -247,6 +269,7 @@ class SemanticSearchService:
             ranked_results = self._rerank(ranked_results, query=query)
             strategy = "retriever_fallback"
 
+        final_results = self._diversify_results(ranked_results, limit=limit)
         took_ms = int((datetime.now(timezone.utc) - search_started).total_seconds() * 1000)
         search_log_id = None
         if db is not None and log_execution:
@@ -255,12 +278,12 @@ class SemanticSearchService:
                 user_id=user_id,
                 workspace_id=workspace_id,
                 query=query,
-                results=ranked_results[:limit],
+                results=final_results,
                 search_duration_ms=took_ms,
             )
 
         return SemanticSearchExecution(
-            results=ranked_results[:limit],
+            results=final_results,
             search_log_id=search_log_id,
             strategy=strategy,
         )
@@ -283,7 +306,7 @@ class SemanticSearchService:
 
         normalized: List[SemanticSearchResult] = []
         for row in postgres_results:
-            created_at = self._parse_datetime(row.get("created_at"))
+            created_at = self._parse_datetime(row.get("updated_at") or row.get("created_at"))
             similarity_score = max(0.0, min(float(row.get("embedding_similarity", 0.0) or 0.0), 1.0))
             text_score = self._normalize_text_score(row.get("text_score", 0.0))
             usage_score = max(0.0, min(float(row.get("interaction_score", 0.0) or 0.0), 1.0))
@@ -309,13 +332,21 @@ class SemanticSearchService:
                     final_score=self._calculate_final_score(semantic_score, recency_score, usage_score),
                     highlight=row.get("highlight") or self._extract_highlight(row.get("content", ""), query),
                     token_count=int(row.get("token_count", 0) or 0),
-                    metadata={"source_kind": "note"},
+                    metadata={
+                        "source_kind": "note",
+                        "created_at": row.get("created_at"),
+                        "updated_at": row.get("updated_at"),
+                        "live_content_fingerprint": stable_content_fingerprint(
+                            [str(row.get("title", "")), str(row.get("content", ""))]
+                        ),
+                    },
                 )
             )
 
         await self._hydrate_result_tags(db, normalized)
         filtered = self._apply_result_filters(normalized, filters)
-        return self._rerank(self._dedupe_results(filtered), query=query)
+        refined = await self._refine_note_results_to_chunks(filtered, query=query)
+        return self._rerank(self._dedupe_results(refined), query=query)
 
     async def _search_retriever_fallback(
         self,
@@ -366,6 +397,12 @@ class SemanticSearchService:
                 metadata = dict(chunk.metadata or {})
                 metadata.setdefault("source_kind", "document")
                 created_at = self._parse_datetime(metadata.get("created_at"))
+                highlights, matched_chunks, confidence, confidence_score = self._build_document_evidence(
+                    chunk=chunk,
+                    query=query,
+                    similarity_score=similarity_score,
+                    metadata=metadata,
+                )
 
                 enriched.append(
                     SemanticSearchResult(
@@ -381,12 +418,21 @@ class SemanticSearchService:
                         similarity_score=similarity_score,
                         vector_score=similarity_score,
                         text_score=float(metadata.get("lexical_overlap", 0.0) or 0.0),
-                        highlight=self._extract_highlight(chunk.text, query),
+                        highlight=highlights[0]["text"] if highlights else "",
                         tags=list(metadata.get("tags", []) or []),
                         token_count=int(getattr(chunk, "token_count", 0) or metadata.get("token_count", 0) or 0),
                         context_before=getattr(chunk, "context_before", None) or metadata.get("context_before"),
                         context_after=getattr(chunk, "context_after", None) or metadata.get("context_after"),
                         metadata=metadata,
+                        highlights=highlights,
+                        matched_chunks=matched_chunks,
+                        confidence=confidence,
+                        confidence_score=confidence_score,
+                        match_summary={
+                            "strategy": "document_chunk_vector",
+                            "matched_chunk_count": len(matched_chunks),
+                            "highlight_count": len(highlights),
+                        },
                     )
                 )
             except Exception as exc:
@@ -478,8 +524,217 @@ class SemanticSearchService:
 
         return hydrated
 
+    async def _refine_note_results_to_chunks(
+        self,
+        results: List[SemanticSearchResult],
+        *,
+        query: str,
+    ) -> List[SemanticSearchResult]:
+        """Turn whole-note candidates into chunk-evidenced note results."""
+        if not results:
+            return results
+
+        note_results = [result for result in results if str(result.source_kind or "").lower() == "note"]
+        if not note_results:
+            return results
+
+        chunks_by_note: Dict[str, List[SearchTextChunk]] = {}
+        all_chunks: List[SearchTextChunk] = []
+        max_chunk_embeddings = 80
+
+        for result in note_results:
+            chunks = self.highlight_extractor.chunk_note(
+                note_id=str(result.document_id),
+                title=result.document_title,
+                content=result.content,
+                tags=result.tags,
+            )
+            chunks_by_note[str(result.document_id)] = chunks
+            remaining = max_chunk_embeddings - len(all_chunks)
+            if remaining > 0:
+                all_chunks.extend(chunks[:remaining])
+
+        query_embedding = self._safe_embed_query(query)
+        chunk_embeddings: Dict[str, List[float]] = {}
+        if query_embedding and all_chunks and hasattr(self.embedding_service, "embed_batch"):
+            try:
+                embeddings = self.embedding_service.embed_batch([chunk.text for chunk in all_chunks])
+                chunk_embeddings = {
+                    chunk.chunk_id: vector
+                    for chunk, vector in zip(all_chunks, embeddings)
+                    if vector and len(vector) == len(query_embedding)
+                }
+            except Exception as exc:
+                logger.warning("Chunk embedding refinement skipped: %s", exc)
+
+        refined: List[SemanticSearchResult] = []
+        for result in results:
+            if str(result.source_kind or "").lower() != "note":
+                refined.append(result)
+                continue
+
+            chunks = chunks_by_note.get(str(result.document_id), [])
+            matched = self.highlight_extractor.score_chunks(
+                query=query,
+                chunks=chunks,
+                query_embedding=query_embedding,
+                chunk_embeddings=chunk_embeddings,
+                note_semantic_score=result.vector_score or result.similarity_score,
+                note_text_score=result.text_score,
+                source_type=result.source_type,
+                max_chunks=3,
+            )
+            if not matched:
+                fallback_chunk = chunks[0] if chunks else None
+                if fallback_chunk is not None:
+                    fallback_highlights = self.highlight_extractor.extract_highlights(
+                        query=query,
+                        chunk=fallback_chunk,
+                        source_type=result.source_type,
+                        max_highlights=1,
+                    )
+                    result.highlights = [highlight.to_dict() for highlight in fallback_highlights]
+                    result.highlight = result.highlights[0]["text"] if result.highlights else result.highlight
+                    result.matched_chunks = []
+                    result.confidence = "low"
+                    result.confidence_score = min(result.final_score, 0.24)
+                    result.final_score = min(result.final_score, 0.24)
+                    result.match_summary = {
+                        "strategy": "whole_note_candidate_low_evidence",
+                        "matched_chunk_count": 0,
+                        "highlight_count": len(result.highlights),
+                    }
+                refined.append(result)
+                continue
+
+            best = matched[0]
+            highlight_dicts = [
+                highlight.to_dict()
+                for evidence in matched
+                for highlight in evidence.highlights
+            ][:4]
+            matched_chunk_dicts = [evidence.to_dict() for evidence in matched]
+            result.content = best.chunk.text
+            result.chunk_index = best.chunk.chunk_index
+            result.token_count = max(result.token_count, len(best.chunk.text.split()))
+            result.highlight = highlight_dicts[0]["text"] if highlight_dicts else best.chunk.text[:240]
+            result.highlights = highlight_dicts
+            result.matched_chunks = matched_chunk_dicts
+            result.confidence = best.confidence
+            result.confidence_score = max(0.0, min(best.score, 1.0))
+            result.metadata = {
+                **(result.metadata or {}),
+                "source_kind": "note",
+                "matched_note_chunk_id": best.chunk.chunk_id,
+                "source_offset_start": best.chunk.start_offset,
+                "source_offset_end": best.chunk.end_offset,
+                "heading": best.chunk.heading,
+                "live_chunk_fingerprint": stable_content_fingerprint(
+                    [str(result.document_id), best.chunk.text, str(best.chunk.start_offset), str(best.chunk.end_offset)]
+                ),
+            }
+            result.match_summary = {
+                "strategy": "note_chunk_refinement",
+                "matched_chunk_count": len(matched),
+                "highlight_count": len(highlight_dicts),
+                "best_chunk_score": round(best.score, 4),
+                "best_chunk_evidence": round(best.evidence_score, 4),
+                "best_chunk_semantic": round(best.semantic_score, 4),
+            }
+            result.similarity_score = max(result.similarity_score, best.semantic_score * 0.88 + best.evidence_score * 0.12)
+            result.final_score = max(
+                0.0,
+                min(
+                    result.final_score * 0.55
+                    + best.score * 0.35
+                    + min(best.evidence_score, 1.0) * 0.10,
+                    1.0,
+                ),
+            )
+            refined.append(result)
+
+        return refined
+
+    def _build_document_evidence(
+        self,
+        *,
+        chunk: RetrievedChunk,
+        query: str,
+        similarity_score: float,
+        metadata: Dict[str, Any],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, float]:
+        start_offset = int(
+            metadata.get("source_offset_start")
+            or metadata.get("char_start")
+            or metadata.get("start_offset")
+            or 0
+        )
+        text_value = chunk.text or ""
+        raw_heading = metadata.get("heading") or metadata.get("section") or metadata.get("heading_path")
+        if isinstance(raw_heading, list):
+            heading = " / ".join(str(part) for part in raw_heading if str(part).strip()) or None
+        elif raw_heading:
+            heading = str(raw_heading)
+        else:
+            heading = None
+        search_chunk = SearchTextChunk(
+            chunk_id=str(chunk.chunk_id),
+            note_id=str(chunk.document_id),
+            text=text_value,
+            start_offset=start_offset,
+            end_offset=start_offset + len(text_value),
+            chunk_index=int(chunk.chunk_index or 0),
+            heading=heading,
+            metadata={
+                **(metadata or {}),
+                "title": chunk.document_title,
+                "source_offset_start": start_offset,
+                "source_offset_end": start_offset + len(text_value),
+            },
+        )
+        matched = self.highlight_extractor.score_chunks(
+            query=query,
+            chunks=[search_chunk],
+            note_semantic_score=similarity_score,
+            note_text_score=float(metadata.get("lexical_overlap", 0.0) or 0.0),
+            source_type=chunk.source_type,
+            max_chunks=1,
+        )
+        if matched:
+            evidence = matched[0]
+            return (
+                [highlight.to_dict() for highlight in evidence.highlights],
+                [evidence.to_dict()],
+                evidence.confidence,
+                max(0.0, min(evidence.score, 1.0)),
+            )
+
+        highlights = self.highlight_extractor.extract_highlights(
+            query=query,
+            chunk=search_chunk,
+            source_type=chunk.source_type,
+            max_highlights=1,
+        )
+        confidence_score = min(max(similarity_score, 0.0), 0.24)
+        return (
+            [highlight.to_dict() for highlight in highlights],
+            [],
+            "low",
+            confidence_score,
+        )
+
+    def _safe_embed_query(self, query: str) -> Optional[List[float]]:
+        try:
+            embedding = self.embedding_service.embed_query(query)
+            if embedding:
+                return embedding
+        except Exception as exc:
+            logger.warning("Query embedding unavailable for chunk refinement: %s", exc)
+        return None
+
     def _rerank(self, results: List[SemanticSearchResult], query: str = "") -> List[SemanticSearchResult]:
         intent = analyze_query_intent(query)
+        narrow_query = self._is_narrow_query(query)
         filtered_results: List[SemanticSearchResult] = []
 
         for result in results:
@@ -519,17 +774,93 @@ class SemanticSearchService:
                     1.0,
                 ),
             )
+            if result.confidence == "low" and relevance.evidence_score < 0.16:
+                result.final_score *= 0.82
+
+            has_highlight_evidence = self._has_grounded_highlight_evidence(result)
+            matched_chunk_count = int((result.match_summary or {}).get("matched_chunk_count", 0) or 0)
+            if not has_highlight_evidence:
+                result.final_score = min(result.final_score, 0.20)
+                result.confidence_score = min(result.confidence_score or result.final_score, 0.20)
+                result.confidence = "low"
+                if narrow_query or intent.is_domain_specific:
+                    continue
+
+            if matched_chunk_count == 0:
+                result.final_score = min(result.final_score, 0.28)
+
+            calibrated_confidence = max(0.0, min(result.confidence_score or result.final_score, result.final_score, 1.0))
+            if relevance.evidence_score < 0.18:
+                calibrated_confidence = min(calibrated_confidence, 0.44)
+            if matched_chunk_count == 0:
+                calibrated_confidence = min(calibrated_confidence, 0.30)
+            result.confidence_score = calibrated_confidence
+            result.confidence = (
+                "high" if calibrated_confidence >= 0.72
+                else "medium" if calibrated_confidence >= 0.46
+                else "low"
+            )
 
             if intent.is_domain_specific:
                 if relevance.off_topic:
                     continue
                 if relevance.evidence_score < 0.12 and result.final_score < 0.45:
                     continue
+            if narrow_query and result.confidence == "low" and relevance.evidence_score < 0.18:
+                continue
+            elif result.final_score < 0.22 and result.confidence == "low":
+                continue
 
             filtered_results.append(result)
 
         filtered_results.sort(key=lambda item: item.final_score, reverse=True)
         return filtered_results
+
+    def _diversify_results(self, results: List[SemanticSearchResult], limit: int) -> List[SemanticSearchResult]:
+        """Prevent one document/note from dominating final results."""
+        if not results:
+            return []
+
+        per_document_counts: Dict[str, int] = {}
+        primary: List[SemanticSearchResult] = []
+        overflow: List[SemanticSearchResult] = []
+        per_document_cap = 2
+
+        for result in results:
+            document_key = f"{result.source_kind}:{result.document_id}"
+            count = per_document_counts.get(document_key, 0)
+            if count < per_document_cap:
+                primary.append(result)
+                per_document_counts[document_key] = count + 1
+            else:
+                overflow.append(result)
+
+        return [*primary, *overflow][:limit]
+
+    def _has_grounded_highlight_evidence(self, result: SemanticSearchResult) -> bool:
+        for highlight in result.highlights or []:
+            text_value = str(highlight.get("text") or "").strip()
+            if not text_value:
+                continue
+            if float(highlight.get("score") or 0.0) >= 0.12:
+                return True
+            if highlight.get("matched_terms"):
+                return True
+        return False
+
+    def _is_narrow_query(self, query: str) -> bool:
+        intent = analyze_query_intent(query)
+        if intent.quoted_terms:
+            return True
+        content_terms = [term for term in intent.content_terms if term]
+        if len(content_terms) >= 3:
+            return True
+        technical_terms = {
+            "api", "apis", "oauth", "callback", "timeout", "latency", "embedding",
+            "embeddings", "qdrant", "postgres", "pgvector", "chunk", "chunks",
+            "rerank", "ranking", "typescript", "python", "react", "webhook",
+        }
+        return len(set(content_terms) & technical_terms) >= 2
 
     def _calculate_recency_score(self, created_at: datetime) -> float:
         now = datetime.now(timezone.utc)

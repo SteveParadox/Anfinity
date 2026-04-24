@@ -26,8 +26,8 @@ HTTP_METHODS = frozenset(HTTP_METHOD_IDS)
 
 
 def assert_registry_integrity() -> None:
-    if len(TRIGGER_TYPE_IDS) != 10 or len(SUPPORTED_TRIGGER_TYPES) != len(TRIGGER_TYPE_IDS):
-        raise RuntimeError("Automation trigger registry must define exactly 10 unique trigger types")
+    if len(TRIGGER_TYPE_IDS) != 11 or len(SUPPORTED_TRIGGER_TYPES) != len(TRIGGER_TYPE_IDS):
+        raise RuntimeError("Automation trigger registry must define exactly 11 unique trigger types")
     if len(ACTION_TYPE_IDS) != 14 or len(SUPPORTED_ACTION_TYPES) != len(ACTION_TYPE_IDS):
         raise RuntimeError("Automation action registry must define exactly 14 unique action types")
     if len(CONDITION_OPERATOR_IDS) != 8 or len(SUPPORTED_CONDITION_OPERATORS) != len(CONDITION_OPERATOR_IDS):

@@ -1,4 +1,5 @@
 """Embedding service for generating and managing embeddings."""
+from dataclasses import dataclass
 import logging
 from threading import RLock
 from typing import List, Optional
@@ -25,6 +26,19 @@ try:
     HAS_COHERE = True
 except ImportError:
     HAS_COHERE = False
+
+try:
+    import tiktoken
+
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
+
+
+@dataclass
+class _PreparedOllamaInput:
+    original_text: str
+    segments: List[str]
 
 def _ai_runtime():
     getter = getattr(app_config, "get_ai_runtime_config", None)
@@ -73,6 +87,11 @@ class EmbeddingService:
     LONG_TEXT_CHUNK_CHARS = 5000
     LONG_TEXT_CHUNK_OVERLAP_CHARS = 500
     MAX_LONG_TEXT_CHUNKS = 8
+    OLLAMA_SAFE_MAX_INPUT_TOKENS_768 = 1536
+    OLLAMA_SAFE_MAX_INPUT_TOKENS_DEFAULT = 2000
+    OLLAMA_SAFE_MAX_INPUT_CHARS_768 = 6000
+    OLLAMA_SAFE_MAX_INPUT_CHARS_DEFAULT = 8000
+    MAX_OLLAMA_SPLIT_DEPTH = 6
 
     def __init__(self, provider: Optional[str] = None):
         """Initialize embedding service.
@@ -87,6 +106,16 @@ class EmbeddingService:
         self._http: Optional[requests.Session] = None
         self._cache = None
         self._cache_lock = RLock()
+        self._tokenizer = None
+        self._use_tiktoken = False
+
+        if HAS_TIKTOKEN:
+            try:
+                self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                self._use_tiktoken = True
+            except Exception:
+                self._tokenizer = None
+                self._use_tiktoken = False
 
         if self.provider == "openai" and HAS_OPENAI:
             self.client = OpenAI(api_key=runtime.openai.api_key)
@@ -162,6 +191,445 @@ class EmbeddingService:
             )
         return embeddings
 
+    def _count_tokens(self, text: str) -> int:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return 0
+        if self._use_tiktoken and self._tokenizer is not None:
+            try:
+                return len(self._tokenizer.encode(cleaned))
+            except Exception:
+                pass
+        return max(len(cleaned.split()), (len(cleaned) + 3) // 4)
+
+    def _get_ollama_input_budget(self, model_name: Optional[str] = None) -> tuple[int, int]:
+        resolved_model = str(model_name or self.get_model_name() or "").lower()
+        is_768_dim_model = self.dimension == 768 or "nomic-embed" in resolved_model
+        if is_768_dim_model:
+            return (
+                self.OLLAMA_SAFE_MAX_INPUT_TOKENS_768,
+                self.OLLAMA_SAFE_MAX_INPUT_CHARS_768,
+            )
+        return (
+            self.OLLAMA_SAFE_MAX_INPUT_TOKENS_DEFAULT,
+            self.OLLAMA_SAFE_MAX_INPUT_CHARS_DEFAULT,
+        )
+
+    def _is_within_ollama_budget(
+        self,
+        text: str,
+        *,
+        token_budget: Optional[int] = None,
+        char_budget: Optional[int] = None,
+    ) -> bool:
+        resolved_token_budget, resolved_char_budget = self._get_ollama_input_budget()
+        token_budget = token_budget or resolved_token_budget
+        char_budget = char_budget or resolved_char_budget
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return True
+        return len(cleaned) <= char_budget and self._count_tokens(cleaned) <= token_budget
+
+    def _truncate_text_to_budget(
+        self,
+        text: str,
+        *,
+        token_budget: Optional[int] = None,
+        char_budget: Optional[int] = None,
+    ) -> str:
+        resolved_token_budget, resolved_char_budget = self._get_ollama_input_budget()
+        token_budget = token_budget or resolved_token_budget
+        char_budget = char_budget or resolved_char_budget
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+
+        truncated = cleaned[:char_budget].strip()
+        if not truncated:
+            return ""
+
+        while truncated and self._count_tokens(truncated) > token_budget:
+            next_len = max(int(len(truncated) * 0.85), min(len(truncated) - 1, char_budget // 2))
+            if next_len >= len(truncated):
+                next_len = len(truncated) - 1
+            if next_len <= 0:
+                break
+            truncated = truncated[:next_len].strip()
+
+        return truncated or cleaned[: max(1, min(len(cleaned), char_budget // 2))].strip()
+
+    @staticmethod
+    def _find_split_position(text: str) -> int:
+        midpoint = len(text) // 2
+        delimiters = ("\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ")
+
+        best_position = -1
+        best_distance = None
+        for delimiter in delimiters:
+            left = text.rfind(delimiter, 0, midpoint)
+            right = text.find(delimiter, midpoint)
+            for candidate in (left, right):
+                if candidate <= 0 or candidate >= len(text):
+                    continue
+                distance = abs(candidate - midpoint)
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_position = candidate + (len(delimiter) if delimiter.strip() else 0)
+
+        if best_position > 0:
+            return best_position
+        return midpoint
+
+    def _split_text_to_ollama_segments(
+        self,
+        text: str,
+        *,
+        token_budget: Optional[int] = None,
+        char_budget: Optional[int] = None,
+        force_split: bool = False,
+        depth: int = 0,
+    ) -> List[str]:
+        resolved_token_budget, resolved_char_budget = self._get_ollama_input_budget()
+        token_budget = token_budget or resolved_token_budget
+        char_budget = char_budget or resolved_char_budget
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return []
+
+        if not force_split and self._is_within_ollama_budget(
+            cleaned,
+            token_budget=token_budget,
+            char_budget=char_budget,
+        ):
+            return [cleaned]
+
+        if depth >= self.MAX_OLLAMA_SPLIT_DEPTH or len(cleaned) <= max(256, char_budget // 2):
+            truncated = self._truncate_text_to_budget(
+                cleaned,
+                token_budget=token_budget,
+                char_budget=char_budget,
+            )
+            return [truncated] if truncated else []
+
+        split_at = self._find_split_position(cleaned)
+        split_at = max(1, min(split_at, len(cleaned) - 1))
+        left = cleaned[:split_at].strip()
+        right = cleaned[split_at:].strip()
+
+        if not left or not right:
+            midpoint = max(1, min(len(cleaned) - 1, len(cleaned) // 2))
+            left = cleaned[:midpoint].strip()
+            right = cleaned[midpoint:].strip()
+
+        if not left or not right:
+            truncated = self._truncate_text_to_budget(
+                cleaned,
+                token_budget=token_budget,
+                char_budget=char_budget,
+            )
+            return [truncated] if truncated else []
+
+        segments: List[str] = []
+        segments.extend(
+            self._split_text_to_ollama_segments(
+                left,
+                token_budget=token_budget,
+                char_budget=char_budget,
+                depth=depth + 1,
+            )
+        )
+        segments.extend(
+            self._split_text_to_ollama_segments(
+                right,
+                token_budget=token_budget,
+                char_budget=char_budget,
+                depth=depth + 1,
+            )
+        )
+        return segments
+
+    def _prepare_ollama_inputs(self, texts: List[str]) -> List[_PreparedOllamaInput]:
+        token_budget, char_budget = self._get_ollama_input_budget()
+        prepared: List[_PreparedOllamaInput] = []
+
+        for text in texts:
+            segments = self._split_text_to_ollama_segments(
+                text,
+                token_budget=token_budget,
+                char_budget=char_budget,
+            )
+            if len(segments) > 1:
+                logger.info(
+                    "Splitting oversized Ollama embedding input for model=%s into %d segments (chars=%d tokens=%d)",
+                    self.get_model_name(),
+                    len(segments),
+                    len(text),
+                    self._count_tokens(text),
+                )
+            prepared.append(_PreparedOllamaInput(original_text=text, segments=segments or [""]))
+
+        return prepared
+
+    @staticmethod
+    def _extract_ollama_error_details(exc: Exception) -> tuple[Optional[int], str]:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        response_text = ""
+        if response is not None:
+            response_text = str(getattr(response, "text", "") or "")
+        return status, response_text or str(exc)
+
+    def _is_ollama_context_length_error(self, exc: Exception) -> bool:
+        status, payload = self._extract_ollama_error_details(exc)
+        lowered = payload.lower()
+        return (
+            status == 400
+            and (
+                "context length" in lowered
+                or "maximum context length" in lowered
+                or "input length" in lowered
+                or "too many tokens" in lowered
+            )
+        )
+
+    def _is_ollama_embed_endpoint_unsupported(self, exc: Exception) -> bool:
+        status, payload = self._extract_ollama_error_details(exc)
+        return status == 404 or "/api/embed unsupported" in payload.lower()
+
+    def _log_ollama_retry(
+        self,
+        *,
+        exc: Exception,
+        text: str,
+        batch_size: int,
+        retry_strategy: str,
+        model_name: str,
+    ) -> None:
+        status, payload = self._extract_ollama_error_details(exc)
+        logger.warning(
+            "Ollama embedding retry: model=%s batch_size=%d failed_item_chars=%d failed_item_tokens=%d strategy=%s status=%s error=%s",
+            model_name,
+            batch_size,
+            len(text),
+            self._count_tokens(text),
+            retry_strategy,
+            status,
+            payload[:240],
+        )
+
+    def _post_ollama_embed(
+        self,
+        *,
+        session: requests.Session,
+        base_url: str,
+        model_name: str,
+        timeout: int,
+        batch: List[str],
+    ) -> List[List[float]]:
+        response = session.post(
+            f"{base_url}/api/embed",
+            json={"model": model_name, "input": batch},
+            timeout=timeout,
+        )
+        if response.status_code == 404:
+            raise requests.HTTPError("/api/embed unsupported", response=response)
+        response.raise_for_status()
+        return self._validate_ollama_embeddings_response(
+            response.json(),
+            expected_count=len(batch),
+        )
+
+    def _post_ollama_legacy_single(
+        self,
+        *,
+        session: requests.Session,
+        base_url: str,
+        model_name: str,
+        timeout: int,
+        text: str,
+    ) -> List[float]:
+        response = session.post(
+            f"{base_url}/api/embeddings",
+            json={"model": model_name, "prompt": text},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return self._validate_ollama_embeddings_response(
+            response.json(),
+            expected_count=1,
+        )[0]
+
+    def _embed_single_ollama_text(
+        self,
+        *,
+        session: requests.Session,
+        base_url: str,
+        model_name: str,
+        timeout: int,
+        text: str,
+        depth: int = 0,
+    ) -> List[float]:
+        try:
+            return self._post_ollama_embed(
+                session=session,
+                base_url=base_url,
+                model_name=model_name,
+                timeout=timeout,
+                batch=[text],
+            )[0]
+        except Exception as exc:
+            self._log_ollama_retry(
+                exc=exc,
+                text=text,
+                batch_size=1,
+                retry_strategy="retry-individual",
+                model_name=model_name,
+            )
+
+            if not self._is_ollama_embed_endpoint_unsupported(exc):
+                try:
+                    return self._post_ollama_legacy_single(
+                        session=session,
+                        base_url=base_url,
+                        model_name=model_name,
+                        timeout=timeout,
+                        text=text,
+                    )
+                except Exception as legacy_exc:
+                    exc = legacy_exc
+                    self._log_ollama_retry(
+                        exc=legacy_exc,
+                        text=text,
+                        batch_size=1,
+                        retry_strategy="legacy-single",
+                        model_name=model_name,
+                    )
+
+            if self._is_ollama_context_length_error(exc):
+                token_budget, char_budget = self._get_ollama_input_budget(model_name)
+                if depth < self.MAX_OLLAMA_SPLIT_DEPTH and len(text) > 1:
+                    segments = self._split_text_to_ollama_segments(
+                        text,
+                        token_budget=max(128, token_budget // 2),
+                        char_budget=max(256, char_budget // 2),
+                        force_split=True,
+                    )
+                    if len(segments) > 1:
+                        self._log_ollama_retry(
+                            exc=exc,
+                            text=text,
+                            batch_size=1,
+                            retry_strategy=f"split-item->{len(segments)}",
+                            model_name=model_name,
+                        )
+                        child_embeddings = self._embed_ollama_batches(
+                            texts=segments,
+                            session=session,
+                            base_url=base_url,
+                            model_name=model_name,
+                            timeout=timeout,
+                            batch_size=1,
+                            depth=depth + 1,
+                        )
+                        return self._pool_embeddings(
+                            child_embeddings,
+                            weights=[len(segment) for segment in segments],
+                        )
+
+                truncated = self._truncate_text_to_budget(
+                    text,
+                    token_budget=max(128, token_budget // 2),
+                    char_budget=max(256, char_budget // 2),
+                )
+                if truncated and truncated != text and depth < self.MAX_OLLAMA_SPLIT_DEPTH:
+                    self._log_ollama_retry(
+                        exc=exc,
+                        text=text,
+                        batch_size=1,
+                        retry_strategy=f"truncate-item->{len(truncated)}",
+                        model_name=model_name,
+                    )
+                    return self._embed_single_ollama_text(
+                        session=session,
+                        base_url=base_url,
+                        model_name=model_name,
+                        timeout=timeout,
+                        text=truncated,
+                        depth=depth + 1,
+                    )
+
+            raise
+
+    def _embed_ollama_batches(
+        self,
+        *,
+        texts: List[str],
+        session: requests.Session,
+        base_url: str,
+        model_name: str,
+        timeout: int,
+        batch_size: int,
+        depth: int = 0,
+    ) -> List[List[float]]:
+        if not texts:
+            return []
+
+        embeddings: List[List[float]] = []
+        index = 0
+        current_batch_size = max(1, batch_size)
+
+        while index < len(texts):
+            batch = texts[index : index + current_batch_size]
+            try:
+                embeddings.extend(
+                    self._post_ollama_embed(
+                        session=session,
+                        base_url=base_url,
+                        model_name=model_name,
+                        timeout=timeout,
+                        batch=batch,
+                    )
+                )
+                index += len(batch)
+                continue
+            except Exception as exc:
+                if len(batch) > 1:
+                    next_batch_size = max(1, len(batch) // 2)
+                    self._log_ollama_retry(
+                        exc=exc,
+                        text=max(batch, key=len),
+                        batch_size=len(batch),
+                        retry_strategy=f"halve-batch->{next_batch_size}",
+                        model_name=model_name,
+                    )
+                    embeddings.extend(
+                        self._embed_ollama_batches(
+                            texts=batch,
+                            session=session,
+                            base_url=base_url,
+                            model_name=model_name,
+                            timeout=timeout,
+                            batch_size=next_batch_size,
+                            depth=depth + 1,
+                        )
+                    )
+                    index += len(batch)
+                    continue
+
+                embeddings.append(
+                    self._embed_single_ollama_text(
+                        session=session,
+                        base_url=base_url,
+                        model_name=model_name,
+                        timeout=timeout,
+                        text=batch[0],
+                        depth=depth + 1,
+                    )
+                )
+                index += 1
+
+        return embeddings
+
     def embed_with_ollama(self, texts: List[str]) -> List[List[float]]:
         """Call a local Ollama instance to generate embeddings in batches.
 
@@ -175,55 +643,36 @@ class EmbeddingService:
         runtime = _ai_runtime()
         ollama_base_url = runtime.ollama.base_url.rstrip("/")
         ollama_model = self.model or runtime.ollama.embedding_model
-        ollama_batch_size = runtime.ollama.embedding_batch_size
+        ollama_batch_size = max(1, runtime.ollama.embedding_batch_size)
         ollama_timeout = runtime.ollama.embedding_timeout
         session = self._get_http()
-        embeddings: List[List[float]] = []
+        prepared_inputs = self._prepare_ollama_inputs(texts)
+        flattened_segments: List[str] = []
+        spans: List[tuple[int, int, List[int]]] = []
 
-        for start in range(0, len(texts), ollama_batch_size):
-            batch = texts[start : start + ollama_batch_size]
-            try:
-                response = session.post(
-                    f"{ollama_base_url}/api/embed",
-                    json={"model": ollama_model, "input": batch},
-                    timeout=ollama_timeout,
-                )
-                if response.status_code == 404:
-                    raise requests.HTTPError("/api/embed unsupported", response=response)
-                response.raise_for_status()
-                embeddings.extend(
-                    self._validate_ollama_embeddings_response(
-                        response.json(),
-                        expected_count=len(batch),
-                    )
-                )
-                continue
-            except Exception as batch_err:
-                logger.warning(
-                    "Batch Ollama embedding failed for %d texts, falling back to legacy mode: %s",
-                    len(batch),
-                    batch_err,
-                )
+        for prepared in prepared_inputs:
+            start = len(flattened_segments)
+            flattened_segments.extend(prepared.segments)
+            spans.append((start, len(prepared.segments), [len(segment) for segment in prepared.segments]))
 
-            for text in batch:
-                response = session.post(
-                    f"{ollama_base_url}/api/embeddings",
-                    json={"model": ollama_model, "prompt": text},
-                    timeout=ollama_timeout,
-                )
-                if response.status_code != 200:
-                    raise RuntimeError(
-                        f"Ollama embedding failed (HTTP {response.status_code}): "
-                        f"{response.text[:200]}"
-                    )
-                embeddings.extend(
-                    self._validate_ollama_embeddings_response(
-                        response.json(),
-                        expected_count=1,
-                    )
-                )
+        segment_embeddings = self._embed_ollama_batches(
+            texts=flattened_segments,
+            session=session,
+            base_url=ollama_base_url,
+            model_name=ollama_model,
+            timeout=ollama_timeout,
+            batch_size=ollama_batch_size,
+        )
 
-        return embeddings
+        pooled_embeddings: List[List[float]] = []
+        for start, count, weights in spans:
+            current_embeddings = segment_embeddings[start : start + count]
+            if count > 1:
+                pooled_embeddings.append(self._pool_embeddings(current_embeddings, weights=weights))
+            else:
+                pooled_embeddings.append(current_embeddings[0] if current_embeddings else [])
+
+        return pooled_embeddings
 
 
     # ------------------------------------------------------------------
@@ -341,6 +790,28 @@ class EmbeddingService:
         """Embed a query string with caching enabled."""
         return self.embed_text(text)
 
+    def _embed_batch_uncached(self, texts: List[str]) -> List[List[float]]:
+        if self.provider == "openai" and self.client:
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=texts,
+            )
+            sorted_data = sorted(response.data, key=lambda x: x.index)
+            return [e.embedding for e in sorted_data]
+
+        if self.provider == "cohere" and self.client:
+            response = self.client.embed(
+                texts=texts,
+                model=self.model,
+                input_type="search_document",
+            )
+            return response.embeddings
+
+        if self.provider == "ollama":
+            return self.embed_with_ollama(texts)
+
+        raise RuntimeError("Embedding generation failed: no provider configured.")
+
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """Embed multiple texts.
 
@@ -357,44 +828,45 @@ class EmbeddingService:
         if not texts:
             return []
 
-        # Sanitise inputs
         texts = [t.strip() for t in texts if t and t.strip()]
         if not texts:
             return []
 
-        embeddings: List[List[float]] = []
+        cache = self._get_cache()
+        cache_model = self.get_model_name()
+        cached_embeddings: dict[str, List[float]] = {}
+        unique_texts = list(dict.fromkeys(texts))
+        missing_texts: List[str] = []
+
+        if cache is not None:
+            for text in unique_texts:
+                cached = cache.get(text, cache_model)
+                if cached is not None:
+                    cached_embeddings[text] = cached
+                else:
+                    missing_texts.append(text)
+        else:
+            missing_texts = unique_texts
+
+        fresh_embeddings: dict[str, List[float]] = {}
 
         try:
-            if self.provider == "openai" and self.client:
-                response = self.client.embeddings.create(
-                    model=self.model,
-                    input=texts,
-                )
-                # Maintain original order
-                sorted_data = sorted(response.data, key=lambda x: x.index)
-                embeddings = [e.embedding for e in sorted_data]
-
-            elif self.provider == "cohere" and self.client:
-                response = self.client.embed(
-                    texts=texts,
-                    model=self.model,
-                    input_type="search_document",
-                )
-                embeddings = response.embeddings
-
-            elif self.provider == "ollama":
-                embeddings = self.embed_with_ollama(texts)
-
-            else:
-                # STEP 1: no silent mock fallback — fail loudly.
-                raise RuntimeError("Embedding generation failed: no provider configured.")
+            if missing_texts:
+                generated_embeddings = self._embed_batch_uncached(missing_texts)
+                if len(generated_embeddings) != len(missing_texts):
+                    raise RuntimeError(
+                        f"Embedding provider returned {len(generated_embeddings)} embeddings for {len(missing_texts)} texts"
+                    )
+                fresh_embeddings = {
+                    text: embedding
+                    for text, embedding in zip(missing_texts, generated_embeddings)
+                }
+                if cache is not None:
+                    for text, embedding in fresh_embeddings.items():
+                        cache.set(text, self.get_model_name(), embedding)
 
         except Exception as primary_err:
-            # Primary provider failed — attempt Ollama as emergency fallback
-            # only when the primary was NOT already Ollama.
             if self.provider != "ollama":
-                # FIX: Check if Ollama has the same dimension as primary provider
-                # to prevent silent dimension mismatches during fallback
                 ollama_dimension = _ai_runtime().embeddings.dimension
                 if ollama_dimension != self.dimension:
                     logger.error(
@@ -412,7 +884,7 @@ class EmbeddingService:
                         f"({self.dimension}D vs {ollama_dimension}D). "
                         f"Cannot safely fall back. Original error: {primary_err}"
                     ) from primary_err
-                
+
                 logger.warning(
                     "Primary embedding provider '%s' failed (%s). "
                     "Falling back to Ollama (dimension-compatible).",
@@ -420,10 +892,17 @@ class EmbeddingService:
                     primary_err,
                 )
                 try:
-                    embeddings = self.embed_with_ollama(texts)
+                    fallback_targets = missing_texts or texts
+                    fallback_embeddings = self.embed_with_ollama(fallback_targets)
+                    fresh_embeddings = {
+                        text: embedding
+                        for text, embedding in zip(fallback_targets, fallback_embeddings)
+                    }
+                    if cache is not None:
+                        for text, embedding in fresh_embeddings.items():
+                            cache.set(text, self.get_model_name(), embedding)
                 except Exception as ollama_err:
                     logger.error("Ollama fallback also failed: %s", ollama_err)
-                    # STEP 1: raise — never return fake vectors.
                     raise RuntimeError(
                         f"All embedding providers failed. "
                         f"Primary error: {primary_err}. "
@@ -434,7 +913,11 @@ class EmbeddingService:
                     f"Embedding generation failed: {primary_err}"
                 ) from primary_err
 
-        # BONUS: validate every vector before returning
+        embeddings = [
+            cached_embeddings.get(text) or fresh_embeddings[text]
+            for text in texts
+        ]
+
         for i, vec in enumerate(embeddings):
             if not self.is_valid_embedding(vec):
                 raise RuntimeError(

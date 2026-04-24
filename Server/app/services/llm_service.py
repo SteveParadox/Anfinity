@@ -1,12 +1,13 @@
 """LLM integration service with centralized provider configuration."""
 
 import asyncio
+import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import httpx
 
@@ -361,6 +362,48 @@ class LLMService:
             model=self.openai_model,
             provider=LLMProvider.OPENAI,
         )
+
+    async def async_openai_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Generate a JSON object with OpenAI and parse it server-side."""
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise RuntimeError("openai package not installed") from exc
+
+        runtime = _ai_runtime()
+        api_key = runtime.openai.api_key
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not configured")
+
+        client = AsyncOpenAI(api_key=api_key, timeout=runtime.openai.timeout)
+        resolved_model = model or self.openai_model
+        resolved_max_tokens = max_tokens if max_tokens is not None else runtime.llm.max_tokens
+        response = await client.chat.completions.create(
+            model=resolved_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=resolved_max_tokens,
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content or "{}"
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"OpenAI returned malformed JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("OpenAI returned a non-object JSON payload")
+        return parsed
 
     def _provider_order(self, primary_override: Optional[str] = None) -> List[str]:
         primary = str(primary_override or self.primary_provider or "ollama").lower()
