@@ -19,7 +19,7 @@
  * • Manual refresh button added to the header.
  */
 
-import { useState, useEffect, useContext, useCallback, useRef } from 'react';
+import { useState, useEffect, useContext, useCallback, useDeferredValue, useMemo } from 'react';
 import {
   FileText,
   Trash2,
@@ -205,6 +205,8 @@ interface DocumentRowProps {
   onRetryOptimistic: (id: string) => void;
   onReload: () => Promise<void>;
   canMutate: boolean;
+  selected: boolean;
+  onSelect: (id: string) => void;
 }
 
 function DocumentRow({
@@ -214,6 +216,8 @@ function DocumentRow({
   onRetryOptimistic,
   onReload,
   canMutate,
+  selected,
+  onSelect,
 }: DocumentRowProps) {
   const ingestion = useDocumentIngestion(doc.id, workspaceId);
 
@@ -274,17 +278,28 @@ function DocumentRow({
     >
       {/* Main row */}
       <div
+        role="button"
+        tabIndex={0}
+        onClick={() => onSelect(doc.id)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            onSelect(doc.id);
+          }
+        }}
         style={{
           display: 'grid',
           gridTemplateColumns: '1fr auto auto auto auto',
           gap: '16px',
           alignItems: 'center',
           padding: '12px 16px',
-          background: TT.inkRaised,
-          border: `1px solid ${confirmingDelete ? TT.errorBorder : TT.inkBorder}`,
+          background: selected ? 'rgba(245,230,66,0.05)' : TT.inkRaised,
+          border: `1px solid ${confirmingDelete ? TT.errorBorder : selected ? 'rgba(245,230,66,0.28)' : TT.inkBorder}`,
+          borderLeft: `3px solid ${selected ? TT.yolk : 'transparent'}`,
           borderRadius: '6px',
           fontSize: '13px',
           transition: 'border-color 0.2s',
+          cursor: 'pointer',
         }}
       >
         {/* Title + metadata */}
@@ -458,6 +473,12 @@ export function DocumentsView() {
   const [isLoading, setIsLoading] = useState(true);    // True only on the first load
   const [isRefreshing, setIsRefreshing] = useState(false); // True on background polls
   const [pageError, setPageError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | DocumentType['status']>('all');
+  const [sortMode, setSortMode] = useState<'recent' | 'title' | 'largest'>('recent');
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
+
+  const deferredSearchQuery = useDeferredValue(searchQuery.trim().toLowerCase());
 
   const authContext = useContext(AuthContext);
   const workspaceId = authContext?.currentWorkspaceId;
@@ -537,6 +558,52 @@ export function DocumentsView() {
    * refresh the list after a retry without duplicating the fetch logic.
    */
   const handleReload = useCallback(() => loadDocuments({ silent: true }), [loadDocuments]);
+
+  useEffect(() => {
+    setSelectedDocumentId((current) => (current && documents.some((doc) => doc.id === current) ? current : documents[0]?.id ?? null));
+  }, [documents]);
+
+  const documentStats = useMemo(() => {
+    return {
+      total: documents.length,
+      indexed: documents.filter((doc) => doc.status === 'indexed').length,
+      processing: documents.filter((doc) => doc.status === 'processing' || doc.status === 'pending').length,
+      failed: documents.filter((doc) => doc.status === 'failed').length,
+    };
+  }, [documents]);
+
+  const filteredDocuments = useMemo(() => {
+    const nextDocuments = documents.filter((doc) => {
+      const matchesStatus = statusFilter === 'all' || doc.status === statusFilter;
+      const matchesQuery =
+        !deferredSearchQuery ||
+        [doc.title, doc.sourceType, doc.status]
+          .join(' ')
+          .toLowerCase()
+          .includes(deferredSearchQuery);
+
+      return matchesStatus && matchesQuery;
+    });
+
+    nextDocuments.sort((left, right) => {
+      if (sortMode === 'title') {
+        return left.title.localeCompare(right.title);
+      }
+
+      if (sortMode === 'largest') {
+        return (right.tokenCount ?? 0) - (left.tokenCount ?? 0);
+      }
+
+      return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+    });
+
+    return nextDocuments;
+  }, [deferredSearchQuery, documents, sortMode, statusFilter]);
+
+  const selectedDocument =
+    documents.find((doc) => doc.id === selectedDocumentId) ??
+    filteredDocuments[0] ??
+    null;
 
   // ── Guard: no workspace ─────────────────────────────────────────────────────
 
@@ -625,7 +692,7 @@ export function DocumentsView() {
             Documents
           </h1>
           <p style={{ color: TT.inkSubtle, fontSize: '14px' }}>
-            {documents.length} document{documents.length !== 1 ? 's' : ''} in this workspace
+            {filteredDocuments.length} visible of {documents.length} document{documents.length !== 1 ? 's' : ''} in this workspace
           </p>
         </div>
 
@@ -672,6 +739,158 @@ export function DocumentsView() {
         )}
       </AnimatePresence>
 
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '10px', marginBottom: '16px' }}>
+        {[
+          { label: 'Total', value: documentStats.total, helper: 'all documents' },
+          { label: 'Indexed', value: documentStats.indexed, helper: 'search-ready' },
+          { label: 'Processing', value: documentStats.processing, helper: 'still running' },
+          { label: 'Failed', value: documentStats.failed, helper: 'need attention' },
+        ].map(({ label, value, helper }) => (
+          <div
+            key={label}
+            style={{
+              background: TT.inkRaised,
+              border: `1px solid ${TT.inkBorder}`,
+              borderLeft: `3px solid ${TT.yolk}`,
+              borderRadius: '6px',
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ fontSize: '10px', letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkSubtle, marginBottom: '6px' }}>
+              {label}
+            </div>
+            <div style={{ fontSize: '26px', fontWeight: 700, color: TT.snow, lineHeight: 1 }}>{value}</div>
+            <div style={{ fontSize: '11px', color: TT.inkMuted, marginTop: '6px' }}>{helper}</div>
+          </div>
+        ))}
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: '10px',
+          alignItems: 'center',
+          marginBottom: '16px',
+          padding: '12px',
+          background: TT.inkRaised,
+          border: `1px solid ${TT.inkBorder}`,
+          borderRadius: '8px',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            background: TT.inkBlack,
+            border: `1px solid ${TT.inkBorder}`,
+            borderRadius: '6px',
+            padding: '0 10px',
+            height: '38px',
+            minWidth: '240px',
+          }}
+        >
+          <FileText size={13} color={TT.inkMuted} />
+          <input
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="Search documents"
+            aria-label="Search documents"
+            style={{
+              flex: 1,
+              height: '100%',
+              background: 'transparent',
+              border: 'none',
+              color: TT.snow,
+              outline: 'none',
+              fontSize: '13px',
+            }}
+          />
+        </div>
+
+        {(['all', 'indexed', 'processing', 'pending', 'failed'] as const).map((status) => (
+          <button
+            key={status}
+            type="button"
+            onClick={() => setStatusFilter(status)}
+            aria-pressed={statusFilter === status}
+            style={{
+              borderRadius: '999px',
+              border: `1px solid ${statusFilter === status ? 'rgba(245,230,66,0.28)' : TT.inkBorder}`,
+              background: statusFilter === status ? 'rgba(245,230,66,0.08)' : TT.inkBlack,
+              color: statusFilter === status ? TT.yolk : TT.inkMuted,
+              padding: '6px 10px',
+              fontSize: '10px',
+              letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              cursor: 'pointer',
+            }}
+          >
+            {status}
+          </button>
+        ))}
+
+        {(['recent', 'title', 'largest'] as const).map((mode) => (
+          <button
+            key={mode}
+            type="button"
+            onClick={() => setSortMode(mode)}
+            aria-pressed={sortMode === mode}
+            style={{
+              borderRadius: '999px',
+              border: `1px solid ${sortMode === mode ? 'rgba(245,245,245,0.14)' : TT.inkBorder}`,
+              background: sortMode === mode ? TT.inkBorder : TT.inkBlack,
+              color: sortMode === mode ? TT.snow : TT.inkMuted,
+              padding: '6px 10px',
+              fontSize: '10px',
+              letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              cursor: 'pointer',
+            }}
+          >
+            {mode}
+          </button>
+        ))}
+      </div>
+
+      {selectedDocument ? (
+        <div
+          style={{
+            marginBottom: '16px',
+            background: TT.inkRaised,
+            border: `1px solid ${TT.inkBorder}`,
+            borderLeft: `3px solid ${TT.yolk}`,
+            borderRadius: '8px',
+            padding: '14px 16px',
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
+            <div>
+              <div style={{ color: TT.snow, fontSize: '15px', fontWeight: 600, marginBottom: '4px' }}>{selectedDocument.title}</div>
+              <div style={{ color: TT.inkSubtle, fontSize: '12px' }}>
+                {selectedDocument.sourceType} source • Created {formatDistanceToNow(new Date(selectedDocument.createdAt))} ago
+              </div>
+            </div>
+            <StatusBadge status={selectedDocument.status} />
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '14px', marginTop: '12px', fontSize: '11px', color: TT.inkMuted }}>
+            <span>{selectedDocument.chunkCount ?? 0} chunks</span>
+            <span>{selectedDocument.tokenCount ?? 0} tokens</span>
+            {selectedDocument.storageUrl ? (
+              <a
+                href={selectedDocument.storageUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: TT.yolk, textDecoration: 'none' }}
+              >
+                Open source
+              </a>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       {/* Empty state */}
       {documents.length === 0 ? (
         <div
@@ -688,10 +907,43 @@ export function DocumentsView() {
           <p style={{ marginBottom: '6px', color: TT.snow }}>No documents uploaded yet</p>
           <p style={{ fontSize: '12px' }}>Upload your first document to get started</p>
         </div>
+      ) : filteredDocuments.length === 0 ? (
+        <div
+          style={{
+            padding: '32px 24px',
+            textAlign: 'center',
+            background: TT.inkRaised,
+            borderRadius: '8px',
+            border: `1px dashed ${TT.inkBorder}`,
+            color: TT.inkSubtle,
+          }}
+        >
+          <p style={{ marginBottom: '6px', color: TT.snow }}>No documents match the current filters</p>
+          <p style={{ fontSize: '12px', marginBottom: '14px' }}>Adjust the search, status, or sort controls to broaden the list.</p>
+          <button
+            type="button"
+            onClick={() => {
+              setSearchQuery('');
+              setStatusFilter('all');
+              setSortMode('recent');
+            }}
+            style={{
+              background: TT.inkBlack,
+              border: `1px solid ${TT.inkBorder}`,
+              borderRadius: '6px',
+              color: TT.yolk,
+              padding: '8px 12px',
+              cursor: 'pointer',
+              fontSize: '12px',
+            }}
+          >
+            Reset filters
+          </button>
+        </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           <AnimatePresence initial={false}>
-            {documents.map((doc) => (
+            {filteredDocuments.map((doc) => (
               <DocumentRow
                 key={doc.id}
                 doc={doc}
@@ -700,6 +952,8 @@ export function DocumentsView() {
                 onRetryOptimistic={handleRetryOptimistic}
                 onReload={handleReload}
                 canMutate={canMutateDocuments}
+                selected={selectedDocument?.id === doc.id}
+                onSelect={setSelectedDocumentId}
               />
             ))}
           </AnimatePresence>

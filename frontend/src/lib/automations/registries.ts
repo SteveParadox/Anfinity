@@ -212,6 +212,22 @@ export const TRIGGER_TYPES = defineTriggerRegistry({
       { key: "payload.metadata.source", label: "Payload source", kind: "string" },
     ],
   },
+  "competitive_intelligence.urgent_finding": {
+    id: "competitive_intelligence.urgent_finding",
+    eventName: "automation/competitive_intelligence.urgent_finding",
+    label: "Urgent Competitive Finding",
+    description: "Runs immediately when competitive intelligence detects a high-urgency page change.",
+    icon: "Globe2",
+    payloadFields: [
+      { key: "workspace.id", label: "Workspace ID", kind: "string", required: true },
+      { key: "competitive.source.id", label: "Source ID", kind: "string", required: true },
+      { key: "competitive.source.name", label: "Source name", kind: "string" },
+      { key: "competitive.source.url", label: "Source URL", kind: "url" },
+      { key: "competitive.analysis.overall_urgency", label: "Overall urgency", kind: "number" },
+      { key: "competitive.analysis.urgency_label", label: "Urgency label", kind: "string" },
+      { key: "competitive.analysis.findings", label: "Findings", kind: "json" },
+    ],
+  },
 });
 
 export const ACTION_TYPES = defineActionRegistry({

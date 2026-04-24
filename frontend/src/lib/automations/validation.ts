@@ -187,8 +187,8 @@ export function validateActionConfig<T extends AutomationActionType>(
 
 export function validateAutomationRegistryIntegrity(): void {
   const triggerIds = new Set(SUPPORTED_TRIGGER_TYPES);
-  if (triggerIds.size !== 10) {
-    throw new Error(`Expected exactly 10 trigger types, found ${triggerIds.size}`);
+  if (triggerIds.size !== 11) {
+    throw new Error(`Expected exactly 11 trigger types, found ${triggerIds.size}`);
   }
 
   const actionIds = new Set(SUPPORTED_ACTION_TYPES);

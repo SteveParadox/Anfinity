@@ -10,6 +10,7 @@ import {
   transformNoteCommentFromAPI,
   transformNoteContributionFromAPI,
   transformNoteFromAPI,
+  transformOnboardingCurriculumFromAPI,
   transformPaginatedNotes,
   transformPaginatedDocuments,
   transformThinkingSessionAccessFromAPI,
@@ -30,6 +31,7 @@ import type {
   NoteComment,
   NoteContribution,
   NoteConnectionSuggestion,
+  OnboardingCurriculum,
   NoteInvite,
   NoteVersion,
   ThinkingSession,
@@ -175,10 +177,13 @@ export interface Workspace {
   id: string;
   name: string;
   description?: string;
+  role?: 'owner' | 'admin' | 'member' | 'viewer';
   owner_id: string;
   settings: Record<string, any>;
   created_at: string;
   updated_at?: string;
+  member_count?: number;
+  members?: Array<Record<string, any>>;
 }
 
 export interface SearchResult {
@@ -187,6 +192,11 @@ export interface SearchResult {
   document_title: string;
   content: string;
   highlight: string;
+  highlights?: SmartHighlight[];
+  matched_chunks?: MatchedSearchChunk[];
+  confidence?: 'low' | 'medium' | 'high' | string;
+  confidence_score?: number;
+  match_summary?: Record<string, any>;
   tags: string[];
   source_kind: string;
   source_type: string;
@@ -201,6 +211,35 @@ export interface SearchResult {
   recency_score: number;
   usage_score: number;
   final_score: number;
+}
+
+export interface SmartHighlight {
+  text: string;
+  start_offset: number;
+  end_offset: number;
+  score: number;
+  matched_terms: string[];
+  heading?: string | null;
+  confidence: 'low' | 'medium' | 'high' | string;
+}
+
+export interface MatchedSearchChunk {
+  chunk_id: string;
+  note_id: string;
+  chunk_index: number;
+  text: string;
+  start_offset: number;
+  end_offset: number;
+  heading?: string | null;
+  score: number;
+  semantic_score: number;
+  lexical_score: number;
+  evidence_score: number;
+  domain_alignment: number;
+  off_topic: boolean;
+  confidence: 'low' | 'medium' | 'high' | string;
+  highlights: SmartHighlight[];
+  metadata?: Record<string, any>;
 }
 
 export interface SearchResponse {
@@ -224,7 +263,9 @@ export interface TokenResponse {
   workspaces?: Array<{
     id: string;
     name: string;
+    description?: string;
     role: 'owner' | 'admin' | 'member' | 'viewer';
+    member_count?: number;
   }>;
 }
 
@@ -1391,6 +1432,21 @@ class ApiClient {
       signal: options?.signal,
       timeout: 300000, // 300s for RAG queries (180s backend LLM + 30s retrieval + 90s buffer for slow Ollama)
     });
+  }
+
+  async generateOnboardingCurriculum(
+    workspaceId: string,
+    role: string
+  ): Promise<OnboardingCurriculum> {
+    const response = await this.request<any>('/onboarding/curriculum', {
+      method: 'POST',
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        role,
+      }),
+      timeout: 120000,
+    });
+    return transformOnboardingCurriculumFromAPI(response);
   }
 
   // ==================== STEP 7 & 8: Answer Feedback & Verification ====================

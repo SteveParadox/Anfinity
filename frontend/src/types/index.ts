@@ -193,6 +193,7 @@ export interface ApprovalWorkflowTransition {
 
 export type UserNotificationType =
   | 'automation'
+  | 'note_comment'
   | 'comment_mention'
   | 'comment_reply'
   | 'approval_submitted'
@@ -517,6 +518,68 @@ export interface Workspace {
   updatedAt: Date;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface OnboardingCandidateNote {
+  noteId: string;
+  title: string;
+  excerpt: string;
+  summary?: string;
+  tags: string[];
+  noteType: string;
+  semanticScore: number;
+  popularityScore: number;
+  freshnessScore: number;
+  completenessScore: number;
+  rankingScore: number;
+  matchedQueries: string[];
+  queryHits: number;
+  popularityCount: number;
+  groundingSources: string[];
+}
+
+export interface OnboardingReadingItem {
+  noteId: string;
+  title: string;
+  reason: string;
+}
+
+export interface OnboardingWeek {
+  weekNumber: number;
+  theme: string;
+  objectives: string[];
+  readingList: OnboardingReadingItem[];
+  conceptCheckpoints: string[];
+  supportNoteIds: string[];
+}
+
+export interface OnboardingGlossaryEntry {
+  term: string;
+  definition: string;
+  supportNoteIds: string[];
+}
+
+export interface OnboardingGroundingMetadata {
+  candidateNoteCount: number;
+  modelCandidateNoteCount: number;
+  selectedNoteCount: number;
+  groundingConfidence: 'low' | 'medium' | 'high';
+  insufficientContent: boolean;
+  warnings: string[];
+  roleQueries: string[];
+  fallbackQueries: string[];
+  usedNoteIds: string[];
+}
+
+export interface OnboardingCurriculum {
+  roleInput: string;
+  role: string;
+  normalizedRole: string;
+  summary: string;
+  weeks: OnboardingWeek[];
+  glossary: OnboardingGlossaryEntry[];
+  grounding: OnboardingGroundingMetadata;
+  candidateNotes: OnboardingCandidateNote[];
 }
 
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';

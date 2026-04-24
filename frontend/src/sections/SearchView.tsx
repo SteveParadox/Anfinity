@@ -51,12 +51,47 @@ interface SemanticResult {
   recency_score: number;
   usage_score: number;
   final_score: number;
+  highlights?: SmartHighlight[];
+  matched_chunks?: MatchedSearchChunk[];
+  confidence?: 'low' | 'medium' | 'high' | string;
+  confidence_score?: number;
+  match_summary?: Record<string, unknown>;
+}
+
+interface SmartHighlight {
+  text: string;
+  start_offset: number;
+  end_offset: number;
+  score: number;
+  matched_terms: string[];
+  heading?: string | null;
+  confidence: 'low' | 'medium' | 'high' | string;
+}
+
+interface MatchedSearchChunk {
+  chunk_id: string;
+  note_id: string;
+  chunk_index: number;
+  text: string;
+  start_offset: number;
+  end_offset: number;
+  heading?: string | null;
+  score: number;
+  semantic_score: number;
+  lexical_score: number;
+  evidence_score: number;
+  domain_alignment: number;
+  off_topic: boolean;
+  confidence: 'low' | 'medium' | 'high' | string;
+  highlights: SmartHighlight[];
+  metadata?: Record<string, unknown>;
 }
 
 interface SearchDisplayResult {
   note: Note;
   score: number;
-  highlights: string[];
+  highlights: SmartHighlight[];
+  legacyHighlight: string;
   sourceType: string;
   sourceKind: string;
   chunkIndex: number;
@@ -64,6 +99,9 @@ interface SearchDisplayResult {
   contextBefore?: string | null;
   contextAfter?: string | null;
   metadata: Record<string, unknown>;
+  matchedChunks: MatchedSearchChunk[];
+  confidence: string;
+  confidenceScore: number;
   raw: SemanticResult;
 }
 
@@ -88,6 +126,43 @@ const TT = {
   fontMono:    "'IBM Plex Mono', monospace",
   fontBody:    "'IBM Plex Sans', sans-serif",
 };
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function renderHighlightedText(text: string, matchedTerms: string[]) {
+  const terms = Array.from(new Set((matchedTerms || []).map((term) => term.trim()).filter(Boolean)))
+    .sort((a, b) => b.length - a.length);
+
+  if (!terms.length) return text;
+
+  const regex = new RegExp(`(${terms.map(escapeRegExp).join('|')})`, 'gi');
+  const parts = text.split(regex).filter(Boolean);
+
+  return parts.map((part, index) => {
+    const isMatch = terms.some((term) => part.toLowerCase() === term.toLowerCase());
+    if (!isMatch) return <span key={`${part}-${index}`}>{part}</span>;
+    return (
+      <mark
+        key={`${part}-${index}`}
+        style={{
+          color: TT.snow,
+          background: 'rgba(245,230,66,0.18)',
+          borderBottom: `1px solid ${TT.yolk}`,
+          padding: '0 1px',
+        }}
+      >
+        {part}
+      </mark>
+    );
+  });
+}
+
+function confidenceLabel(confidence: string, score: number) {
+  const normalized = confidence || (score >= 0.72 ? 'high' : score >= 0.46 ? 'medium' : 'low');
+  if (normalized === 'high') return 'Strong evidence';
+  if (normalized === 'medium') return 'Good evidence';
+  return 'Weak evidence';
+}
 
 export function SearchView() {
   const [query, setQuery] = useState('');
@@ -192,31 +267,51 @@ export function SearchView() {
 
   // Transform query results to Note format for display
   const displayResults = useMemo(() => {
-    return semanticResults.map((result) => ({
-      note: {
-        id: result.chunk_id,
-        title: result.document_title,
-        content: result.content,
-        summary: result.highlight || result.content.substring(0, 150),
-        tags: result.tags || [],
-        connections: [] as string[],
-        userId: '',
-        workspaceId: workspaceId || '',
-        type: 'document' as const,
-        createdAt: new Date(result.created_at),
-        updatedAt: new Date(result.created_at),
-      },
-      score: result.final_score,
-      highlights: [result.highlight || result.content.substring(0, 100) + '...'],
-      sourceType: result.source_type,
-      sourceKind: result.source_kind,
-      chunkIndex: result.chunk_index,
-      tokenCount: result.token_count || 0,
-      contextBefore: result.context_before,
-      contextAfter: result.context_after,
-      metadata: result.metadata || {},
-      raw: result,
-    }));
+    return semanticResults.map((result) => {
+      const structuredHighlights = Array.isArray(result.highlights) && result.highlights.length > 0
+        ? result.highlights
+        : result.highlight
+          ? [{
+            text: result.highlight || `${result.content.substring(0, 100)}${result.content.length > 100 ? '...' : ''}`,
+            start_offset: 0,
+            end_offset: Math.min(result.content.length, result.highlight.length),
+            score: result.final_score,
+            matched_terms: [],
+            heading: null,
+            confidence: result.confidence || 'low',
+          }]
+          : [];
+
+      return {
+        note: {
+          id: result.source_kind === 'note' ? result.document_id : result.chunk_id,
+          title: result.document_title,
+          content: result.content,
+          summary: structuredHighlights[0]?.text || 'No focused highlight available',
+          tags: result.tags || [],
+          connections: [] as string[],
+          userId: '',
+          workspaceId: workspaceId || '',
+          type: result.source_kind === 'note' ? 'note' as const : 'document' as const,
+          createdAt: new Date(result.created_at),
+          updatedAt: new Date(result.created_at),
+        },
+        score: result.final_score,
+        highlights: structuredHighlights,
+        legacyHighlight: result.highlight || '',
+        sourceType: result.source_type,
+        sourceKind: result.source_kind,
+        chunkIndex: result.chunk_index,
+        tokenCount: result.token_count || 0,
+        contextBefore: result.context_before,
+        contextAfter: result.context_after,
+        metadata: result.metadata || {},
+        matchedChunks: Array.isArray(result.matched_chunks) ? result.matched_chunks : [],
+        confidence: result.confidence || 'low',
+        confidenceScore: result.confidence_score ?? result.final_score,
+        raw: result,
+      };
+    });
   }, [semanticResults, workspaceId]);
 
   const filteredResults = useMemo(() => {
@@ -448,7 +543,8 @@ export function SearchView() {
     }
 
     try {
-      await api.logSearchClick(workspaceId, searchLogId, result.note.id);
+      const clickTargetId = result.sourceKind === 'note' ? result.raw.document_id : result.raw.chunk_id;
+      await api.logSearchClick(workspaceId, searchLogId, clickTargetId);
     } catch (err) {
       console.error('Failed to log semantic search click:', err);
     }
@@ -840,8 +936,8 @@ export function SearchView() {
             {filteredResults.length === 0 && !error ? (
               <div style={{ textAlign: 'center', padding: '60px 0' }}>
                 <Lightbulb size={36} color={TT.inkMid} style={{ margin: '0 auto 16px' }} />
-                <div style={{ fontFamily: TT.fontDisplay, fontSize: 24, letterSpacing: '0.06em', color: TT.snow, marginBottom: 8 }}>NO RESULTS</div>
-                <p style={{ fontSize: 10.5, letterSpacing: '0.04em', color: TT.inkMuted, textTransform: 'uppercase' }}>Try different keywords or upload more documents</p>
+                <div style={{ fontFamily: TT.fontDisplay, fontSize: 24, letterSpacing: '0.06em', color: TT.snow, marginBottom: 8 }}>NO STRONG MATCHES</div>
+                <p style={{ fontSize: 10.5, letterSpacing: '0.04em', color: TT.inkMuted, textTransform: 'uppercase' }}>Try a more specific natural-language query or add notes with clearer source content</p>
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -883,14 +979,19 @@ export function SearchView() {
                               <Brain size={9} color={TT.yolk} />
                               <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.yolk }}>{Math.round(result.score * 100)}% match</span>
                             </div>
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: result.confidence === 'low' ? TT.inkMuted : TT.snow }}>
+                              {confidenceLabel(result.confidence, result.confidenceScore)}
+                            </span>
                           </div>
 
                           {/* Highlights */}
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginBottom: 10 }}>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 10 }}>
                             {result.highlights.slice(0, 2).map((h, i) => (
-                              <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                                {h.includes('...') && <Quote size={9} color={TT.inkMid} style={{ marginTop: 3, flexShrink: 0 }} />}
-                                <span style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.5, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{h}</span>
+                              <div key={`${h.start_offset}-${i}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                                <Quote size={9} color={h.confidence === 'low' ? TT.inkMid : TT.yolk} style={{ marginTop: 3, flexShrink: 0 }} />
+                                <span style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.5, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                                  {renderHighlightedText(h.text, h.matched_terms)}
+                                </span>
                               </div>
                             ))}
                           </div>
@@ -905,6 +1006,11 @@ export function SearchView() {
                             <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
                               Chunk {result.chunkIndex + 1}
                             </span>
+                            {result.highlights[0]?.heading && (
+                              <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
+                                {result.highlights[0].heading}
+                              </span>
+                            )}
                             {result.tokenCount > 0 && (
                               <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
                                 {result.tokenCount} tokens
@@ -1092,13 +1198,48 @@ export function SearchView() {
               )}
 
               <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '14px 16px', marginBottom: 12 }}>
-                <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk, marginBottom: 8 }}>
-                  Matched Chunk Text
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+                  <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk }}>
+                    Matched Source Section
+                  </div>
+                  <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: TT.inkMuted }}>
+                    {confidenceLabel(selectedResult.confidence, selectedResult.confidenceScore)}
+                  </span>
                 </div>
                 <p style={{ fontFamily: TT.fontBody, fontSize: 13, lineHeight: 1.7, color: TT.inkSubtle, whiteSpace: 'pre-wrap', margin: 0 }}>
-                  {selectedResult.note.content}
+                  {renderHighlightedText(
+                    selectedResult.note.content,
+                    selectedResult.highlights.flatMap((highlight) => highlight.matched_terms || [])
+                  )}
                 </p>
               </div>
+
+              {selectedResult.highlights.length > 0 && (
+                <div style={{ background: 'rgba(245,230,66,0.04)', border: `1px solid rgba(245,230,66,0.15)`, borderRadius: 3, padding: '12px 14px', marginBottom: 12 }}>
+                  <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk, marginBottom: 8 }}>
+                    Smart Highlights
+                  </div>
+                  <div style={{ display: 'grid', gap: 8 }}>
+                    {selectedResult.highlights.map((highlight, index) => (
+                      <div key={`${highlight.start_offset}-${index}`}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                          <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: TT.inkMid }}>
+                            chars {highlight.start_offset}-{highlight.end_offset}
+                          </span>
+                          {highlight.heading && (
+                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, color: TT.inkMuted }}>
+                              {highlight.heading}
+                            </span>
+                          )}
+                        </div>
+                        <p style={{ fontFamily: TT.fontBody, fontSize: 11.5, lineHeight: 1.6, color: TT.inkSubtle, margin: 0 }}>
+                          {renderHighlightedText(highlight.text, highlight.matched_terms)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {selectedResult.contextAfter && (
                 <div style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '12px 14px', marginBottom: 12 }}>
@@ -1125,7 +1266,7 @@ export function SearchView() {
               {/* Footer */}
               <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: `1px solid ${TT.inkBorder}`, paddingTop: 12 }}>
                 <span style={{ fontSize: 9.5, color: TT.inkMid, letterSpacing: '0.04em' }}>
-                  Semantic match from RAG index
+                  Semantic match grounded in matched source text
                 </span>
                 {queryResults?.confidence && hasGroundedAnswer && (
                   <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 9.5, color: TT.yolk }}>

@@ -9,6 +9,12 @@ import type {
   ApprovalWorkflowItem,
   ApprovalWorkflowSummary,
   ApprovalWorkflowTransition,
+  OnboardingCandidateNote,
+  OnboardingCurriculum,
+  OnboardingGlossaryEntry,
+  OnboardingGroundingMetadata,
+  OnboardingReadingItem,
+  OnboardingWeek,
   Note, NoteComment, NoteCommentMention, NoteCommentReactionSummary, NoteCommentUser, NoteContribution, UserNotification, Workspace, Document, 
   AIInsight, SearchResult, PricingPlan,
   ThinkingContribution,
@@ -212,6 +218,126 @@ export function transformApprovalWorkflowTransitionFromAPI(item: any): ApprovalW
   };
 }
 
+function transformOnboardingReadingItemFromAPI(item: any): OnboardingReadingItem {
+  return {
+    noteId: item.note_id || item.noteId || '',
+    title: item.title || '',
+    reason: item.reason || '',
+  };
+}
+
+function createEmptyOnboardingWeek(weekNumber: number): OnboardingWeek {
+  return {
+    weekNumber,
+    theme: `Week ${weekNumber}: Available workspace material`,
+    objectives: [],
+    readingList: [],
+    conceptCheckpoints: [],
+    supportNoteIds: [],
+  };
+}
+
+function dedupeStrings(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return Array.from(new Set(values.map(String).map((value) => value.trim()).filter(Boolean)));
+}
+
+function transformOnboardingWeekFromAPI(week: any): OnboardingWeek {
+  return {
+    weekNumber: week.week_number ?? week.weekNumber ?? 0,
+    theme: week.theme || '',
+    objectives: Array.isArray(week.objectives) ? week.objectives.map(String) : [],
+    readingList: Array.isArray(week.reading_list || week.readingList)
+      ? (week.reading_list || week.readingList)
+          .map(transformOnboardingReadingItemFromAPI)
+          .filter((item: OnboardingReadingItem) => Boolean(item.noteId))
+      : [],
+    conceptCheckpoints: Array.isArray(week.concept_checkpoints || week.conceptCheckpoints)
+      ? (week.concept_checkpoints || week.conceptCheckpoints).map(String)
+      : [],
+    supportNoteIds: dedupeStrings(week.support_note_ids || week.supportNoteIds),
+  };
+}
+
+function transformOnboardingGlossaryEntryFromAPI(entry: any): OnboardingGlossaryEntry {
+  return {
+    term: entry.term || '',
+    definition: entry.definition || '',
+    supportNoteIds: Array.isArray(entry.support_note_ids || entry.supportNoteIds)
+      ? (entry.support_note_ids || entry.supportNoteIds).map(String)
+      : [],
+  };
+}
+
+function transformOnboardingGroundingFromAPI(grounding: any): OnboardingGroundingMetadata {
+  const confidence = grounding?.grounding_confidence || grounding?.groundingConfidence;
+  return {
+    candidateNoteCount: grounding?.candidate_note_count ?? grounding?.candidateNoteCount ?? 0,
+    modelCandidateNoteCount: grounding?.model_candidate_note_count ?? grounding?.modelCandidateNoteCount ?? 0,
+    selectedNoteCount: grounding?.selected_note_count ?? grounding?.selectedNoteCount ?? 0,
+    groundingConfidence: confidence === 'high' || confidence === 'medium' || confidence === 'low' ? confidence : 'low',
+    insufficientContent: Boolean(grounding?.insufficient_content ?? grounding?.insufficientContent),
+    warnings: Array.isArray(grounding?.warnings) ? grounding.warnings.map(String) : [],
+    roleQueries: dedupeStrings(grounding?.role_queries || grounding?.roleQueries),
+    fallbackQueries: dedupeStrings(grounding?.fallback_queries || grounding?.fallbackQueries),
+    usedNoteIds: dedupeStrings(grounding?.used_note_ids || grounding?.usedNoteIds),
+  };
+}
+
+function transformOnboardingCandidateNoteFromAPI(note: any): OnboardingCandidateNote {
+  return {
+    noteId: note.note_id || note.noteId || '',
+    title: note.title || '',
+    excerpt: note.excerpt || '',
+    summary: note.summary || undefined,
+    tags: Array.isArray(note.tags) ? note.tags.map(String) : [],
+    noteType: note.note_type || note.noteType || 'note',
+    semanticScore: Number(note.semantic_score ?? note.semanticScore ?? 0),
+    popularityScore: Number(note.popularity_score ?? note.popularityScore ?? 0),
+    freshnessScore: Number(note.freshness_score ?? note.freshnessScore ?? 0),
+    completenessScore: Number(note.completeness_score ?? note.completenessScore ?? 0),
+    rankingScore: Number(note.ranking_score ?? note.rankingScore ?? 0),
+    matchedQueries: Array.isArray(note.matched_queries || note.matchedQueries)
+      ? (note.matched_queries || note.matchedQueries).map(String)
+      : [],
+    queryHits: Number(note.query_hits ?? note.queryHits ?? 0),
+    popularityCount: Number(note.popularity_count ?? note.popularityCount ?? 0),
+    groundingSources: Array.isArray(note.grounding_sources || note.groundingSources)
+      ? (note.grounding_sources || note.groundingSources).map(String)
+      : [],
+  };
+}
+
+export function transformOnboardingCurriculumFromAPI(payload: any): OnboardingCurriculum {
+  const transformedWeeks = Array.isArray(payload.weeks)
+    ? payload.weeks
+        .map(transformOnboardingWeekFromAPI)
+        .filter((week: OnboardingWeek) => week.weekNumber >= 1 && week.weekNumber <= 4)
+        .sort((left: OnboardingWeek, right: OnboardingWeek) => left.weekNumber - right.weekNumber)
+    : [];
+  const weekByNumber = new Map<number, OnboardingWeek>();
+  transformedWeeks.forEach((week: OnboardingWeek) => {
+    if (!weekByNumber.has(week.weekNumber)) {
+      weekByNumber.set(week.weekNumber, week);
+    }
+  });
+
+  return {
+    roleInput: payload.role_input || payload.roleInput || '',
+    role: payload.role || '',
+    normalizedRole: payload.normalized_role || payload.normalizedRole || '',
+    summary: payload.summary || '',
+    weeks: [1, 2, 3, 4].map((weekNumber) => weekByNumber.get(weekNumber) || createEmptyOnboardingWeek(weekNumber)),
+    glossary: Array.isArray(payload.glossary) ? payload.glossary.map(transformOnboardingGlossaryEntryFromAPI) : [],
+    grounding: transformOnboardingGroundingFromAPI(payload.grounding || {}),
+    candidateNotes: Array.isArray(payload.candidate_notes || payload.candidateNotes)
+      ? (payload.candidate_notes || payload.candidateNotes)
+          .map(transformOnboardingCandidateNoteFromAPI)
+          .filter((note: OnboardingCandidateNote) => Boolean(note.noteId))
+      : [],
+  };
+}
+
 /**
  * Transform workspace from API (snake_case) to frontend (camelCase)
  */
@@ -223,9 +349,21 @@ export function transformWorkspaceFromAPI(workspace: any): Workspace {
     id: workspace.id,
     name: workspace.name,
     description: workspace.description || '',
-    members: workspace.members || [],
+    role: workspace.role || undefined,
+    owner_id: workspace.owner_id || workspace.ownerId || undefined,
+    member_count:
+      typeof workspace.member_count === 'number'
+        ? workspace.member_count
+        : typeof workspace.memberCount === 'number'
+          ? workspace.memberCount
+          : Array.isArray(workspace.members)
+            ? workspace.members.length
+            : undefined,
+    members: Array.isArray(workspace.members) ? workspace.members : [],
     createdAt: createdAtStr ? new Date(createdAtStr) : new Date(),
     updatedAt: updatedAtStr ? new Date(updatedAtStr) : new Date(),
+    created_at: workspace.created_at || undefined,
+    updated_at: workspace.updated_at || undefined,
   };
 }
 

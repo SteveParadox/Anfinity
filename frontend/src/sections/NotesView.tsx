@@ -12,6 +12,7 @@ import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
 import { getCollaboratorColor } from '@/lib/collaboration/colors';
 import { CollaborativeNoteEditor } from '@/components/notes/CollaborativeNoteEditor';
+import { OnboardingAcceleratorPanel } from '@/components/notes/OnboardingAcceleratorPanel';
 import { NoteInvitePanel } from '@/components/notes/NoteInvitePanel';
 
 interface NotesViewProps {
@@ -812,12 +813,18 @@ export function NotesView({
 
   const workspaceId = currentWorkspaceId || initialSelectedWorkspace;
   const defaultWorkspaceId = workspaceId || workspaces[0]?.id || '';
+  const activeWorkspace = workspaceId ? workspaces.find((workspace) => workspace.id === workspaceId) || null : null;
   const canViewWorkspaceNotes = Boolean(workspaceId && hasPermission(workspaceId, 'notes', 'view'));
   const canCreateWorkspaceNotes = Boolean(defaultWorkspaceId && hasPermission(defaultWorkspaceId, 'notes', 'create'));
+  const canGenerateOnboarding = Boolean(
+    workspaceId
+      && hasPermission(workspaceId, 'notes', 'view')
+      && hasPermission(workspaceId, 'chat', 'create')
+  );
   const canUpdateSelectedNote = Boolean(selectedNote?.workspaceId && hasPermission(selectedNote.workspaceId, 'notes', 'update'));
   const canCommentOnSelectedNote = Boolean(
     selectedNote?.workspaceId
-      ? hasPermission(selectedNote.workspaceId, 'notes', 'view')
+      ? hasPermission(selectedNote.workspaceId, 'notes', 'update')
       : selectedNote?.userId === user?.id
   );
   const canResolveSelectedNote = Boolean(
@@ -1319,6 +1326,22 @@ export function NotesView({
     }
   };
 
+  const openNoteById = async (noteId: string) => {
+    const existingNote = notes.find((note) => note.id === noteId);
+    if (existingNote) {
+      setSelectedNote(existingNote);
+      return;
+    }
+
+    try {
+      const fetchedNote = normalizeNote(await api.getNote(noteId));
+      setNotes((prev) => (prev.some((note) => note.id === fetchedNote.id) ? prev : [fetchedNote, ...prev]));
+      setSelectedNote(fetchedNote);
+    } catch (err) {
+      console.error('Open onboarding note error:', err);
+    }
+  };
+
   const addTag = (isEditing: boolean) => {
     if (!newTag.trim()) return;
     if (isEditing && editingNote) {
@@ -1522,6 +1545,13 @@ export function NotesView({
           </SelectContent>
         </Select>
       </div>
+      <OnboardingAcceleratorPanel
+        workspaceId={workspaceId}
+        workspaceName={activeWorkspace?.name || null}
+        notes={notes}
+        canGenerate={canGenerateOnboarding}
+        onOpenNote={openNoteById}
+      />
 
       {/* ── Notes Grid ──────────────────────────────────────────── */}
       <div

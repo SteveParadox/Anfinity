@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext } from 'react';
+import { useDeferredValue, useEffect, useContext, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import {
@@ -200,6 +200,9 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<string>('member');
   const [inviteDialogOpen, setInviteDialogOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [roleFilter, setRoleFilter] = useState<'all' | 'owner' | 'admin' | 'member' | 'viewer'>('all');
+  const deferredSearchQuery = useDeferredValue(searchQuery.trim().toLowerCase());
   
   const authContext = useContext(AuthContext);
   const currentUser = user || authContext?.user;
@@ -232,6 +235,39 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
     }
   }, [selectedWorkspace?.id]);
 
+  const getWorkspaceMemberCount = (workspace: any) => {
+    if (typeof workspace?.member_count === 'number') return workspace.member_count;
+    if (typeof workspace?.memberCount === 'number') return workspace.memberCount;
+    if (Array.isArray(workspace?.members)) return workspace.members.length;
+    return null;
+  };
+
+  const workspaceSummary = useMemo(() => ({
+    total: workspaces.length,
+    owned: workspaces.filter((workspace) => String(workspace.role).toLowerCase() === 'owner').length,
+    shared: workspaces.filter((workspace) => {
+      const memberCount = getWorkspaceMemberCount(workspace);
+      return memberCount !== null && memberCount > 1;
+    }).length,
+    current: currentWorkspaceId ? workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.name ?? 'None' : 'None',
+  }), [currentWorkspaceId, workspaces]);
+
+  const filteredWorkspaces = useMemo(() => {
+    return workspaces.filter((workspace) => {
+      const role = String(workspace.role || 'member').toLowerCase();
+      const matchesRole = roleFilter === 'all' || role === roleFilter;
+      const matchesQuery =
+        !deferredSearchQuery ||
+        [workspace.name, workspace.description, workspace.role]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+          .includes(deferredSearchQuery);
+
+      return matchesRole && matchesQuery;
+    });
+  }, [deferredSearchQuery, roleFilter, workspaces]);
+
   // FIX: Centralised date-safe transform — falls back to Date.now() so
   // createdAt/updatedAt are always valid Date objects inside state.
   const transformWorkspace = (workspace: any) => {
@@ -244,7 +280,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
       createdAt: isNaN(createdAt.getTime()) ? new Date() : createdAt,
       updatedAt: isNaN(updatedAt.getTime()) ? new Date() : updatedAt,
       members: workspace.members || [],
-      member_count: workspace.member_count ?? workspace.memberCount ?? workspace.members?.length ?? 1,
+      member_count: workspace.member_count ?? workspace.memberCount ?? workspace.members?.length,
       role: workspace.role || 'member',
     };
   };
@@ -475,6 +511,65 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
         </YellowBtn>
       </div>
 
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10, marginBottom: 16 }}>
+        {[
+          { label: 'Total', value: workspaceSummary.total, helper: 'all workspaces' },
+          { label: 'Owned', value: workspaceSummary.owned, helper: 'owner access' },
+          { label: 'Shared', value: workspaceSummary.shared, helper: 'collaborative spaces' },
+          { label: 'Current', value: workspaceSummary.current, helper: 'active workspace' },
+        ].map(({ label, value, helper }) => (
+          <div key={label} style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '14px 16px' }}>
+            <div style={{ fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 8 }}>{label}</div>
+            <div style={{ fontFamily: TT.fontDisplay, fontSize: 24, color: TT.snow, letterSpacing: '0.04em', lineHeight: 1 }}>{value}</div>
+            <div style={{ fontFamily: TT.fontBody, fontSize: 11, color: TT.inkSubtle, marginTop: 6 }}>{helper}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', marginBottom: 16, padding: '12px', background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '0 10px', height: 38, minWidth: 240 }}>
+          <Users size={12} color={TT.inkMuted} />
+          <input
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="Search workspaces"
+            aria-label="Search workspaces"
+            style={{ flex: 1, height: '100%', background: 'transparent', border: 'none', color: TT.snow, outline: 'none', fontFamily: TT.fontMono, fontSize: 12 }}
+          />
+        </div>
+
+        {(['all', 'owner', 'admin', 'member', 'viewer'] as const).map((role) => (
+          <button
+            key={role}
+            type="button"
+            onClick={() => setRoleFilter(role)}
+            aria-pressed={roleFilter === role}
+            style={{
+              borderRadius: 999,
+              border: `1px solid ${roleFilter === role ? 'rgba(245,230,66,0.28)' : TT.inkBorder}`,
+              background: roleFilter === role ? 'rgba(245,230,66,0.08)' : TT.inkBlack,
+              color: roleFilter === role ? TT.yolk : TT.inkMuted,
+              padding: '6px 10px',
+              fontFamily: TT.fontMono,
+              fontSize: 10,
+              letterSpacing: '0.08em',
+              textTransform: 'uppercase',
+              cursor: 'pointer',
+            }}
+          >
+            {role}
+          </button>
+        ))}
+
+        <GhostBtn onClick={() => {
+          setSearchQuery('');
+          setRoleFilter('all');
+          void loadWorkspaces();
+        }}>
+          <Clock size={12} /> Refresh
+        </GhostBtn>
+      </div>
+
       {/* ── Workspace Grid ─────────────────────────────────────── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 }}>
         {error && (
@@ -492,9 +587,20 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
             <p style={{ fontFamily: TT.fontDisplay, fontSize: 24, color: TT.snow, marginBottom: 8 }}>NO WORKSPACES</p>
             <p style={{ fontFamily: TT.fontMono, fontSize: 10.5, color: TT.inkMuted, textTransform: 'uppercase' }}>Create one to get started</p>
           </div>
+        ) : filteredWorkspaces.length === 0 ? (
+          <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '48px 0' }}>
+            <p style={{ fontFamily: TT.fontDisplay, fontSize: 24, color: TT.snow, marginBottom: 8 }}>NO MATCHES</p>
+            <p style={{ fontFamily: TT.fontMono, fontSize: 10.5, color: TT.inkMuted, textTransform: 'uppercase', marginBottom: 14 }}>Adjust search or role filters</p>
+            <GhostBtn onClick={() => { setSearchQuery(''); setRoleFilter('all'); }}>
+              Clear filters
+            </GhostBtn>
+          </div>
         ) : null}
 
-        {workspaces.map((workspace, index) => (
+        {filteredWorkspaces.map((workspace, index) => {
+          const memberCount = getWorkspaceMemberCount(workspace);
+
+          return (
           <motion.div
             key={workspace.id}
             initial={{ opacity: 0, y: 16 }}
@@ -504,7 +610,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
             <div
               onClick={() => setSelectedWorkspace(workspace)}
               style={{
-                background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3,
+                background: TT.inkDeep, border: `1px solid ${currentWorkspaceId === workspace.id ? 'rgba(245,230,66,0.28)' : TT.inkBorder}`, borderRadius: 3,
                 padding: '18px 16px', cursor: 'pointer',
                 transition: 'border-color 0.15s, border-left-width 0.1s', position: 'relative',
               }}
@@ -528,6 +634,9 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
                   <FolderOpen size={18} color={TT.yolk} />
                 </div>
                 <div className="ws-actions" style={{ display: 'flex', gap: 4, opacity: 0, transition: 'opacity 0.15s' }} onClick={(e) => e.stopPropagation()}>
+                  {currentWorkspaceId !== workspace.id && setCurrentWorkspace && (
+                    <SmallBtn onClick={() => setCurrentWorkspace(workspace.id)}><Eye size={10} /> Switch</SmallBtn>
+                  )}
                   {hasPermission(workspace.id, 'settings', 'update') && <SmallBtn onClick={() => setEditingWorkspace(workspace)}><Edit2 size={10} /></SmallBtn>}
                   {hasPermission(workspace.id, 'settings', 'delete') && <SmallBtn danger onClick={() => handleDeleteWorkspace(workspace.id)}><Trash2 size={10} /></SmallBtn>}
                 </div>
@@ -536,6 +645,11 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
               <h3 style={{ fontFamily: TT.fontMono, fontSize: 13, fontWeight: 500, color: TT.snow, marginBottom: 6, letterSpacing: '0.02em' }}>
                 {workspace.name}
               </h3>
+              {currentWorkspaceId === workspace.id && (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 8px', borderRadius: 999, background: 'rgba(245,230,66,0.08)', border: '1px solid rgba(245,230,66,0.2)', color: TT.yolk, fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>
+                  Active Workspace
+                </div>
+              )}
               <p style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.6, marginBottom: 14, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
                 {workspace.description || '(No description)'}
               </p>
@@ -544,7 +658,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                   <Users size={10} color={TT.inkMuted} />
                   <span style={{ fontFamily: TT.fontMono, fontSize: 9.5, color: TT.inkMuted, letterSpacing: '0.04em' }}>
-                    {workspace.member_count || 1} member{(workspace.member_count || 1) !== 1 ? 's' : ''}
+                    {memberCount === null ? 'Members unavailable' : `${memberCount} member${memberCount === 1 ? '' : 's'}`}
                   </span>
                 </div>
                 {/* FIX: safeFromNow never throws on missing/invalid dates */}
@@ -554,7 +668,7 @@ export function WorkspacesView({ user }: WorkspacesViewProps) {
               </div>
             </div>
           </motion.div>
-        ))}
+        )})}
 
         {/* ── Create New Card ──────────────────────────────────── */}
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: workspaces.length * 0.06 }}>

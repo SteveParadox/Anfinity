@@ -1,5 +1,5 @@
-import { useEffect, useState, type CSSProperties, type FormEvent } from "react";
-import { Brain, Loader2, Users, Vote, Wand2 } from "lucide-react";
+import { useDeferredValue, useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import { Brain, Copy, Loader2, RefreshCw, Search, Users, Vote, Wand2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { useThinkingSessionRoom } from "@/hooks/useThinkingSessionRoom";
@@ -59,6 +59,12 @@ export function ThinkingSessionsView() {
   const [contributionInput, setContributionInput] = useState("");
   const [refinementDraft, setRefinementDraft] = useState("");
   const [refinementDirty, setRefinementDirty] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState("");
+  const [phaseFilter, setPhaseFilter] = useState<"all" | ThinkingSessionPhase>("all");
+  const [contributionSearch, setContributionSearch] = useState("");
+
+  const deferredSessionSearch = useDeferredValue(sessionSearch.trim().toLowerCase());
+  const deferredContributionSearch = useDeferredValue(contributionSearch.trim().toLowerCase());
 
   const room = useThinkingSessionRoom({
     sessionId: selectedSessionId,
@@ -197,6 +203,22 @@ export function ThinkingSessionsView() {
   const canParticipate = Boolean(sessionAccess?.canParticipate);
 
   const displayedParticipants = room.status === "connected" ? room.participants : [];
+  const sessionCounts = useMemo(() => ({
+    total: sessions.length,
+    waiting: sessions.filter((session) => session.phase === "waiting").length,
+    gathering: sessions.filter((session) => session.phase === "gathering").length,
+    refining: sessions.filter((session) => session.phase === "refining").length,
+    completed: sessions.filter((session) => session.phase === "completed").length,
+  }), [sessions]);
+  const filteredSessions = useMemo(() => {
+    return sessions.filter((session) => {
+      const matchesPhase = phaseFilter === "all" || session.phase === phaseFilter;
+      const matchesQuery =
+        !deferredSessionSearch ||
+        [session.title, session.phase, session.roomId].join(" ").toLowerCase().includes(deferredSessionSearch);
+      return matchesPhase && matchesQuery;
+    });
+  }, [deferredSessionSearch, phaseFilter, sessions]);
 
   const handleCreateSession = async (event: FormEvent) => {
     event.preventDefault();
@@ -291,6 +313,13 @@ export function ThinkingSessionsView() {
     : activeSession?.phase === "refining"
       ? activeSession.refinedOutput || activeSession.synthesisOutput
       : activeSession?.synthesisOutput || "";
+  const filteredContributions = (activeSession?.contributions || []).filter((contribution) => {
+    if (!deferredContributionSearch) {
+      return true;
+    }
+
+    return [contribution.content, contribution.author?.name || ""].join(" ").toLowerCase().includes(deferredContributionSearch);
+  });
 
   if (!currentWorkspaceId) {
     return (
@@ -326,6 +355,25 @@ export function ThinkingSessionsView() {
         <div style={{ fontSize: 11, color: room.status === "connected" ? TT.green : TT.inkSubtle }}>
           Room status: {room.status}
         </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, marginBottom: 16 }}>
+        {[
+          { label: "Total", value: sessionCounts.total, helper: "all sessions" },
+          { label: "Gathering", value: sessionCounts.gathering, helper: "ideas in progress" },
+          { label: "Refining", value: sessionCounts.refining, helper: "editing output" },
+          { label: "Completed", value: sessionCounts.completed, helper: "ready to reuse" },
+        ].map(({ label, value, helper }) => (
+          <div key={label} style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 10, padding: 14 }}>
+            <div style={{ fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase", color: TT.inkSubtle, marginBottom: 8 }}>
+              {label}
+            </div>
+            <div style={{ fontFamily: TT.fontDisplay, fontSize: 26, color: TT.snow, letterSpacing: "0.05em", lineHeight: 1 }}>
+              {value}
+            </div>
+            <div style={{ fontSize: 11, color: TT.inkMuted, marginTop: 6 }}>{helper}</div>
+          </div>
+        ))}
       </div>
 
       {error || room.lastError ? (
@@ -425,17 +473,102 @@ export function ThinkingSessionsView() {
               <h2 style={{ margin: 0, fontSize: 13, color: TT.yolk, textTransform: "uppercase", letterSpacing: "0.08em" }}>
                 Sessions
               </h2>
-              {loadingSessions ? <Loader2 size={14} className="animate-spin" /> : null}
+              <button
+                type="button"
+                onClick={() => {
+                  if (!currentWorkspaceId || !canView) return;
+                  setLoadingSessions(true);
+                  setError(null);
+                  void api.listThinkingSessions(currentWorkspaceId)
+                    .then((response) => {
+                      setSessions(response);
+                      setSelectedSessionId((current) => (
+                        current && response.some((session) => session.id === current)
+                          ? current
+                          : response[0]?.id ?? null
+                      ));
+                    })
+                    .catch((err) => {
+                      setError(err instanceof Error ? err.message : "Unable to load thinking sessions");
+                    })
+                    .finally(() => setLoadingSessions(false));
+                }}
+                disabled={loadingSessions}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 10px",
+                  borderRadius: 8,
+                  border: `1px solid ${TT.inkBorder}`,
+                  background: TT.inkRaised,
+                  color: TT.snow,
+                  fontFamily: TT.fontMono,
+                  fontSize: 10,
+                  cursor: "pointer",
+                }}
+              >
+                <RefreshCw size={12} className={loadingSessions ? "animate-spin" : undefined} />
+                Refresh
+              </button>
+            </div>
+
+            <div style={{ display: "grid", gap: 10, marginBottom: 12 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  background: TT.inkBlack,
+                  border: `1px solid ${TT.inkBorder}`,
+                  borderRadius: 8,
+                  padding: "0 10px",
+                  height: 36,
+                }}
+              >
+                <Search size={12} color={TT.inkMuted} />
+                <input
+                  value={sessionSearch}
+                  onChange={(event) => setSessionSearch(event.target.value)}
+                  placeholder="Search sessions"
+                  aria-label="Search sessions"
+                  style={{ flex: 1, height: "100%", background: "transparent", border: "none", color: TT.snow, outline: "none", fontFamily: TT.fontMono, fontSize: 12 }}
+                />
+              </div>
+
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {(["all", "waiting", "gathering", "synthesizing", "refining", "completed"] as const).map((phase) => (
+                  <button
+                    key={phase}
+                    type="button"
+                    onClick={() => setPhaseFilter(phase)}
+                    aria-pressed={phaseFilter === phase}
+                    style={{
+                      borderRadius: 999,
+                      border: `1px solid ${phaseFilter === phase ? "rgba(245,230,66,0.28)" : TT.inkBorder}`,
+                      background: phaseFilter === phase ? TT.yolkSoft : TT.inkBlack,
+                      color: phaseFilter === phase ? TT.yolk : TT.inkMuted,
+                      padding: "6px 10px",
+                      fontSize: 10,
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {phase}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {sessions.length === 0 && !loadingSessions ? (
+              {filteredSessions.length === 0 && !loadingSessions ? (
                 <div style={{ color: TT.inkSubtle, fontSize: 12 }}>
-                  No sessions yet. Create one to start facilitating live thinking.
+                  No sessions match the current filters.
                 </div>
               ) : null}
 
-              {sessions.map((session) => {
+              {filteredSessions.map((session) => {
                 const selected = session.id === selectedSessionId;
                 return (
                   <button
@@ -538,6 +671,12 @@ export function ThinkingSessionsView() {
                     {activeSession.promptContext}
                   </div>
                 ) : null}
+
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 14 }}>
+                  <span style={sessionInfoPillStyle}>{activeSession.contributions.length} contributions</span>
+                  <span style={sessionInfoPillStyle}>{displayedParticipants.length} live participants</span>
+                  {activeSession.activeSynthesisRunId ? <span style={{ ...sessionInfoPillStyle, color: TT.yolk }}>Synthesis running</span> : null}
+                </div>
               </div>
 
               <div style={{ display: "grid", gridTemplateColumns: "260px minmax(0, 1fr)", gap: 16 }}>
@@ -607,8 +746,31 @@ export function ThinkingSessionsView() {
                         Contributions
                       </h3>
                       <span style={{ color: TT.inkSubtle, fontSize: 10 }}>
-                        {activeSession.contributions.length} total
+                        {filteredContributions.length} visible
                       </span>
+                    </div>
+
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        background: TT.inkBlack,
+                        border: `1px solid ${TT.inkBorder}`,
+                        borderRadius: 8,
+                        padding: "0 10px",
+                        height: 36,
+                        marginBottom: 14,
+                      }}
+                    >
+                      <Search size={12} color={TT.inkMuted} />
+                      <input
+                        value={contributionSearch}
+                        onChange={(event) => setContributionSearch(event.target.value)}
+                        placeholder="Search contributions"
+                        aria-label="Search contributions"
+                        style={{ flex: 1, height: "100%", background: "transparent", border: "none", color: TT.snow, outline: "none", fontFamily: TT.fontMono, fontSize: 12 }}
+                      />
                     </div>
 
                     {activeSession.phase === "gathering" && canParticipate ? (
@@ -633,7 +795,7 @@ export function ThinkingSessionsView() {
                     ) : null}
 
                     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                      {activeSession.contributions.map((contribution) => {
+                      {filteredContributions.map((contribution) => {
                         const hasVoted = contribution.voterUserIds.includes(currentUserId);
                         return (
                           <div
@@ -669,9 +831,11 @@ export function ThinkingSessionsView() {
                           </div>
                         );
                       })}
-                      {activeSession.contributions.length === 0 ? (
+                      {filteredContributions.length === 0 ? (
                         <div style={{ color: TT.inkSubtle, fontSize: 12 }}>
-                          No contributions yet. Start gathering ideas to move this session forward.
+                          {activeSession.contributions.length === 0
+                            ? "No contributions yet. Start gathering ideas to move this session forward."
+                            : "No contributions match that search."}
                         </div>
                       ) : null}
                     </div>
@@ -687,12 +851,30 @@ export function ThinkingSessionsView() {
                       <h3 style={{ margin: 0, fontSize: 13, textTransform: "uppercase", letterSpacing: "0.08em" }}>
                         Synthesis
                       </h3>
-                      {room.activeRunId ? (
-                        <div style={{ display: "flex", alignItems: "center", gap: 6, color: TT.yolk, fontSize: 10 }}>
-                          <Wand2 size={12} />
-                          Streaming live
-                        </div>
-                      ) : null}
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        {room.activeRunId ? (
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, color: TT.yolk, fontSize: 10 }}>
+                            <Wand2 size={12} />
+                            Streaming live
+                          </div>
+                        ) : null}
+                        {synthesisText ? (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(synthesisText);
+                              } catch (err) {
+                                setError(err instanceof Error ? err.message : "Unable to copy synthesis");
+                              }
+                            }}
+                            style={actionButtonStyle(TT.blue)}
+                          >
+                            <Copy size={12} />
+                            Copy
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
 
                     <div style={{
@@ -758,6 +940,21 @@ const textareaStyle: CSSProperties = {
   color: TT.snow,
   fontFamily: TT.fontMono,
   resize: "vertical",
+};
+
+const sessionInfoPillStyle: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  padding: "5px 8px",
+  borderRadius: 999,
+  border: `1px solid ${TT.inkBorder}`,
+  background: TT.inkRaised,
+  color: TT.inkSubtle,
+  fontFamily: TT.fontMono,
+  fontSize: 10,
+  letterSpacing: "0.06em",
+  textTransform: "uppercase",
 };
 
 function actionButtonStyle(color: string): CSSProperties {

@@ -218,6 +218,7 @@ function App() {
           onViewGraph={() => setCurrentView(canViewGraph ? 'graph' : 'workspaces')}
           onViewAllNotes={() => setCurrentView(canViewNotes ? 'notes' : 'workspaces')}
           onViewAllInsights={() => setCurrentView(canUseSearch ? 'search' : 'workspaces')}
+          onOpenWorkflows={() => setCurrentView(canViewWorkflows ? 'workflows' : 'workspaces')}
         />
       ),
       notes:      <NotesView />,

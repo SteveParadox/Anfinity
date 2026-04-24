@@ -16,8 +16,13 @@ export interface SemanticSearchResult {
   document_title: string;
   content: string;
   tags: string[];
+  source_kind: string;
   source_type: string;
   chunk_index: number;
+  token_count: number;
+  context_before?: string | null;
+  context_after?: string | null;
+  metadata?: Record<string, unknown>;
   created_at: string;
   interaction_count: number;
   similarity_score: number;
@@ -25,6 +30,40 @@ export interface SemanticSearchResult {
   usage_score: number;
   final_score: number;
   highlight: string;
+  highlights?: SmartHighlight[];
+  matched_chunks?: MatchedSearchChunk[];
+  confidence?: 'low' | 'medium' | 'high' | string;
+  confidence_score?: number;
+  match_summary?: Record<string, unknown>;
+}
+
+export interface SmartHighlight {
+  text: string;
+  start_offset: number;
+  end_offset: number;
+  score: number;
+  matched_terms: string[];
+  heading?: string | null;
+  confidence: 'low' | 'medium' | 'high' | string;
+}
+
+export interface MatchedSearchChunk {
+  chunk_id: string;
+  note_id: string;
+  chunk_index: number;
+  text: string;
+  start_offset: number;
+  end_offset: number;
+  heading?: string | null;
+  score: number;
+  semantic_score: number;
+  lexical_score: number;
+  evidence_score: number;
+  domain_alignment: number;
+  off_topic: boolean;
+  confidence: 'low' | 'medium' | 'high' | string;
+  highlights: SmartHighlight[];
+  metadata?: Record<string, unknown>;
 }
 
 export interface SemanticSearchResponse {

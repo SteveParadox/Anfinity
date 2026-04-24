@@ -14,7 +14,7 @@ import { validateAutomationRegistryIntegrity } from "./validation";
 
 describe("automation registries", () => {
   it("defines exactly the supported trigger and action set", () => {
-    expect(SUPPORTED_TRIGGER_TYPES).toHaveLength(10);
+    expect(SUPPORTED_TRIGGER_TYPES).toHaveLength(11);
     expect(SUPPORTED_ACTION_TYPES).toHaveLength(14);
     expect(new Set(TRIGGER_TYPE_IDS).size).toBe(TRIGGER_TYPE_IDS.length);
     expect(new Set(ACTION_TYPE_IDS).size).toBe(ACTION_TYPE_IDS.length);
