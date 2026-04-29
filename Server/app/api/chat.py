@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from typing import AsyncGenerator, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -18,7 +18,20 @@ from app.core.auth import get_current_active_user
 from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser, WorkspaceSection
 from app.database.session import get_db
-from app.services.top_k_retriever import get_top_k_retriever
+from app.services.strict_note_rag import (
+    CitationStreamTransformer,
+    GroundedAnswerStreamGuard,
+    MIN_SUPPORTED_SCORE,
+    REFUSAL_TEXT,
+    StrictRAGResult,
+    StrictRAGSource,
+    calibrate_similarity_percent,
+    cited_sources_from_answer,
+    evaluate_sources,
+    replace_source_markers,
+    retrieve_strict_note_context,
+)
+from app.services.settings_preferences import get_workspace_ai_min_similarity, workspace_feature_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +46,17 @@ _OLLAMA_STREAM_SEMAPHORE = asyncio.Semaphore(_OLLAMA_STREAM_CONCURRENCY)
 
 class RAGSource(BaseModel):
     """Source document for RAG response with attribution."""
+    sourceId: str = ""
     noteId: str
     title: str
     excerpt: str
     createdAt: str
     similarity: float
+    similarityPercent: int = 0
+    citation: str = ""
+    chunkId: str = ""
+    chunkIndex: int = 0
+    supportLevel: str = "supported"
 
 
 class ChatMessage(BaseModel):
@@ -63,6 +82,7 @@ class AskPastSelfResponse(BaseModel):
     sources: List[RAGSource]
     confidence: str = Field(..., pattern="^(high|medium|low|not_found)$")
     followUpQuestions: List[str]
+    answerStatus: str = Field(default="supported", pattern="^(supported|partial|refusal)$")
 
 
 # ============================================================================
@@ -87,6 +107,18 @@ async def _verify_workspace_access(
         section=WorkspaceSection.CHAT,
         action="create",
     )
+    await ensure_workspace_permission(
+        workspace_id=workspace_id,
+        user=user,
+        db=db,
+        section=WorkspaceSection.NOTES,
+        action="view",
+    )
+    if not await workspace_feature_enabled(db, workspace_id, "ai_search", "ask_past_self_enabled"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Ask Your Past Self is disabled for this workspace.",
+        )
 
 
 def _determine_confidence(sources: List[RAGSource]) -> str:
@@ -143,69 +175,38 @@ def extract_excerpt(content: str, query: str, max_length: int = 300) -> str:
 async def retrieve_context(
     query: str,
     workspace_id: UUID,
+    user: DBUser,
     db: AsyncSession,
     k: int = 6,
     threshold: float = 0.3,
-) -> List[RAGSource]:
-    """
-    Retrieve the top-k notes relevant to *query* from the given workspace.
-
-    Runs the (potentially blocking) retriever in a thread executor so it
-    never stalls the event loop.
-    """
+) -> StrictRAGResult:
+    """Retrieve live note-only evidence and gate answerability."""
     try:
-        retriever = get_top_k_retriever(db=db, top_k=k, similarity_threshold=threshold)
-
-        # Offload sync retriever to a thread so the event loop stays clear.
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: retriever.retrieve(
-                query=query,
-                workspace_id=workspace_id,
-                top_k=k,
-                similarity_threshold=threshold,
-            ),
+        workspace_min_score = await get_workspace_ai_min_similarity(db, workspace_id)
+        min_score = max(float(threshold or 0.0), workspace_min_score, MIN_SUPPORTED_SCORE)
+        return await retrieve_strict_note_context(
+            query=query,
+            workspace_id=workspace_id,
+            user=user,
+            db=db,
+            limit=k,
+            min_score=min_score,
         )
-
-        if not result.chunks:
-            return []
-
-        sources: List[RAGSource] = []
-        for chunk in result.chunks:
-            title = (
-                getattr(chunk, "document_title", None)
-                or "Untitled Note"
-            )
-            created_at = ""
-            raw_date = getattr(chunk, "created_at", None)
-            if raw_date:
-                created_at = raw_date.isoformat() if hasattr(raw_date, "isoformat") else str(raw_date)
-
-            similarity = max(0.0, min(float(chunk.similarity), 1.0))
-            sources.append(
-                RAGSource(
-                    noteId=str(chunk.document_id),
-                    title=title,
-                    excerpt=extract_excerpt(chunk.text, query),
-                    createdAt=created_at,
-                    similarity=similarity,
-                )
-            )
-
-        sources.sort(key=lambda item: item.similarity, reverse=True)
-        return sources[:k]
-
     except Exception:
         logger.exception("Error retrieving context for query=%r workspace=%s", query, workspace_id)
-        return []
+        return StrictRAGResult(
+            sources=[],
+            answer_status="refusal",
+            confidence="not_found",
+            refusal_reason="retrieval_error",
+        )
 
 
 # ============================================================================
 # STEP 2.4: Prompt Construction
 # ============================================================================
 
-def build_rag_system_prompt(query: str, sources: List[RAGSource]) -> str:
+def build_rag_system_prompt(query: str, sources: List[StrictRAGSource | RAGSource]) -> str:
     """Build a strictly-grounded system prompt from retrieved sources."""
     if not sources:
         return (
@@ -215,11 +216,11 @@ def build_rag_system_prompt(query: str, sources: List[RAGSource]) -> str:
 
     source_context = "\n".join(
         f"""
-[SOURCE {i + 1}]
-Note: "{s.title}"
-Date: {s.createdAt}
-Relevance: {round(s.similarity * 100)}%
-Content: {s.excerpt}
+[{getattr(s, "source_id", "") or getattr(s, "sourceId", "") or f"S{i + 1}"}]
+Note title: "{s.title}"
+Note date: {getattr(s, "created_at", "") or getattr(s, "createdAt", "")}
+Similarity: {getattr(s, "similarity_percent", 0) or getattr(s, "similarityPercent", 0) or round(s.similarity * 100)}%
+Matched note excerpt: {s.excerpt}
 ---"""
         for i, s in enumerate(sources)
     )
@@ -229,18 +230,17 @@ Your job is to answer their question using ONLY information from the provided so
 
 STRICT RULES:
 1. ONLY use information from the provided sources. Never use general knowledge.
-2. Cite every claim inline using this exact format: [Note Title | YYYY-MM-DD | NN%].
-3. Every citation must use the matching source title, date, and relevance percentage from the provided sources.
-4. If the sources don't contain enough information, say exactly: "I couldn't find enough in your notes to answer that."
+2. Cite every factual claim inline with the source marker, for example [S1].
+3. Use only the source markers listed below. Never invent note titles, dates, or similarity values.
+4. If the sources don't contain enough information, say exactly: "{REFUSAL_TEXT}"
 5. Never invent facts, dates, or explanations that are not explicitly supported by the sources.
 6. Refer to the user in second person ("you wrote", "your notes say").
 7. Keep the answer focused and grounded in the cited notes.
-8. Do not use [SOURCE N] style placeholders in the final answer.
+8. Do not cite sources you did not use.
 9. Do not answer from memory or world knowledge even if you know the topic.
-10. Include the note title, date, and similarity percentage in every citation.
-11. End with 2-3 follow-up questions the user might want to explore.
+10. If a sentence cannot be supported by a source marker, omit the sentence.
 
-SOURCES FROM YOUR KNOWLEDGE BASE:
+LIVE NOTE EVIDENCE FROM THE USER'S ACCESSIBLE NOTES:
 {source_context}
 
 USER QUESTION: {query}
@@ -355,6 +355,18 @@ def _chunk_text_for_stream(text: str, chunk_size: int = 48) -> List[str]:
     return [text[i:i + chunk_size] for i in range(0, len(text or ""), chunk_size)]
 
 
+def _api_sources(sources: List[StrictRAGSource]) -> List[dict]:
+    """Serialize only server-validated note sources for the client."""
+    return [source.to_api_dict() for source in sources]
+
+
+def _sse_event(event: str, payload: dict) -> str:
+    """Emit a named SSE event while preserving the legacy payload type field."""
+    body = dict(payload)
+    body.setdefault("type", event)
+    return f"event: {event}\ndata: {json.dumps(body)}\n\n"
+
+
 # ============================================================================
 # STEP 2.6: Follow-up Question Extraction
 # ============================================================================
@@ -403,27 +415,63 @@ async def _rag_stream(
     Workspace auth is verified by the route handler *before* this is called,
     so HTTPException cannot fire mid-stream and corrupt the SSE contract.
 
-    Yields newline-delimited JSON chunks:
-      {type: "sources", sources: [...]}
-      {type: "token",   text: "..."}       ← one per word from Ollama / per chunk from OpenAI
-      {type: "done",    followUpQuestions: [...]}
-      {type: "error",   message: "..."}    ← only on unrecoverable failure
+    Yields named SSE chunks:
+      event: start   data: {type, correlationId, status}
+      event: token   data: {type, text, correlationId}
+      event: sources data: {type, sources, answerStatus, confidence, correlationId}
+      event: done    data: {type, followUpQuestions, answerStatus, confidence, correlationId}
+      event: error   data: {type, message, correlationId}
     """
-    # --- Retrieve context --------------------------------------------------
-    sources = await retrieve_context(query, workspace_id, db, k=top_k, threshold=threshold)
-    yield json.dumps({"type": "sources", "sources": [s.model_dump() for s in sources]}) + "\n"
+    correlation_id = str(uuid4())
+    yield _sse_event("start", {"correlationId": correlation_id, "status": "retrieving"})
 
-    if not sources:
-        yield json.dumps({
-            "type": "token",
-            "text": "I couldn't find enough in your notes to answer that.",
-        }) + "\n"
-        yield json.dumps({"type": "done", "followUpQuestions": []}) + "\n"
+    retrieval = await retrieve_context(
+        query=query,
+        workspace_id=workspace_id,
+        user=user,
+        db=db,
+        k=top_k,
+        threshold=threshold,
+    )
+
+    if not retrieval.can_answer:
+        logger.info(
+            "ask_past_self_refused",
+            extra={
+                "correlation_id": correlation_id,
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+                "reason": retrieval.refusal_reason,
+                **retrieval.diagnostics,
+            },
+        )
+        yield _sse_event("token", {"text": REFUSAL_TEXT, "correlationId": correlation_id})
+        yield _sse_event(
+            "sources",
+            {
+                "sources": [],
+                "answerStatus": "refusal",
+                "confidence": "not_found",
+                "correlationId": correlation_id,
+            },
+        )
+        yield _sse_event(
+            "done",
+            {
+                "followUpQuestions": [],
+                "answerStatus": "refusal",
+                "confidence": "not_found",
+                "correlationId": correlation_id,
+            },
+        )
         return
 
     # --- Build prompt & messages -------------------------------------------
+    sources = retrieval.sources
     system_prompt = build_rag_system_prompt(query, sources)
     messages = _build_messages(system_prompt, query, history)
+    citation_transformer = CitationStreamTransformer(sources)
+    grounding_guard = GroundedAnswerStreamGuard(sources)
 
     # --- Generate answer ---------------------------------------------------
     full_response_parts: List[str] = []
@@ -431,7 +479,10 @@ async def _rag_stream(
         try:
             async for token in _stream_with_ollama(messages):
                 full_response_parts.append(token)
-                yield json.dumps({"type": "token", "text": token}) + "\n"
+                grounded_token = grounding_guard.feed(token)
+                display_token = citation_transformer.feed(grounded_token)
+                if display_token:
+                    yield _sse_event("token", {"text": display_token, "correlationId": correlation_id})
         except Exception as ollama_exc:
             logger.warning(
                 "Streaming Ollama chat failed (%s), falling back to buffered generation",
@@ -440,17 +491,63 @@ async def _rag_stream(
             full_response = await generate_answer(messages)
             for chunk in _chunk_text_for_stream(full_response):
                 full_response_parts.append(chunk)
-                yield json.dumps({"type": "token", "text": chunk}) + "\n"
+                grounded_chunk = grounding_guard.feed(chunk)
+                display_chunk = citation_transformer.feed(grounded_chunk)
+                if display_chunk:
+                    yield _sse_event("token", {"text": display_chunk, "correlationId": correlation_id})
+        grounded_tail = grounding_guard.flush()
+        if not grounding_guard.released_any and REFUSAL_TEXT not in "".join(full_response_parts):
+            logger.warning(
+                "ask_past_self_suppressed_uncited_answer",
+                extra={
+                    "correlation_id": correlation_id,
+                    "workspace_id": str(workspace_id),
+                    "user_id": str(getattr(user, "id", "")),
+                },
+            )
+            grounded_tail = REFUSAL_TEXT
+        tail = citation_transformer.feed(grounded_tail) + citation_transformer.flush()
+        if tail:
+            yield _sse_event("token", {"text": tail, "correlationId": correlation_id})
     except HTTPException as exc:
-        yield json.dumps({"type": "error", "message": exc.detail}) + "\n"
+        yield _sse_event("error", {"message": exc.detail, "correlationId": correlation_id})
         return
 
     # --- Done --------------------------------------------------------------
     full_response = "".join(full_response_parts)
-    yield json.dumps({
-        "type": "done",
-        "followUpQuestions": extract_follow_up_questions(full_response),
-    }) + "\n"
+    cited_sources = cited_sources_from_answer(full_response, sources)
+    answer_status = retrieval.answer_status
+    confidence = retrieval.confidence
+    if not cited_sources and REFUSAL_TEXT not in full_response:
+        logger.warning(
+            "ask_past_self_answer_without_valid_citations",
+            extra={
+                "correlation_id": correlation_id,
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+            },
+        )
+        answer_status = "refusal"
+        confidence = "not_found"
+
+    yield _sse_event(
+        "sources",
+        {
+            "sources": _api_sources(cited_sources),
+            "answerStatus": answer_status,
+            "confidence": confidence,
+            "correlationId": correlation_id,
+        },
+    )
+    yield _sse_event(
+        "done",
+        {
+            "followUpQuestions": extract_follow_up_questions(full_response),
+            "answerStatus": answer_status,
+            "confidence": confidence,
+            "correlationId": correlation_id,
+        },
+    )
 
 
 # ============================================================================
@@ -470,9 +567,11 @@ async def ask_past_self(
     4xx errors are returned as proper HTTP responses, not buried in the stream.
 
     Event stream format:
-      data: {type: "sources",  sources: [...]}
-      data: {type: "token",    text: "..."}
-      data: {type: "done",     followUpQuestions: [...]}
+      event: start   data: {type, correlationId, status}
+      event: token   data: {type, text, correlationId}
+      event: sources data: {type, sources, answerStatus, confidence, correlationId}
+      event: done    data: {type, followUpQuestions, answerStatus, confidence, correlationId}
+      event: error   data: {type, message, correlationId}
     """
     # Auth check outside the generator — HTTPException propagates cleanly here.
     await _verify_workspace_access(request.workspace_id, current_user, db)
@@ -487,7 +586,7 @@ async def ask_past_self(
             top_k=request.top_k,
             threshold=request.similarity_threshold,
         ):
-            yield f"data: {chunk}\n"
+            yield chunk
 
     return StreamingResponse(
         _event_stream(),
@@ -508,32 +607,51 @@ async def ask_past_self_sync(
     """
     await _verify_workspace_access(request.workspace_id, current_user, db)
 
-    sources = await retrieve_context(
+    retrieval = await retrieve_context(
         query=request.query,
         workspace_id=request.workspace_id,
+        user=current_user,
         db=db,
         k=request.top_k,
         threshold=request.similarity_threshold,
     )
 
-    confidence = _determine_confidence(sources)
-
-    if confidence == "not_found":
+    if not retrieval.can_answer:
         return AskPastSelfResponse(
-            answer="I couldn't find any notes in your knowledge base relevant to that question.",
+            answer=REFUSAL_TEXT,
             sources=[],
             confidence="not_found",
             followUpQuestions=[],
+            answerStatus="refusal",
         )
 
+    sources = retrieval.sources
     system_prompt = build_rag_system_prompt(request.query, sources)
     messages = _build_messages(system_prompt, request.query, request.history)
 
-    answer = await generate_answer(messages)  # raises HTTP 502 on total failure
+    raw_answer = await generate_answer(messages)  # raises HTTP 502 on total failure
+    cited_sources = cited_sources_from_answer(raw_answer, sources)
+    if not cited_sources and REFUSAL_TEXT not in raw_answer:
+        logger.warning(
+            "ask_past_self_sync_uncited_answer_refused",
+            extra={
+                "workspace_id": str(request.workspace_id),
+                "user_id": str(getattr(current_user, "id", "")),
+            },
+        )
+        return AskPastSelfResponse(
+            answer=REFUSAL_TEXT,
+            sources=[],
+            confidence="not_found",
+            followUpQuestions=[],
+            answerStatus="refusal",
+        )
+    answer = replace_source_markers(raw_answer, sources)
 
     return AskPastSelfResponse(
         answer=answer,
-        sources=sources,
-        confidence=confidence,
-        followUpQuestions=extract_follow_up_questions(answer),
+        sources=[RAGSource(**source.to_api_dict()) for source in cited_sources],
+        confidence="not_found" if REFUSAL_TEXT in raw_answer else retrieval.confidence,
+        followUpQuestions=extract_follow_up_questions(raw_answer),
+        answerStatus="refusal" if REFUSAL_TEXT in raw_answer else retrieval.answer_status,
     )

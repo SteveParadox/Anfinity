@@ -54,6 +54,9 @@ class KnowledgeGraphStatsResponse(BaseModel):
     total_clusters: int = 0
     node_types: Dict[str, int] = Field(default_factory=dict)
     edge_types: Dict[str, int] = Field(default_factory=dict)
+    limited: bool = False
+    node_limit: int = 500
+    edge_limit: int = 1500
 
 
 class KnowledgeGraphResponse(BaseModel):
@@ -167,6 +170,8 @@ async def get_knowledge_graph(
     search: Optional[str] = Query(None),
     min_weight: float = Query(0.0, ge=0.0),
     include_isolated: bool = Query(True),
+    node_limit: int = Query(500, ge=1, le=2000),
+    edge_limit: int = Query(1500, ge=0, le=5000),
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> KnowledgeGraphResponse:
@@ -187,6 +192,8 @@ async def get_knowledge_graph(
             "search": search,
             "min_weight": min_weight,
             "include_isolated": include_isolated,
+            "node_limit": node_limit,
+            "edge_limit": edge_limit,
         },
     )
 

@@ -20,6 +20,7 @@ from app.database.models import (
     User as DBUser,
 )
 from app.database.session import get_db
+from app.services.billing import enforce_entitlement_limit, increment_usage_counter
 from app.services.thinking_sessions import (
     build_facilitation_prompt,
     build_thinking_session_snapshot,
@@ -207,6 +208,13 @@ async def create_thinking_session_endpoint(
     current_user: DBUser = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> ThinkingSessionStateResponse:
+    await enforce_entitlement_limit(
+        db,
+        workspace_id=payload.workspace_id,
+        metric_key="thinking_sessions_created_monthly",
+        increment=1,
+        upgrade_url=f"{settings.FRONTEND_URL}",
+    )
     session = await create_thinking_session(
         workspace_id=payload.workspace_id,
         title=payload.title,
@@ -214,6 +222,12 @@ async def create_thinking_session_endpoint(
         note_id=payload.note_id,
         user=current_user,
         db=db,
+    )
+    await increment_usage_counter(
+        db,
+        workspace_id=payload.workspace_id,
+        metric_key="thinking_sessions_created_monthly",
+        amount=1,
     )
     snapshot = await build_thinking_session_snapshot(session, db)
     return ThinkingSessionStateResponse.model_validate(snapshot)

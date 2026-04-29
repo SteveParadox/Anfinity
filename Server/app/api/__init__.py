@@ -14,4 +14,5 @@ __all__ = [
     "audit",
     "connectors",
     "ingestion",
+    "preferences",
 ]

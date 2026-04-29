@@ -1,6 +1,7 @@
 """Document API routes."""
 import asyncio
 import logging
+from pathlib import Path
 from typing import Optional, List
 from uuid import UUID
 
@@ -22,6 +23,53 @@ from app.tasks.worker import process_document, delete_document_vectors
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
+
+UPLOAD_FILE_TYPE_LABELS = {
+    ".pdf": "PDF",
+    ".txt": "TXT",
+    ".md": "Markdown",
+    ".markdown": "Markdown",
+    ".docx": "DOCX",
+}
+
+UPLOAD_EXTENSION_MIME_TYPES = {
+    ".pdf": {"application/pdf"},
+    ".txt": {"text/plain"},
+    ".md": {"text/markdown", "text/x-markdown", "text/plain"},
+    ".markdown": {"text/markdown", "text/x-markdown", "text/plain"},
+    ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+}
+
+
+def _supported_upload_formats() -> str:
+    return ", ".join(dict.fromkeys(UPLOAD_FILE_TYPE_LABELS.values()))
+
+
+def validate_upload_file_type(filename: Optional[str], content_type: Optional[str]) -> str:
+    """Validate upload extension and MIME type, returning the normalized suffix."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix not in UPLOAD_FILE_TYPE_LABELS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file extension. Upload {_supported_upload_formats()}.",
+        )
+
+    normalized_content_type = (content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+    configured_mime_types = set(settings.ALLOWED_FILE_TYPES)
+    allowed_mime_types = UPLOAD_EXTENSION_MIME_TYPES[suffix] & configured_mime_types
+    if not allowed_mime_types:
+        allowed_mime_types = UPLOAD_EXTENSION_MIME_TYPES[suffix]
+
+    if normalized_content_type not in allowed_mime_types:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"File type '{normalized_content_type}' is not supported for "
+                f"{UPLOAD_FILE_TYPE_LABELS[suffix]} uploads."
+            ),
+        )
+
+    return suffix
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -111,12 +159,7 @@ async def upload_document(
         )
 
     content_type = file.content_type or "application/octet-stream"
-    if content_type not in settings.ALLOWED_FILE_TYPES:
-        logger.warning(f"❌ [TYPE VALIDATION FAILED] File type '{content_type}' not supported")
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"File type '{content_type}' is not supported",
-        )
+    validate_upload_file_type(file.filename, content_type)
 
     content_hash = s3_client.compute_hash(content)
     logger.debug(f"📝 [CONTENT HASH] Computed hash: {content_hash}")

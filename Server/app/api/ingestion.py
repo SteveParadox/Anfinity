@@ -449,7 +449,7 @@ async def configure_email_ingestion(
     email_hash = hashlib.sha256(
         f"{workspace_uuid}{current_user.id}".encode()
     ).hexdigest()[:12]
-    workspace_email = f"cogniflow+{email_hash}@example.com"
+    workspace_email = f"anfinity+{email_hash}@example.com"
 
     workspace.settings = workspace.settings or {}
     workspace.settings["email_ingestion"] = {

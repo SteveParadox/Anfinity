@@ -14,6 +14,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, false, func, text
 
+from app.config import settings
 from app.database.session import get_db, AsyncSessionLocal
 from app.database.models import ApprovalWorkflowPriority, ApprovalWorkflowStatus, Note, NoteCollaborator, NoteCollaborationRole, NoteConnectionSuggestion, NoteInvite, NoteInviteStatus, NoteVersion, User as DBUser, WorkspaceSection
 from app.core.auth import get_current_user
@@ -40,6 +41,12 @@ from app.services.note_invites import (
     revoke_note_invite,
     temporary_rls_bypass,
 )
+from app.services.note_creation import (
+    NoteCaptureIdempotencyConflict,
+    NoteCapturedEvent,
+    create_note as create_note_service,
+)
+from app.services.billing import enforce_entitlement_limit, increment_usage_counter
 
 logger = logging.getLogger(__name__)
 
@@ -909,60 +916,59 @@ async def create_note(
         section=WorkspaceSection.NOTES,
         action="create",
     )
+    await enforce_entitlement_limit(
+        db,
+        workspace_id=workspace_id,
+        metric_key="notes_created_monthly",
+        increment=1,
+        upgrade_url=f"{settings.FRONTEND_URL}",
+    )
     logger.debug(f"✅ [WORKSPACE VERIFIED] User can create notes in workspace {workspace_id}")
     
-    # Create note
-    new_note = Note(
-        workspace_id=workspace_id,
-        user_id=current_user.id,
-        title=note_data.title,
-        content=note_data.content,
-        tags=note_data.tags,
-        source_url=note_data.source_url,
-        note_type=note_data.note_type,
-        word_count=calculate_word_count(note_data.content),
-        ai_generated=False,
+    correlation_id = (
+        request.headers.get("x-correlation-id")
+        or request.headers.get("x-request-id")
+        or None
     )
-    
-    db.add(new_note)
-    await db.flush()
-    await db.refresh(new_note)
-    created_version = await create_note_version_snapshot(
-        db,
-        note=new_note,
-        user_id=current_user.id,
-        change_reason="created",
-        extra_metadata={"trigger": "create_note"},
-    )
-    await audit.note_created(
-        db,
-        actor_user_id=current_user.id,
-        workspace_id=workspace_id,
-        note_id=new_note.id,
-        metadata={
-            "title": new_note.title,
-            "note_type": new_note.note_type,
-            "tag_count": len(new_note.tags or []),
-            "word_count": new_note.word_count or 0,
-            "version_id": str(created_version.id) if created_version is not None else None,
-            "source": "api.notes.create_note",
-        },
-        context=build_note_audit_context(request, "api.notes.create_note"),
-    )
+    idempotency_key = request.headers.get("idempotency-key") or request.headers.get("x-idempotency-key") or None
+    try:
+        result = await create_note_service(
+            db,
+            NoteCapturedEvent(
+                workspace_id=workspace_id,
+                user_id=current_user.id,
+                title=note_data.title,
+                content=note_data.content,
+                tags=note_data.tags,
+                source_url=note_data.source_url,
+                note_type=note_data.note_type,
+                capture_source="manual",
+                capture_path="api.notes",
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+                metadata={"http_path": "/notes"},
+            ),
+            audit_context=build_note_audit_context(request, "api.notes.create_note", session_id=correlation_id),
+        )
+    except NoteCaptureIdempotencyConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    if result.created:
+        await increment_usage_counter(
+            db,
+            workspace_id=workspace_id,
+            metric_key="notes_created_monthly",
+            amount=1,
+        )
     await db.commit()
-    await db.refresh(new_note)
+    await db.refresh(result.note)
 
-    # Queue post-create enrichment after the response so the control-plane note
-    # save stays fast and a downstream service issue does not fail note creation.
-    background_tasks.add_task(sync_note_graph_by_id, new_note.id)
-    background_tasks.add_task(sync_note_search_index_by_id, new_note.id)
-    background_tasks.add_task(queue_note_embedding, str(new_note.id))
-    background_tasks.add_task(queue_note_connection_suggestions, str(new_note.id))
+    background_tasks.add_task(sync_note_graph_by_id, result.note.id)
+    background_tasks.add_task(sync_note_search_index_by_id, result.note.id)
 
-    if len(note_data.content.split()) > 20:
-        background_tasks.add_task(queue_note_summary, str(new_note.id))
-    
-    return serialize_note(new_note)
+    return serialize_note(result.note)
 
 
 @router.get("", response_model=NoteListResponse)

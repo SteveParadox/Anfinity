@@ -20,6 +20,7 @@ from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser
 from app.database.models import WorkspaceSection
 from app.database.session import get_db, log_session_query_metrics
+from app.services.billing import enforce_entitlement_limit, increment_usage_counter
 from app.services.semantic_search import SemanticSearchResult, get_semantic_search_service
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,12 @@ async def _run_semantic_search(
                     query=query,
                     results=cached_results,
                     search_duration_ms=0,
+                    retrieval_metadata={
+                        "strategy": "cached_response",
+                        "top_k": limit,
+                        "filters": filters or {},
+                        "cache_hit": True,
+                    },
                 )
                 data["cached"] = True
                 data["search_log_id"] = search_log_id
@@ -221,6 +228,13 @@ async def semantic_search(
         action="create",
         context=workspace_ctx,
     )
+    await enforce_entitlement_limit(
+        db,
+        workspace_id=workspace_ctx.workspace_id,
+        metric_key="semantic_search_runs_monthly",
+        increment=1,
+        upgrade_url=f"{settings.FRONTEND_URL}",
+    )
     filters: Dict[str, Any] = {}
     if tags:
         filters["tags"] = [item.strip() for item in tags.split(",") if item.strip()]
@@ -230,7 +244,14 @@ async def semantic_search(
         filters["date_to"] = date_to
     if source_type:
         filters["source_type"] = source_type
-    return await _run_semantic_search(q, limit, filters, current_user, workspace_ctx, db)
+    response = await _run_semantic_search(q, limit, filters, current_user, workspace_ctx, db)
+    await increment_usage_counter(
+        db,
+        workspace_id=workspace_ctx.workspace_id,
+        metric_key="semantic_search_runs_monthly",
+        amount=1,
+    )
+    return response
 
 
 @router.post("/semantic", response_model=SemanticSearchResponse)
@@ -248,8 +269,22 @@ async def semantic_search_post(
         action="create",
         context=workspace_ctx,
     )
+    await enforce_entitlement_limit(
+        db,
+        workspace_id=workspace_ctx.workspace_id,
+        metric_key="semantic_search_runs_monthly",
+        increment=1,
+        upgrade_url=f"{settings.FRONTEND_URL}",
+    )
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else {}
-    return await _run_semantic_search(payload.query, payload.limit, filters, current_user, workspace_ctx, db)
+    response = await _run_semantic_search(payload.query, payload.limit, filters, current_user, workspace_ctx, db)
+    await increment_usage_counter(
+        db,
+        workspace_id=workspace_ctx.workspace_id,
+        metric_key="semantic_search_runs_monthly",
+        amount=1,
+    )
+    return response
 
 
 @router.get("/trending", response_model=TrendingResponse)

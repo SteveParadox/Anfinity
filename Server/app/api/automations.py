@@ -22,6 +22,8 @@ from app.services.automations import (
     serialize_automation,
     validate_automation_config,
 )
+from app.services.billing import enforce_entitlement_limit, increment_usage_counter
+from app.services.settings_preferences import workspace_feature_enabled
 
 
 router = APIRouter(prefix="/automations", tags=["Automations"])
@@ -114,6 +116,13 @@ async def create_automation(
     db: AsyncSession = Depends(get_db),
 ):
     await ensure_workspace_permission(payload.workspace_id, current_user, db, WorkspaceSection.WORKFLOWS, "create")
+    await enforce_entitlement_limit(
+        db,
+        workspace_id=payload.workspace_id,
+        metric_key="automations_created_monthly",
+        increment=1,
+        upgrade_url=f"{settings.FRONTEND_URL}",
+    )
     actions = _actions_to_json(payload.actions)
     validate_automation_config(trigger_type=payload.trigger_type, conditions=payload.conditions, actions=actions)
 
@@ -128,6 +137,12 @@ async def create_automation(
     )
     db.add(automation)
     await db.flush()
+    await increment_usage_counter(
+        db,
+        workspace_id=payload.workspace_id,
+        metric_key="automations_created_monthly",
+        amount=1,
+    )
     await db.refresh(automation)
     return AutomationResponse(**serialize_automation(automation))
 
@@ -193,6 +208,9 @@ async def get_enabled_automations_internal(
     _: None = Depends(_require_internal_token),
     db: AsyncSession = Depends(get_db),
 ):
+    if not await workspace_feature_enabled(db, workspace_id, "automations", "enabled"):
+        return InternalEnabledAutomationsResponse(automations=[])
+
     rows = await db.execute(
         select(Automation)
         .where(

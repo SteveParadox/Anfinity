@@ -121,6 +121,8 @@ class WorkspaceResponse(BaseModel):
 class WorkspaceStatsResponse(BaseModel):
     """Workspace statistics response."""
     documents: dict = Field(..., description="Document statistics")
+    notes: dict = Field(default_factory=dict, description="Note statistics")
+    chunks: dict = Field(default_factory=dict, description="Chunk/indexing statistics")
     vectors: int = Field(..., description="Total vector embeddings")
 
 
@@ -423,38 +425,70 @@ async def get_workspace_stats(
         action="view",
     )
     
-    from app.database.models import Document, DocumentStatus
-    
-    # Get document statistics
-    total_result = await db.execute(
-        select(func.count(Document.id))
+    from app.database.models import Chunk, ChunkStatus, Document, DocumentStatus, Embedding, Note
+
+    document_status_result = await db.execute(
+        select(Document.status, func.count(Document.id))
+        .where(Document.workspace_id == workspace_id)
+        .group_by(Document.status)
+    )
+    document_counts = {
+        (status_value.value if hasattr(status_value, "value") else str(status_value)): count
+        for status_value, count in document_status_result.all()
+    }
+    total_docs = sum(document_counts.values())
+
+    note_total_result = await db.execute(
+        select(func.count(Note.id)).where(Note.workspace_id == workspace_id)
+    )
+    total_notes = note_total_result.scalar() or 0
+
+    note_embedding_result = await db.execute(
+        select(func.count(Note.id)).where(
+            Note.workspace_id == workspace_id,
+            Note.embedding.isnot(None),
+            Note.embedding != "",
+        )
+    )
+    embedded_notes = note_embedding_result.scalar() or 0
+
+    chunk_status_result = await db.execute(
+        select(Chunk.chunk_status, func.count(Chunk.id))
+        .join(Document, Chunk.document_id == Document.id)
+        .where(Document.workspace_id == workspace_id)
+        .group_by(Chunk.chunk_status)
+    )
+    chunk_counts = {
+        (status_value.value if hasattr(status_value, "value") else str(status_value)): count
+        for status_value, count in chunk_status_result.all()
+    }
+
+    vector_result = await db.execute(
+        select(func.count(Embedding.id))
+        .join(Chunk, Embedding.chunk_id == Chunk.id)
+        .join(Document, Chunk.document_id == Document.id)
         .where(Document.workspace_id == workspace_id)
     )
-    total_docs = total_result.scalar() or 0
-    
-    indexed_result = await db.execute(
-        select(func.count(Document.id))
-        .where(Document.workspace_id == workspace_id)
-        .where(Document.status == DocumentStatus.INDEXED)
-    )
-    indexed_docs = indexed_result.scalar() or 0
-    
-    processing_result = await db.execute(
-        select(func.count(Document.id))
-        .where(Document.workspace_id == workspace_id)
-        .where(Document.status == DocumentStatus.PROCESSING)
-    )
-    processing_docs = processing_result.scalar() or 0
-    
-    # Get vector count (this is a simplified count - in reality you'd count from vector DB)
-    # For now, we'll estimate based on indexed documents
-    vectors = indexed_docs * 5  # Rough estimate: 5 vectors per document
-    
+    vectors = vector_result.scalar() or 0
+
     return WorkspaceStatsResponse(
         documents={
             "total": total_docs,
-            "indexed": indexed_docs,
-            "processing": processing_docs
+            "indexed": document_counts.get(DocumentStatus.INDEXED.value, 0),
+            "processing": document_counts.get(DocumentStatus.PROCESSING.value, 0),
+            "pending": document_counts.get(DocumentStatus.PENDING.value, 0),
+            "failed": document_counts.get(DocumentStatus.FAILED.value, 0),
+        },
+        notes={
+            "total": total_notes,
+            "embedded": embedded_notes,
+            "without_embeddings": max(total_notes - embedded_notes, 0),
+        },
+        chunks={
+            "total": sum(chunk_counts.values()),
+            "embedded": chunk_counts.get(ChunkStatus.EMBEDDED.value, 0),
+            "pending": chunk_counts.get(ChunkStatus.PENDING.value, 0),
+            "failed": chunk_counts.get(ChunkStatus.FAILED.value, 0),
         },
         vectors=vectors
     )
