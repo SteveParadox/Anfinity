@@ -28,6 +28,7 @@ class AuditAction(str, Enum):
     USER_REGISTERED = "user.registered"
     USER_LOGIN = "user.login"
     USER_LOGOUT = "user.logout"
+    USER_UPDATED = "user.updated"
     PASSWORD_CHANGED = "user.password_changed"
 
     WORKSPACE_CREATED = "workspace.created"
