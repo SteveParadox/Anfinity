@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import List, Optional
 from enum import Enum as PyEnum
 import uuid
+import sqlalchemy as sa
 
 from sqlalchemy import (
     Column, String, DateTime, ForeignKey, Integer, Boolean,
@@ -66,6 +67,32 @@ class WorkspaceSection(str, PyEnum):
     KNOWLEDGE_GRAPH = "knowledge_graph"
     CHAT = "chat"
     WORKFLOWS = "workflows"
+
+
+class BillingPlan(str, PyEnum):
+    """Workspace billing plans."""
+
+    FREE = "free"
+    PRO = "pro"
+    TEAM = "team"
+    ENTERPRISE = "enterprise"
+
+
+class BillingInterval(str, PyEnum):
+    """Subscription cadence."""
+
+    MONTHLY = "monthly"
+    ANNUAL = "annual"
+
+
+class BillingStatus(str, PyEnum):
+    """Workspace subscription lifecycle."""
+
+    ACTIVE = "active"
+    TRIALING = "trialing"
+    PAST_DUE = "past_due"
+    CANCELED = "canceled"
+    INCOMPLETE = "incomplete"
 
 
 class NoteCollaborationRole(str, PyEnum):
@@ -231,6 +258,7 @@ class User(Base):
     # Settings
     is_active = Column(Integer, default=1)
     is_superuser = Column(Integer, default=0)
+    settings = Column(JSONB, default=dict)
     
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -330,6 +358,62 @@ class WorkspaceMember(Base):
     
     __table_args__ = (
         UniqueConstraint('workspace_id', 'user_id', name='unique_workspace_member'),
+    )
+
+
+class WorkspaceBillingProfile(Base):
+    """Workspace-scoped billing and subscription state."""
+
+    __tablename__ = "workspace_billing_profiles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    plan = Column(Enum(BillingPlan), nullable=False, default=BillingPlan.FREE, index=True)
+    billing_interval = Column(Enum(BillingInterval), nullable=False, default=BillingInterval.MONTHLY, index=True)
+    status = Column(Enum(BillingStatus), nullable=False, default=BillingStatus.ACTIVE, index=True)
+    stripe_customer_id = Column(String(255), nullable=True, index=True)
+    stripe_subscription_id = Column(String(255), nullable=True, index=True)
+    stripe_price_id = Column(String(255), nullable=True, index=True)
+    currency = Column(String(8), nullable=False, default="usd")
+    period_start = Column(DateTime(timezone=True), nullable=True)
+    period_end = Column(DateTime(timezone=True), nullable=True)
+    cancel_at_period_end = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    workspace = relationship("Workspace", lazy="joined")
+
+
+class UsageCounter(Base):
+    """Workspace usage meters tracked per billing period and metric."""
+
+    __tablename__ = "usage_counters"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    metric_key = Column(String(120), nullable=False, index=True)
+    period_start = Column(DateTime(timezone=True), nullable=False, index=True)
+    period_end = Column(DateTime(timezone=True), nullable=False, index=True)
+    usage_count = Column(Integer, nullable=False, default=0)
+    included_limit = Column(Integer, nullable=True)
+    overage_rate_cents = Column(Integer, nullable=True)
+    unit_label = Column(String(64), nullable=True)
+    counter_metadata = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    workspace = relationship("Workspace", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "metric_key",
+            "period_start",
+            "period_end",
+            name="uq_usage_counter_workspace_metric_period",
+        ),
+        Index("idx_usage_counters_workspace_metric", "workspace_id", "metric_key"),
+        Index("idx_usage_counters_workspace_period", "workspace_id", "period_start", "period_end"),
     )
 
 
@@ -953,6 +1037,142 @@ class Note(Base):
     )
 
 
+class NoteCaptureEvent(Base):
+    """Durable note capture contract and idempotency record."""
+
+    __tablename__ = "note_capture_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    idempotency_key = Column(String(255), nullable=False, unique=True)
+    correlation_id = Column(String(255), nullable=False, index=True)
+    capture_source = Column(String(100), nullable=False, index=True)
+    capture_path = Column(String(100), nullable=False, index=True)
+
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+
+    note_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("notes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    title = Column(String(500), nullable=False)
+    content_hash = Column(String(64), nullable=False, index=True)
+
+    payload_metadata = Column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa.text("'{}'::jsonb"),
+    )
+
+    status = Column(
+        String(40),
+        nullable=False,
+        default="received",
+        server_default="received",
+        index=True,
+    )
+
+    error = Column(Text, nullable=True)
+
+    received_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    note = relationship("Note", foreign_keys=[note_id], lazy="selectin")
+    workspace = relationship("Workspace", foreign_keys=[workspace_id], lazy="selectin")
+    user = relationship("User", foreign_keys=[user_id], lazy="selectin")
+
+    __table_args__ = (
+        Index("idx_note_capture_events_workspace_source", "workspace_id", "capture_source", "created_at"),
+        Index("idx_note_capture_events_note_status", "note_id", "status", "updated_at"),
+    )
+
+class NoteEnrichmentStep(Base):
+    """Per-note enrichment step state for retries, failures, and debugging."""
+
+    __tablename__ = "note_enrichment_steps"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    note_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("notes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    capture_event_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("note_capture_events.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    step = Column(String(80), nullable=False, index=True)
+
+    status = Column(
+        String(40),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+        index=True,
+    )
+
+    attempts = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
+    correlation_id = Column(String(255), nullable=True, index=True)
+    task_id = Column(String(255), nullable=True)
+    error = Column(Text, nullable=True)
+
+    result_metadata = Column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa.text("'{}'::jsonb"),
+    )
+
+    duration_ms = Column(Integer, nullable=True)
+
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    failed_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
+
+    note = relationship("Note", foreign_keys=[note_id], lazy="joined")
+    capture_event = relationship("NoteCaptureEvent", foreign_keys=[capture_event_id], lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("note_id", "step", name="uq_note_enrichment_steps_note_step"),
+        Index("idx_note_enrichment_steps_event_status", "capture_event_id", "status", "updated_at"),
+        Index("idx_note_enrichment_steps_note_status", "note_id", "status", "updated_at"),
+    )
+
+
 class NoteCollaborator(Base):
     """Note-scoped collaborator access granted outside of workspace membership."""
 
@@ -1055,10 +1275,10 @@ class NoteComment(Base):
     deleted_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     note = relationship("Note", back_populates="comments")
-    author = relationship("User", foreign_keys=[author_user_id], back_populates="authored_note_comments", lazy="joined")
+    author = relationship("User", foreign_keys=[author_user_id], back_populates="authored_note_comments", lazy="selectin")
     parent_comment = relationship("NoteComment", remote_side=[id], back_populates="replies")
     replies = relationship("NoteComment", back_populates="parent_comment", cascade="all, delete-orphan")
-    resolved_by = relationship("User", foreign_keys=[resolved_by_user_id], back_populates="resolved_note_comments", lazy="joined")
+    resolved_by = relationship("User", foreign_keys=[resolved_by_user_id], back_populates="resolved_note_comments", lazy="selectin")
     mentions = relationship("NoteCommentMention", back_populates="comment", cascade="all, delete-orphan")
     reactions = relationship("NoteCommentReaction", back_populates="comment", cascade="all, delete-orphan")
     notifications = relationship("UserNotification", back_populates="comment", cascade="all, delete-orphan")
@@ -1135,7 +1355,7 @@ class NoteCommentMention(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
     comment = relationship("NoteComment", back_populates="mentions")
-    mentioned_user = relationship("User", foreign_keys=[mentioned_user_id], back_populates="comment_mentions", lazy="joined")
+    mentioned_user = relationship("User", foreign_keys=[mentioned_user_id], back_populates="comment_mentions", lazy="selectin")
 
     __table_args__ = (
         UniqueConstraint("comment_id", "mentioned_user_id", name="uq_note_comment_mentions_comment_user"),
@@ -1164,7 +1384,7 @@ class NoteCommentReaction(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
     comment = relationship("NoteComment", back_populates="reactions")
-    user = relationship("User", foreign_keys=[user_id], back_populates="comment_reactions", lazy="joined")
+    user = relationship("User", foreign_keys=[user_id], back_populates="comment_reactions", lazy="selectin")
 
     __table_args__ = (
         UniqueConstraint("comment_id", "user_id", "emoji", name="uq_note_comment_reactions_comment_user_emoji"),
@@ -1198,8 +1418,8 @@ class UserNotification(Base):
     read_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
-    user = relationship("User", foreign_keys=[user_id], back_populates="notifications", lazy="joined")
-    actor = relationship("User", foreign_keys=[actor_user_id], back_populates="triggered_notifications", lazy="joined")
+    user = relationship("User", foreign_keys=[user_id], back_populates="notifications", lazy="selectin")
+    actor = relationship("User", foreign_keys=[actor_user_id], back_populates="triggered_notifications", lazy="selectin")
     note = relationship("Note", back_populates="notifications")
     comment = relationship("NoteComment", back_populates="notifications")
 
@@ -1275,7 +1495,7 @@ class ThinkingSessionParticipant(Base):
     last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
 
     session = relationship("ThinkingSession", back_populates="participants")
-    user = relationship("User", lazy="joined")
+    user = relationship("User", lazy="selectin")
 
     __table_args__ = (
         UniqueConstraint("session_id", "user_id", name="uq_thinking_session_participants_session_user"),
@@ -1306,7 +1526,7 @@ class ThinkingSessionContribution(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
 
     session = relationship("ThinkingSession", back_populates="contributions")
-    author = relationship("User", lazy="joined")
+    author = relationship("User", lazy="selectin")
     votes = relationship("ThinkingSessionVote", back_populates="contribution", cascade="all, delete-orphan")
 
     __table_args__ = (
@@ -1326,7 +1546,7 @@ class ThinkingSessionVote(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
     contribution = relationship("ThinkingSessionContribution", back_populates="votes")
-    user = relationship("User", lazy="joined")
+    user = relationship("User", lazy="selectin")
 
     __table_args__ = (
         UniqueConstraint("contribution_id", "user_id", name="uq_thinking_session_votes_contribution_user"),
@@ -1365,7 +1585,7 @@ class ThinkingSessionSynthesisRun(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False, index=True)
 
     session = relationship("ThinkingSession", back_populates="synthesis_runs")
-    triggered_by = relationship("User", lazy="joined")
+    triggered_by = relationship("User", lazy="selectin")
 
     __table_args__ = (
         Index("idx_thinking_session_synthesis_runs_session_status", "session_id", "status", "created_at"),
@@ -1664,13 +1884,15 @@ class SearchLog(Base):
     # Results
     result_chunk_ids = Column(JSONB, default=list)  # Array of chunk UUIDs returned
     result_count = Column(Integer, default=0)
-    
+    result_snapshot = Column(JSONB, default=list)  # Ranked result payloads shown to the user
+
     # User interaction (updated on click)
     clicked_count = Column(Integer, default=0)
     clicked_chunk_ids = Column(JSONB, default=list)
-    
+
     # Performance metrics
     search_duration_ms = Column(Integer, nullable=True)
+    retrieval_metadata = Column(JSONB, default=dict)
     
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
@@ -1685,4 +1907,63 @@ class SearchLog(Base):
         Index('idx_search_log_workspace', 'workspace_id', 'created_at'),
         Index('idx_search_log_user', 'user_id', 'created_at'),
         Index('idx_search_log_query', 'query_text'),
+    )
+
+
+class SearchFeedbackTargetKind(str, PyEnum):
+    """Granularity of feedback captured from semantic search experiences."""
+
+    ANSWER = "answer"
+    RESULT = "result"
+
+
+class SearchFeedback(Base):
+    """Typed, context-linked semantic-search feedback."""
+
+    __tablename__ = "search_feedback"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    search_log_id = Column(UUID(as_uuid=True), ForeignKey("search_logs.id"), nullable=True, index=True)
+    query_id = Column(UUID(as_uuid=True), ForeignKey("queries.id"), nullable=True, index=True)
+    answer_id = Column(UUID(as_uuid=True), ForeignKey("answers.id"), nullable=True, index=True)
+
+    # Uniqueness scope to support safe create/update behavior from repeated submits.
+    context_key = Column(String(255), nullable=False)
+    scope_key = Column(String(255), nullable=False)
+
+    # Feedback payload
+    target_kind = Column(String(20), nullable=False, default=SearchFeedbackTargetKind.ANSWER.value)
+    target_result_id = Column(String(255), nullable=True, index=True)
+    feedback_type = Column(String(64), nullable=False, index=True)
+    rating_value = Column(Integer, nullable=True)
+    reason_code = Column(String(64), nullable=True, index=True)
+    comment = Column(Text, nullable=True)
+
+    # Search/query context
+    query_text = Column(Text, nullable=False)
+    query_embedding_provider = Column(String(64), nullable=True)
+    query_embedding_model = Column(String(128), nullable=True)
+    result_ids = Column(JSONB, default=list)
+    result_snapshot = Column(JSONB, default=list)
+    answer_snapshot = Column(JSONB, default=dict)
+    retrieval_diagnostics = Column(JSONB, default=dict)
+    metadata_json = Column(JSONB, default=dict)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+    workspace = relationship("Workspace")
+    user = relationship("User")
+    search_log = relationship("SearchLog")
+    query = relationship("Query")
+    answer = relationship("Answer")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "user_id", "context_key", "scope_key", name="uq_search_feedback_user_context_scope"),
+        Index("idx_search_feedback_workspace_created", "workspace_id", "created_at"),
+        Index("idx_search_feedback_workspace_type", "workspace_id", "feedback_type", "created_at"),
+        Index("idx_search_feedback_workspace_reason", "workspace_id", "reason_code", "created_at"),
+        Index("idx_search_feedback_workspace_result", "workspace_id", "target_result_id", "created_at"),
     )

@@ -186,6 +186,17 @@ def _dispatch_pending_audit_events_after_commit(session: Session) -> None:
     if pending_events:
         dispatch_pending_audit_events(pending_events)
 
+    pending_note_capture_event_ids = list(session_info.get("pending_note_capture_event_ids") or [])
+    session_info["pending_note_capture_event_ids"] = []
+    if pending_note_capture_event_ids:
+        try:
+            from app.tasks.note_auto_tagging import run_note_auto_tagging_pipeline
+
+            for event_id in dict.fromkeys(str(item) for item in pending_note_capture_event_ids if item):
+                run_note_auto_tagging_pipeline.delay(event_id)
+        except Exception as exc:
+            logger.warning("Failed to dispatch note auto-tagging pipeline after commit: %s", exc)
+
 
 @event.listens_for(Session, "after_rollback")
 def _clear_pending_audit_events_after_rollback(session: Session) -> None:
@@ -196,6 +207,7 @@ def _clear_pending_audit_events_after_rollback(session: Session) -> None:
     from app.core.audit import clear_pending_audit_events
 
     clear_pending_audit_events(session_info)
+    session_info["pending_note_capture_event_ids"] = []
 
 
 def bind_db_user_context(db: AsyncSession | Session, user_id) -> None:
