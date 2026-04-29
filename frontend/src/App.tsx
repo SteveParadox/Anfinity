@@ -4,7 +4,7 @@
  * Fixes vs. original:
  *  - `window.innerWidth` in JSX replaced with reactive `useWindowWidth` hook
  *    (original values were snapshots; sidebar never repositioned after first render)
- *  - `Math.random()` in status bar replaced with stable `useState` values
+ *  - Status bar metrics are loaded from workspace-scoped API stats
  *  - Tailwind `className` strings removed — all layout now driven by inline
  *    styles keyed off the reactive `isMobile` / `isSmall` booleans so the app
  *    works without a Tailwind build step
@@ -20,8 +20,15 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from './contexts/AuthContext';
 import { Sidebar } from './components/Sidebar';
 import { WorkspaceSwitcher } from './components/WorkspaceSwitcher';
-import { Sparkles, Menu, LogOut, AlertCircle, MessageCircle } from 'lucide-react';
+import { ThemeApplier } from './components/ThemeApplier';
+import { ThemeToggle } from './components/ThemeToggle';
+import { ThemeContextProvider } from './contexts/ThemeContext';
+import { Menu, LogOut, AlertCircle, MessageCircle } from 'lucide-react';
 import type { User } from './types';
+import { useProductSettings } from './hooks/useProductSettings';
+import { DESIGN_TOKENS } from './lib/theme';
+import type { ThemeChoice } from './lib/theme';
+import { api, type WorkspaceStatsResponse } from './lib/api';
 
 const Dashboard = lazy(() => import('./sections/Dashboard').then((module) => ({ default: module.Dashboard })));
 const KnowledgeGraphView = lazy(() => import('./sections/KnowledgeGraphView').then((module) => ({ default: module.KnowledgeGraphView })));
@@ -31,9 +38,9 @@ const WorkspacesView = lazy(() => import('./sections/WorkspacesView').then((modu
 const WorkflowsView = lazy(() => import('./sections/WorkflowsView').then((module) => ({ default: module.WorkflowsView })));
 const IntegrationsView = lazy(() => import('./sections/IntegrationsView').then((module) => ({ default: module.IntegrationsView })));
 const PricingView = lazy(() => import('./sections/PricingView').then((module) => ({ default: module.PricingView })));
+const SettingsView = lazy(() => import('./sections/SettingsView').then((module) => ({ default: module.SettingsView })));
 const DocumentUploadView = lazy(() => import('./sections/UploadView').then((module) => ({ default: module.DocumentUploadView })));
 const DocumentsView = lazy(() => import('./sections/DocumentsView').then((module) => ({ default: module.DocumentsView })));
-const AIInsightsPanel = lazy(() => import('./components/AIInsightsPanel').then((module) => ({ default: module.AIInsightsPanel })));
 const AskPastSelf = lazy(() => import('./components/chat/AskPastSelf').then((module) => ({ default: module.AskPastSelf })));
 const ThinkingSessionsView = lazy(() => import('./sections/ThinkingSessionsView').then((module) => ({ default: module.ThinkingSessionsView })));
 
@@ -48,27 +55,34 @@ type View =
   | 'workspaces'
   | 'integrations'
   | 'workflows'
+  | 'settings'
   | 'pricing'
   | 'upload'
   | 'documents';
 
+function parseThemeChoice(value: unknown): ThemeChoice | undefined {
+  return value === 'light' || value === 'dark' || value === 'system' ? value : undefined;
+}
+
 // ─── Design tokens ────────────────────────────────────────────────────────────
 
+// Use CSS custom properties defined by ThemeApplier
+// Fallback to dark theme colors if CSS vars are not yet applied
 const TT = {
-  inkBlack:    '#0A0A0A',
-  inkDeep:     '#111111',
-  inkRaised:   '#1A1A1A',
-  inkBorder:   '#252525',
-  inkMid:      '#3A3A3A',
-  inkMuted:    '#5A5A5A',
-  inkSubtle:   '#888888',
-  snow:        '#F5F5F5',
-  yolk:        '#F5E642',
-  errorText:   '#FF4545',
-  errorBorder: 'rgba(255,69,69,0.3)',
-  fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif",
-  fontMono:    "'IBM Plex Mono', monospace",
-  fontBody:    "'IBM Plex Sans', sans-serif",
+  inkBlack:    'var(--theme-text-inverse, #0A0A0A)',
+  inkDeep:     'var(--theme-panel, #111111)',
+  inkRaised:   'var(--theme-panel-raised, #1A1A1A)',
+  inkBorder:   'var(--theme-border, #252525)',
+  inkMid:      'var(--theme-border-strong, #3A3A3A)',
+  inkMuted:    'var(--theme-text-muted, #5A5A5A)',
+  inkSubtle:   'var(--theme-text-subtle, #888888)',
+  snow:        'var(--theme-text, #F5F5F5)',
+  yolk:        'var(--theme-accent, #F5E642)',
+  errorText:   'var(--theme-error, #D92D20)',
+  errorBorder: 'rgba(217,45,32,0.3)',
+  fontDisplay: DESIGN_TOKENS.fontDisplay,
+  fontMono:    DESIGN_TOKENS.fontMono,
+  fontBody:    DESIGN_TOKENS.fontBody,
 } as const;
 
 const SIDEBAR_EXPANDED  = 240;
@@ -118,28 +132,22 @@ function useWindowWidth(): number {
   return width;
 }
 
-// ─── Stable random stats ─────────────────────────────────────────────────────
-
-/**
- * Returns stable demo stats so the status-bar numbers don't jitter on every
- * render (the original used Math.random() directly in JSX).
- * Replace with real API data when available.
- */
-function useStableStats() {
-  const [stats] = useState(() => ({
-    notes: Math.round(Math.random() * 100),
-    insights: Math.round(Math.random() * 50),
-  }));
-  return stats;
-}
-
 // ─── Component ────────────────────────────────────────────────────────────────
 
 function App() {
   const navigate   = useNavigate();
   const { user: contextUser, logout, isLoading: authLoading, currentWorkspaceId, hasPermission } = useAuth();
+  const { user: shellSettings, updateUserSettings } = useProductSettings(currentWorkspaceId, Boolean(contextUser));
+
+  const themeChoice = useMemo<ThemeChoice | undefined>(
+    () => parseThemeChoice(shellSettings?.settings.appearance?.theme),
+    [shellSettings?.settings.appearance?.theme],
+  );
+
   const windowWidth = useWindowWidth();
-  const stats       = useStableStats();
+  const [shellStats, setShellStats] = useState<WorkspaceStatsResponse | null>(null);
+  const [shellStatsLoading, setShellStatsLoading] = useState(false);
+  const [shellStatsError, setShellStatsError] = useState<string | null>(null);
 
   const isMobile = windowWidth < 1024;
   const isSmall  = windowWidth < 640;
@@ -147,7 +155,6 @@ function App() {
   const [currentView,       setCurrentView]       = useState<View>('dashboard');
   const [sidebarCollapsed,  setSidebarCollapsed]  = useState(isMobile);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [insightsOpen,      setInsightsOpen]      = useState(false);
   const [chatOpen,          setChatOpen]          = useState(false);
   const [logoutError,       setLogoutError]       = useState<string | null>(null);
 
@@ -160,6 +167,63 @@ function App() {
   useEffect(() => {
     if (!isMobile) setMobileSidebarOpen(false);
   }, [isMobile]);
+
+  useEffect(() => {
+    const density = shellSettings?.settings.appearance?.density;
+    const root = document.documentElement;
+
+    if (density) {
+      root.dataset.density = density;
+    } else {
+      delete root.dataset.density;
+    }
+  }, [shellSettings?.settings.appearance?.density]);
+
+  useEffect(() => {
+    if (!contextUser || !currentWorkspaceId) {
+      setShellStats(null);
+      setShellStatsError(null);
+      setShellStatsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadShellStats = async () => {
+      setShellStatsLoading(true);
+      setShellStatsError(null);
+      try {
+        const stats = await api.getWorkspaceStats(currentWorkspaceId);
+        if (!cancelled) setShellStats(stats);
+      } catch (error) {
+        if (!cancelled) {
+          setShellStats(null);
+          setShellStatsError(error instanceof Error ? error.message : 'Workspace metrics unavailable');
+        }
+      } finally {
+        if (!cancelled) setShellStatsLoading(false);
+      }
+    };
+
+    void loadShellStats();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [contextUser, currentWorkspaceId]);
+
+  const handleThemeChoiceChange = useCallback((choice: ThemeChoice) => {
+    const currentAppearance = shellSettings?.settings.appearance ?? {};
+
+    void updateUserSettings({
+      appearance: {
+        ...currentAppearance,
+        theme: choice,
+      },
+    }).catch((error) => {
+      console.error('Failed to save theme preference', error);
+    });
+  }, [shellSettings?.settings.appearance, updateUserSettings]);
 
   const handleLogout = useCallback(async () => {
     try {
@@ -188,7 +252,7 @@ function App() {
   const canViewWorkflows = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'workflows', 'view'));
   const canManageIntegrations = Boolean(currentWorkspaceId && hasPermission(currentWorkspaceId, 'settings', 'view'));
   const availableViews = useMemo<View[]>(() => {
-    const views: View[] = ['dashboard', 'workspaces', 'pricing'];
+    const views: View[] = ['dashboard', 'workspaces', 'settings', 'pricing'];
     if (canViewNotes) views.push('notes');
     if (canViewDocuments) views.push('documents');
     if (canCreateDocuments) views.push('upload');
@@ -228,11 +292,12 @@ function App() {
       workspaces: <WorkspacesView user={contextUser} />,
       integrations: <IntegrationsView />,
       workflows:  <WorkflowsView />,
+      settings:   <SettingsView user={contextUser} />,
       pricing:    <PricingView currentPlan={contextUser.plan ?? 'free'} />,
       upload:     <DocumentUploadView />,
       documents:  <DocumentsView />,
     };
-  }, [canUseSearch, canViewGraph, canViewNotes, contextUser]);
+  }, [canUseSearch, canViewGraph, canViewNotes, canViewWorkflows, contextUser]);
 
   // ── Derived layout values ───────────────────────────────────────────────
   const sidebarWidth   = sidebarCollapsed ? SIDEBAR_COLLAPSED : SIDEBAR_EXPANDED;
@@ -240,6 +305,12 @@ function App() {
 
   const userInitial = (contextUser?.name ?? contextUser?.email ?? '?').charAt(0).toUpperCase();
   const userName    = contextUser?.full_name ?? contextUser?.name ?? 'User';
+  const shellStatsLabel = useMemo(() => {
+    if (!currentWorkspaceId) return 'No workspace selected';
+    if (shellStatsLoading && !shellStats) return 'Loading workspace metrics';
+    if (shellStatsError) return 'Workspace metrics unavailable';
+    return `${shellStats?.notes.total ?? 0} notes | ${shellStats?.documents.total ?? 0} docs | ${shellStats?.vectors ?? 0} vectors`;
+  }, [currentWorkspaceId, shellStats, shellStatsError, shellStatsLoading]);
 
   // ── Auth loading guard ──────────────────────────────────────────────────
   if (authLoading) {
@@ -271,20 +342,24 @@ function App() {
   // ─────────────────────────────────────────────────────────────────────────
 
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        background: TT.inkBlack,
-        backgroundImage: [
-          'linear-gradient(rgba(245,230,66,0.018) 1px, transparent 1px)',
-          'linear-gradient(90deg, rgba(245,230,66,0.018) 1px, transparent 1px)',
-        ].join(', '),
-        backgroundSize: '32px 32px',
-        display: 'flex',
-        fontFamily: TT.fontMono,
-        position: 'relative',
-      }}
-    >
+    <ThemeContextProvider initialChoice={themeChoice} onChoiceChange={handleThemeChoiceChange}>
+      {/* Apply theme tokens from context */}
+      <ThemeApplier />
+      
+      <div
+        style={{
+          minHeight: '100vh',
+          background: TT.inkBlack,
+          backgroundImage: [
+            'linear-gradient(rgba(245,230,66,0.018) 1px, transparent 1px)',
+            'linear-gradient(90deg, rgba(245,230,66,0.018) 1px, transparent 1px)',
+          ].join(', '),
+          backgroundSize: '32px 32px',
+          display: 'flex',
+          fontFamily: TT.fontMono,
+          position: 'relative',
+        }}
+      >
       {/* ── Mobile overlay ─────────────────────────────────────── */}
       {mobileSidebarOpen && (
         <div
@@ -394,7 +469,7 @@ function App() {
                   lineHeight: 1,
                 }}
               >
-                <span style={{ color: TT.yolk }}>C</span>OGNI
+                <span style={{ color: TT.yolk }}>AN</span>FINITY
               </span>
               <span style={{ color: TT.inkMid, fontFamily: TT.fontMono, fontSize: 12 }}>/</span>
               <span
@@ -452,21 +527,21 @@ function App() {
               style={{
                 height: 32,
                 padding: '0 12px',
-                background: chatOpen ? 'rgba(139,92,246,0.1)' : 'transparent',
-                border: `1px solid ${chatOpen ? 'rgba(139,92,246,0.3)' : TT.inkBorder}`,
+                background: chatOpen ? 'rgba(245,230,66,0.1)' : 'transparent',
+                border: `1px solid ${chatOpen ? 'rgba(245,230,66,0.3)' : TT.inkBorder}`,
                 borderRadius: 3,
                 cursor: canOpenWorkspaceScopedChat ? 'pointer' : 'not-allowed',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 7,
                 transition: 'all 0.15s',
-                color: chatOpen ? '#8B5CF6' : TT.inkMuted,
+                color: chatOpen ? TT.yolk : TT.inkMuted,
                 opacity: canOpenWorkspaceScopedChat ? 1 : 0.45,
               }}
               onMouseEnter={(e) => {
                 if (!chatOpen && canOpenWorkspaceScopedChat) {
-                  e.currentTarget.style.borderColor = 'rgba(139,92,246,0.25)';
-                  e.currentTarget.style.color = '#8B5CF6';
+                  e.currentTarget.style.borderColor = 'rgba(245,230,66,0.25)';
+                  e.currentTarget.style.color = TT.yolk;
                 }
               }}
               onMouseLeave={(e) => {
@@ -491,51 +566,11 @@ function App() {
               )}
             </button>
 
-            {/* AI Insights toggle */}
-            <button
-              onClick={() => setInsightsOpen((o) => !o)}
-              aria-pressed={insightsOpen}
-              aria-label="Toggle AI Insights panel"
-              style={{
-                height: 32,
-                padding: '0 12px',
-                background: insightsOpen ? 'rgba(245,230,66,0.1)' : 'transparent',
-                border: `1px solid ${insightsOpen ? 'rgba(245,230,66,0.3)' : TT.inkBorder}`,
-                borderRadius: 3,
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 7,
-                transition: 'all 0.15s',
-                color: insightsOpen ? TT.yolk : TT.inkMuted,
-              }}
-              onMouseEnter={(e) => {
-                if (!insightsOpen) {
-                  e.currentTarget.style.borderColor = 'rgba(245,230,66,0.25)';
-                  e.currentTarget.style.color = TT.yolk;
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (!insightsOpen) {
-                  e.currentTarget.style.borderColor = TT.inkBorder;
-                  e.currentTarget.style.color = TT.inkMuted;
-                }
-              }}
-            >
-              <Sparkles size={12} aria-hidden />
-              {!isSmall && (
-                <span
-                  style={{
-                    fontFamily: TT.fontMono,
-                    fontSize: 10,
-                    letterSpacing: '0.08em',
-                    textTransform: 'uppercase',
-                  }}
-                >
-                  AI Insights
-                </span>
-              )}
-            </button>
+            {/* Divider */}
+            <div style={{ width: 1, height: 22, background: TT.inkBorder }} aria-hidden />
+
+            {/* Theme toggle */}
+            <ThemeToggle compact iconSize={16} />
 
             {/* Divider */}
             <div style={{ width: 1, height: 22, background: TT.inkBorder }} aria-hidden />
@@ -681,7 +716,7 @@ function App() {
                 color: TT.inkMid,
               }}
             >
-              {stats.notes} notes · {stats.insights} insights
+              {shellStatsLabel}
             </span>
           </div>
           <span
@@ -693,21 +728,10 @@ function App() {
               color: TT.inkBorder,
             }}
           >
-            CogniFlow v2.4.1
+            Anfinity v2.4.1
           </span>
         </div>
       </div>
-
-      {/* ── AI Insights panel ─────────────────────────────────────── */}
-      {insightsOpen && (
-        <Suspense fallback={null}>
-          <AIInsightsPanel
-            insights={[]}
-            isOpen={insightsOpen}
-            onClose={() => setInsightsOpen(false)}
-          />
-        </Suspense>
-      )}
 
       {/* ── Ask Your Past Self Chat Modal ─────────────────────────── */}
       {chatOpen && contextUser && (
@@ -736,10 +760,10 @@ function App() {
               right: 20,
               width: Math.min(500, windowWidth - 40),
               height: Math.min(600, window.innerHeight - 40),
-              background: TT.inkBlack,
+              background: TT.inkDeep,
               borderRadius: 6,
               border: `1px solid ${TT.inkBorder}`,
-              boxShadow: '0 20px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(139,92,246,0.2)',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.35), 0 0 0 1px var(--theme-accent-border)',
               zIndex: 999,
               display: 'flex',
               flexDirection: 'column',
@@ -762,7 +786,8 @@ function App() {
           50%       { opacity: 0.5; box-shadow: 0 0 12px #F5E642; }
         }
       `}</style>
-    </div>
+      </div>
+    </ThemeContextProvider>
   );
 }
 

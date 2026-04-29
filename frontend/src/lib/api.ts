@@ -1,5 +1,5 @@
 /**
- * Production-ready API Client for CogniFlow
+ * Production-ready API Client for Anfinity
  * Includes retry logic, timeout handling, error management, and request logging
  */
 
@@ -118,6 +118,13 @@ export class AuthorizationError extends ApiError {
   }
 }
 
+export class EntitlementError extends ApiError {
+  constructor(message: string = 'Upgrade required', details?: Record<string, any>) {
+    super(402, 'ENTITLEMENT_REQUIRED', message, details);
+    this.name = 'EntitlementError';
+  }
+}
+
 export class NotFoundError extends ApiError {
   constructor(message: string = 'Resource not found') {
     super(404, 'NOT_FOUND', message);
@@ -185,6 +192,172 @@ export interface Workspace {
   member_count?: number;
   members?: Array<Record<string, any>>;
 }
+
+export interface ProductUserSettings {
+  ai_search: {
+    smart_highlights: boolean;
+    show_source_cards: boolean;
+    show_similarity_scores: boolean;
+    default_top_k: number;
+  };
+  notifications: {
+    in_app_comments: boolean;
+    in_app_mentions: boolean;
+    in_app_replies: boolean;
+    in_app_approvals: boolean;
+    digest_frequency: 'off' | 'daily' | 'weekly';
+  };
+  collaboration: {
+    presence_visible: boolean;
+    show_collaborator_cursors: boolean;
+    allow_note_invites: boolean;
+  };
+  appearance: {
+    theme: 'dark' | 'light' | 'system';
+    density: 'compact' | 'comfortable';
+  };
+  onboarding: {
+    assistant_tips: boolean;
+  };
+}
+
+export interface ProductWorkspaceSettings {
+  ai_search: {
+    ask_past_self_enabled: boolean;
+    min_note_similarity: number;
+    source_cards_default: boolean;
+  };
+  notes: {
+    default_visibility: 'private' | 'workspace';
+    auto_tagging_enabled: boolean;
+    summary_generation_enabled: boolean;
+    connection_suggestions_enabled: boolean;
+    decay_classification_enabled: boolean;
+  };
+  collaboration: {
+    comment_threads_enabled: boolean;
+    mentions_enabled: boolean;
+    invite_policy: 'owners_admins' | 'members';
+  };
+  integrations: {
+    auto_sync_enabled: boolean;
+    sync_frequency: 'manual' | 'hourly' | 'daily';
+  };
+  automations: {
+    enabled: boolean;
+    notify_on_failure: boolean;
+  };
+  approvals: {
+    enabled: boolean;
+    default_priority: 'low' | 'normal' | 'high' | 'critical';
+    default_due_days: number;
+  };
+}
+
+export interface UserSettingsResponse {
+  user_id: string;
+  settings: ProductUserSettings;
+  defaults: ProductUserSettings;
+}
+
+export interface WorkspaceStatsResponse {
+  documents: {
+    total: number;
+    indexed: number;
+    processing: number;
+    pending?: number;
+    failed?: number;
+  };
+  notes: {
+    total: number;
+    embedded: number;
+    without_embeddings: number;
+  };
+  chunks: {
+    total: number;
+    embedded: number;
+    pending: number;
+    failed: number;
+  };
+  vectors: number;
+}
+
+export interface WorkspaceSettingsResponse {
+  workspace_id: string;
+  settings: ProductWorkspaceSettings;
+  defaults: ProductWorkspaceSettings;
+  can_update: boolean;
+}
+
+export interface BillingPlanLimit {
+  limit: number | null;
+  overage_rate_cents: number | null;
+  label: string;
+  unit_label: string;
+}
+
+export interface BillingPlanDefinition {
+  key: string;
+  name: string;
+  description: string;
+  monthly_price_cents: number;
+  annual_price_cents: number | null;
+  annual_per_month_cents: number | null;
+  annual_savings_cents: number | null;
+  features: string[];
+  entitlement_keys: string[];
+  limits: Record<string, BillingPlanLimit>;
+  highlighted: boolean;
+  cta_label: string;
+  stripe_price_ids: {
+    monthly: string | null;
+    annual: string | null;
+  };
+}
+
+export interface BillingSubscription {
+  plan_key: string;
+  billing_interval: 'monthly' | 'annual';
+  status: 'active' | 'trialing' | 'past_due' | 'canceled' | 'incomplete';
+  stripe_customer_id?: string | null;
+  stripe_subscription_id?: string | null;
+  period_start?: string | null;
+  period_end?: string | null;
+  cancel_at_period_end?: boolean;
+  currency?: string;
+}
+
+export interface BillingUsageMetric {
+  metric_key: string;
+  label: string;
+  description: string;
+  unit_label: string;
+  current_usage: number;
+  limit: number | null;
+  percentage_used: number | null;
+  period_start: string;
+  period_end: string;
+  projected_usage: number;
+  projected_overage_units: number;
+  projected_overage_cents: number;
+  overage_rate_cents: number | null;
+}
+
+export interface BillingUsageResponse {
+  workspace_id: string;
+  plan: BillingPlanDefinition;
+  subscription: BillingSubscription;
+  usage_metrics: BillingUsageMetric[];
+  projected_monthly_cost: {
+    base_monthly_cents: number;
+    projected_overage_cents: number;
+    projected_total_monthly_cents: number;
+  };
+}
+
+export type DeepPartial<T> = {
+  [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
+};
 
 export interface SearchResult {
   chunk_id: string;
@@ -572,6 +745,8 @@ class ApiClient {
           throw new AuthenticationError(message);
         case 403:
           throw new AuthorizationError(message);
+        case 402:
+          throw new EntitlementError(message, error.metadata || body?.error?.metadata || body?.metadata);
         case 404:
           throw new NotFoundError(message);
         case 422:
@@ -638,6 +813,37 @@ class ApiClient {
 
   async health(): Promise<{ status: string; version: string; environment: string }> {
     return this.request('/health', { retries: false });
+  }
+
+  // ==================== Billing Endpoints ====================
+
+  async getBillingPlans(): Promise<BillingPlanDefinition[]> {
+    const response = await this.request<{ plans: BillingPlanDefinition[] }>('/billing/plans', {
+      retries: false,
+    });
+    return response?.plans || [];
+  }
+
+  async getWorkspaceBillingSubscription(workspaceId: string): Promise<{
+    workspace_id: string;
+    subscription: BillingSubscription;
+    plan: BillingPlanDefinition;
+  }> {
+    return this.request(`/billing/subscription?workspace_id=${encodeURIComponent(workspaceId)}`);
+  }
+
+  async getBillingUsage(workspaceId: string): Promise<BillingUsageResponse> {
+    return this.request(`/billing/usage?workspace_id=${encodeURIComponent(workspaceId)}`);
+  }
+
+  async createBillingPortalSession(workspaceId: string, returnUrl?: string): Promise<{ url: string }> {
+    return this.request('/billing/portal-session', {
+      method: 'POST',
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        return_url: returnUrl,
+      }),
+    });
   }
 
   // ==================== Documents Endpoints ====================
@@ -1216,11 +1422,47 @@ class ApiClient {
     });
   }
 
-  async getWorkspaceStats(workspaceId: string): Promise<{
-    documents: { total: number; indexed: number; processing: number };
-    vectors: number;
-  }> {
+  async getWorkspaceStats(workspaceId: string): Promise<WorkspaceStatsResponse> {
     return this.request(`/workspaces/${workspaceId}/stats`);
+  }
+
+  // ==================== Settings Endpoints ====================
+
+  async getMySettings(): Promise<UserSettingsResponse> {
+    return this.request('/settings/me');
+  }
+
+  async updateMySettings(settings: DeepPartial<ProductUserSettings>): Promise<UserSettingsResponse> {
+    return this.request('/settings/me', {
+      method: 'PATCH',
+      body: JSON.stringify({ settings }),
+    });
+  }
+
+  async resetMySettings(): Promise<UserSettingsResponse> {
+    return this.request('/settings/me/reset', {
+      method: 'POST',
+    });
+  }
+
+  async getWorkspaceSettings(workspaceId: string): Promise<WorkspaceSettingsResponse> {
+    return this.request(`/settings/workspaces/${workspaceId}`);
+  }
+
+  async updateWorkspaceSettings(
+    workspaceId: string,
+    settings: DeepPartial<ProductWorkspaceSettings>
+  ): Promise<WorkspaceSettingsResponse> {
+    return this.request(`/settings/workspaces/${workspaceId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ settings }),
+    });
+  }
+
+  async resetWorkspaceSettings(workspaceId: string): Promise<WorkspaceSettingsResponse> {
+    return this.request(`/settings/workspaces/${workspaceId}/reset`, {
+      method: 'POST',
+    });
   }
 
   // ==================== Search Endpoints ====================
@@ -1318,6 +1560,12 @@ class ApiClient {
     }
     if (typeof filters?.includeIsolated === 'boolean') {
       queryParams.append('include_isolated', String(filters.includeIsolated));
+    }
+    if (typeof filters?.nodeLimit === 'number') {
+      queryParams.append('node_limit', String(filters.nodeLimit));
+    }
+    if (typeof filters?.edgeLimit === 'number') {
+      queryParams.append('edge_limit', String(filters.edgeLimit));
     }
 
     return this.request(
@@ -1457,13 +1705,97 @@ class ApiClient {
 
   async submitAnswerFeedback(
     answerId: string,
-    status: 'verified' | 'rejected',
-    comment?: string
-  ): Promise<{ answer_id: string; feedback_status: string; chunks_updated: Array<{ chunk_id: string; document_id: string; old_weight: number; new_weight: number; accuracy: number }> }> {
+    payload: {
+      feedback_type: 'correct' | 'partially_correct' | 'irrelevant' | 'missing_expected_result' | 'wrong_result' | 'bad_highlight' | 'low_quality_answer' | 'hallucinated_or_unsupported' | 'other';
+      target_kind: 'answer' | 'result';
+      target_result_id?: string;
+      search_log_id?: string;
+      query_id?: string;
+      query_text?: string;
+      rating_value?: -1 | 0 | 1;
+      reason_code?: 'result_unrelated' | 'expected_note_missing' | 'highlight_wrong' | 'wrong_source_used' | 'answer_unsupported' | 'similarity_misleading' | 'result_outdated' | 'duplicate_result' | 'other';
+      comment?: string;
+      result_ids?: string[];
+      result_snapshot?: Array<Record<string, any>>;
+      answer_snapshot?: Record<string, any>;
+      retrieval_diagnostics?: Record<string, any>;
+      metadata?: Record<string, any>;
+    }
+  ): Promise<{
+    feedback_id: string;
+    answer_id: string;
+    feedback_type: string;
+    target_kind: 'answer' | 'result';
+    target_result_id?: string;
+    reason_code?: string;
+    comment?: string;
+    updated_existing: boolean;
+    feedback_status: string;
+    search_log_id?: string;
+    context_key: string;
+    scope_key: string;
+    chunks_updated: Array<{ chunk_id: string; document_id: string; old_weight: number; new_weight: number; accuracy: number; positive_count: number; negative_count: number; total_uses: number }>;
+    confidence_change: number;
+  }> {
     return this.request(`/answers/${answerId}/feedback`, {
       method: 'POST',
-      body: JSON.stringify({ answer_id: answerId, status, comment }),
+      body: JSON.stringify({ answer_id: answerId, ...payload }),
     });
+  }
+
+  async getCurrentAnswerFeedback(
+    answerId: string,
+    params?: {
+      search_log_id?: string;
+      query_id?: string;
+      target_kind?: 'answer' | 'result';
+      target_result_id?: string;
+    }
+  ): Promise<{
+    exists: boolean;
+    feedback_id?: string;
+    feedback_type?: string;
+    target_kind?: 'answer' | 'result';
+    target_result_id?: string;
+    reason_code?: string;
+    comment?: string;
+    rating_value?: number;
+    search_log_id?: string;
+    context_key?: string;
+    scope_key?: string;
+  }> {
+    const queryParams = new URLSearchParams();
+    if (params?.search_log_id) queryParams.append('search_log_id', params.search_log_id);
+    if (params?.query_id) queryParams.append('query_id', params.query_id);
+    if (params?.target_kind) queryParams.append('target_kind', params.target_kind);
+    if (params?.target_result_id) queryParams.append('target_result_id', params.target_result_id);
+    const suffix = queryParams.toString();
+    return this.request(`/answers/${answerId}/feedback${suffix ? `?${suffix}` : ''}`);
+  }
+
+  async listCurrentAnswerFeedback(
+    answerId: string,
+    params?: {
+      search_log_id?: string;
+      query_id?: string;
+    }
+  ): Promise<Array<{
+    feedback_id: string;
+    feedback_type: string;
+    target_kind: 'answer' | 'result';
+    target_result_id?: string;
+    reason_code?: string;
+    comment?: string;
+    rating_value?: number;
+    search_log_id?: string;
+    context_key: string;
+    scope_key: string;
+  }>> {
+    const queryParams = new URLSearchParams();
+    if (params?.search_log_id) queryParams.append('search_log_id', params.search_log_id);
+    if (params?.query_id) queryParams.append('query_id', params.query_id);
+    const suffix = queryParams.toString();
+    return this.request(`/answers/${answerId}/feedback-list${suffix ? `?${suffix}` : ''}`);
   }
 
   async getChunkCredibilityScores(workspaceId: string, limit: number = 50): Promise<Array<{
@@ -1828,4 +2160,3 @@ export const api = new ApiClient();
 export function useApi() {
   return api;
 }
-

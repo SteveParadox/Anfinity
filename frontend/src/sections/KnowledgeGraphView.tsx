@@ -6,7 +6,6 @@ import { select } from 'd3-selection';
 import { zoom as createZoom, zoomIdentity, type ZoomBehavior, type ZoomTransform } from 'd3-zoom';
 
 import type { KnowledgeGraph, KnowledgeGraphCluster, KnowledgeGraphEdge, KnowledgeGraphFilters, KnowledgeGraphNode, Note } from '@/types';
-import { generateKnowledgeGraph } from '@/lib/mockData';
 import { api } from '@/lib/api';
 import { transformNoteFromAPI } from '@/lib/transformers';
 import { AuthContext } from '@/contexts/AuthContext';
@@ -17,16 +16,30 @@ interface RenderNode extends KnowledgeGraphNode { index?: number; x: number; y: 
 interface RenderEdge extends Omit<KnowledgeGraphEdge, 'source' | 'target'> { source: string | RenderNode; target: string | RenderNode; idealDistance: number; pairIndex: number; pairCount: number; }
 interface NodeRelationship { edge: KnowledgeGraphEdge; node: KnowledgeGraphNode; direction: 'incoming' | 'outgoing'; }
 
-const TT = { inkBlack: '#0A0A0A', inkDeep: '#111111', inkRaised: '#1A1A1A', inkBorder: '#252525', inkMid: '#3A3A3A', inkMuted: '#5A5A5A', inkSubtle: '#888888', snow: '#F5F5F5', yolk: '#F5E642', error: '#FF4545', fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif", fontMono: "'IBM Plex Mono', monospace" };
-const EMPTY_GRAPH: KnowledgeGraph = { nodes: [], edges: [], clusters: [], stats: { total_nodes: 0, total_edges: 0, total_clusters: 0, node_types: {}, edge_types: {} } };
+const TT = { inkBlack: 'var(--theme-canvas)', inkDeep: 'var(--theme-panel)', inkRaised: 'var(--theme-panel-raised)', inkBorder: 'var(--theme-border)', inkMid: 'var(--theme-border-strong)', inkMuted: 'var(--theme-text-muted)', inkSubtle: 'var(--theme-text-subtle)', snow: 'var(--theme-text)', yolk: 'var(--theme-accent)', error: 'var(--theme-error)', fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif", fontMono: "'IBM Plex Mono', monospace" };
+const EMPTY_GRAPH: KnowledgeGraph = {
+  nodes: [],
+  edges: [],
+  clusters: [],
+  stats: {
+    total_nodes: 0,
+    total_edges: 0,
+    total_clusters: 0,
+    node_types: {},
+    edge_types: {},
+    limited: false,
+    node_limit: 500,
+    edge_limit: 1500,
+  },
+};
 const EMPTY_NOTES: Note[] = [];
-const NODE_COLORS: Record<KnowledgeGraphNode['type'] | 'default', string> = { workspace: '#60A5FA', note: '#9CA3AF', entity: '#F5E642', tag: '#FB923C', default: '#5A5A5A' };
-const EDGE_COLORS: Record<KnowledgeGraphEdge['type'], string> = { workspace_contains_note: '#60A5FA', note_mentions_entity: '#F5E642', note_has_tag: '#FB923C', note_links_note: '#9CA3AF', note_related_note: '#F472B6', entity_co_occurs_with_entity: '#34D399', tag_co_occurs_with_tag: '#F97316' };
-const EDGE_DISTANCES: Record<KnowledgeGraphEdge['type'], number> = { workspace_contains_note: 180, note_mentions_entity: 120, note_has_tag: 105, note_links_note: 160, note_related_note: 200, entity_co_occurs_with_entity: 135, tag_co_occurs_with_tag: 125 };
-const LABEL_ZOOM_THRESHOLD: Record<KnowledgeGraphNode['type'], number> = { workspace: 0.8, note: 1.45, entity: 1.05, tag: 0.95 };
-const BASE_CLUSTER_POSITIONS: Record<KnowledgeGraphNode['type'], { x: number; y: number }> = { workspace: { x: 0.5, y: 0.18 }, note: { x: 0.28, y: 0.62 }, entity: { x: 0.72, y: 0.34 }, tag: { x: 0.72, y: 0.72 } };
-const NODE_TYPE_LABELS: Record<KnowledgeGraphNode['type'], string> = { workspace: 'Workspace', note: 'Notes', entity: 'Entities', tag: 'Tags' };
-const EDGE_TYPE_LABELS: Record<KnowledgeGraphEdge['type'], string> = { workspace_contains_note: 'Workspace -> Note', note_mentions_entity: 'Mentions Entity', note_has_tag: 'Has Tag', note_links_note: 'Explicit Links', note_related_note: 'Suggested Links', entity_co_occurs_with_entity: 'Entity Co-occurrence', tag_co_occurs_with_tag: 'Tag Co-occurrence' };
+const NODE_COLORS: Record<KnowledgeGraphNode['type'] | 'default', string> = { workspace: '#60A5FA', note: '#9CA3AF', document: '#A78BFA', entity: '#F5E642', tag: '#FB923C', default: '#5A5A5A' };
+const EDGE_COLORS: Record<KnowledgeGraphEdge['type'], string> = { workspace_contains_note: '#60A5FA', workspace_contains_document: '#A78BFA', note_mentions_entity: '#F5E642', note_has_tag: '#FB923C', note_links_note: '#9CA3AF', note_related_note: '#F472B6', document_mentions_entity: '#FACC15', document_has_tag: '#FB923C', entity_co_occurs_with_entity: '#34D399', tag_co_occurs_with_tag: '#F97316' };
+const EDGE_DISTANCES: Record<KnowledgeGraphEdge['type'], number> = { workspace_contains_note: 180, workspace_contains_document: 190, note_mentions_entity: 120, note_has_tag: 105, note_links_note: 160, note_related_note: 200, document_mentions_entity: 130, document_has_tag: 115, entity_co_occurs_with_entity: 135, tag_co_occurs_with_tag: 125 };
+const LABEL_ZOOM_THRESHOLD: Record<KnowledgeGraphNode['type'], number> = { workspace: 0.8, note: 1.45, document: 1.25, entity: 1.05, tag: 0.95 };
+const BASE_CLUSTER_POSITIONS: Record<KnowledgeGraphNode['type'], { x: number; y: number }> = { workspace: { x: 0.5, y: 0.18 }, note: { x: 0.25, y: 0.62 }, document: { x: 0.47, y: 0.78 }, entity: { x: 0.72, y: 0.34 }, tag: { x: 0.72, y: 0.72 } };
+const NODE_TYPE_LABELS: Record<KnowledgeGraphNode['type'], string> = { workspace: 'Workspace', note: 'Notes', document: 'Documents', entity: 'Entities', tag: 'Tags' };
+const EDGE_TYPE_LABELS: Record<KnowledgeGraphEdge['type'], string> = { workspace_contains_note: 'Workspace -> Note', workspace_contains_document: 'Workspace -> Document', note_mentions_entity: 'Note Mentions Entity', note_has_tag: 'Note Has Tag', note_links_note: 'Explicit Note Links', note_related_note: 'Suggested Note Links', document_mentions_entity: 'Document Mentions Entity', document_has_tag: 'Document Has Tag', entity_co_occurs_with_entity: 'Entity Co-occurrence', tag_co_occurs_with_tag: 'Tag Co-occurrence' };
 const ZOOM_PRESETS = { macro: 0.65, meso: 1.15, micro: 1.95 } as const;
 type ZoomMode = keyof typeof ZOOM_PRESETS;
 
@@ -41,9 +54,9 @@ function getNodeClusterKey(node: KnowledgeGraphNode): string { return typeof nod
 function getNodeNoteIds(node: KnowledgeGraphNode): string[] { return Array.isArray(node.metadata?.note_ids) ? node.metadata.note_ids.filter((noteId): noteId is string => typeof noteId === 'string') : []; }
 function getNodeColor(node: KnowledgeGraphNode): string { const displayColor = typeof node.metadata?.display_color === 'string' ? node.metadata.display_color : null; return displayColor || NODE_COLORS[node.type] || NODE_COLORS.default; }
 function getNodeRadius(node: KnowledgeGraphNode): number { return Math.max(10, Math.min(26, 9 + node.value * 2.2)); }
-function getNodeDescription(node: KnowledgeGraphNode): string { switch (node.type) { case 'workspace': return 'Workspace anchor for the graph cluster.'; case 'note': return `Note node${node.metadata?.note_type ? ` (${node.metadata.note_type})` : ''} grounded in your knowledge base.`; case 'entity': return 'Extracted entity grouped by the notes that mention it.'; case 'tag': return 'Tag node synced from note tags and inline hashtags.'; default: return 'Knowledge graph node.'; } }
+function getNodeDescription(node: KnowledgeGraphNode): string { switch (node.type) { case 'workspace': return 'Workspace anchor for the graph cluster.'; case 'note': return `Note node${node.metadata?.note_type ? ` (${node.metadata.note_type})` : ''} grounded in your knowledge base.`; case 'document': return 'Uploaded or synced document node connected to extracted entities and tags.'; case 'entity': return 'Extracted entity grouped by the notes and documents that mention it.'; case 'tag': return 'Tag node synced from note tags, document metadata, and inline hashtags.'; default: return 'Knowledge graph node.'; } }
 function getNodeMetaTokens(node: KnowledgeGraphNode): string[] { const tags = Array.isArray(node.metadata?.tags) ? node.metadata.tags.filter((tag): tag is string => typeof tag === 'string') : []; return [node.label, ...tags, typeof node.metadata?.cluster_label === 'string' ? node.metadata.cluster_label : '', typeof node.metadata?.cluster_description === 'string' ? node.metadata.cluster_description : '', typeof node.metadata?.note_type === 'string' ? node.metadata.note_type : ''].filter(Boolean); }
-function getEdgeDescription(edgeType: KnowledgeGraphEdge['type']): string { switch (edgeType) { case 'workspace_contains_note': return 'This note belongs to the active workspace.'; case 'note_mentions_entity': return 'The note text mentions this entity.'; case 'note_has_tag': return 'The note is tagged with this keyword.'; case 'note_links_note': return 'These notes are explicitly linked.'; case 'note_related_note': return 'Similarity and graph signals suggest these notes belong together.'; case 'entity_co_occurs_with_entity': return 'These entities often appear in the same notes.'; case 'tag_co_occurs_with_tag': return 'These tags commonly appear together.'; default: return 'Graph relationship.'; } }
+function getEdgeDescription(edgeType: KnowledgeGraphEdge['type']): string { switch (edgeType) { case 'workspace_contains_note': return 'This note belongs to the active workspace.'; case 'workspace_contains_document': return 'This document belongs to the active workspace.'; case 'note_mentions_entity': return 'The note text mentions this entity.'; case 'note_has_tag': return 'The note is tagged with this keyword.'; case 'note_links_note': return 'These notes are explicitly linked.'; case 'note_related_note': return 'Similarity and graph signals suggest these notes belong together.'; case 'document_mentions_entity': return 'The document text mentions this entity.'; case 'document_has_tag': return 'The document carries this tag or source classification.'; case 'entity_co_occurs_with_entity': return 'These entities often appear in the same notes or documents.'; case 'tag_co_occurs_with_tag': return 'These tags commonly appear together.'; default: return 'Graph relationship.'; } }
 function canonicalPairKey(sourceId: string, targetId: string): string { return sourceId < targetId ? `${sourceId}::${targetId}` : `${targetId}::${sourceId}`; }
 function createClusterForce(clusterCenters: Record<string, { x: number; y: number }>, strength = 0.1) { let nodes: RenderNode[] = []; const centerKeys = Object.keys(clusterCenters); const fallbackTarget = clusterCenters[centerKeys[0] || 'default'] || { x: 0, y: 0 }; const force = (alpha: number) => { for (const node of nodes) { const target = clusterCenters[node.clusterKey] || clusterCenters[node.type] || fallbackTarget; const nodeStrength = strength * alpha * (node.type === 'workspace' ? 0.45 : 1); node.vx += (target.x - node.x) * nodeStrength; node.vy += (target.y - node.y) * nodeStrength; } }; force.initialize = (initialNodes: RenderNode[]) => { nodes = initialNodes; }; return force; }
 function getClusterColor(clusterKey: string, fallbackColor: string): string { let hash = 0; for (let index = 0; index < clusterKey.length; index += 1) hash = ((hash << 5) - hash) + clusterKey.charCodeAt(index); const hue = Math.abs(hash) % 360; return `hsl(${hue} 72% 58%)`; }
@@ -200,7 +213,7 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
   useEffect(() => {
     if (!workspaceId || !canViewGraph) {
       setGraphLoadError(null);
-      setRawGraphData(generateKnowledgeGraph(notes));
+      setRawGraphData(EMPTY_GRAPH);
       return undefined;
     }
 
@@ -235,8 +248,8 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
   useEffect(() => {
     if (workspaceId && canViewGraph) return;
     setGraphLoadError(null);
-    setRawGraphData(generateKnowledgeGraph(notes));
-  }, [canViewGraph, workspaceId, notes]);
+    setRawGraphData(EMPTY_GRAPH);
+  }, [canViewGraph, workspaceId]);
 
   useEffect(() => {
     resetKnowledgeGraphFilters();
@@ -522,7 +535,7 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
     { label: 'Nodes', value: filteredNodes.length },
     { label: 'Connections', value: filteredEdges.length },
     { label: 'Clusters', value: filteredClusters.length },
-    { label: 'Notes', value: filteredNodes.filter((node) => node.type === 'note').length },
+    { label: 'Content', value: filteredNodes.filter((node) => node.type === 'note' || node.type === 'document').length },
   ];
   const zoom = zoomTransform.k;
   const zoomMode: ZoomMode = zoom >= ZOOM_PRESETS.micro ? 'micro' : zoom >= ZOOM_PRESETS.meso ? 'meso' : 'macro';
@@ -532,12 +545,16 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
     () => hasActiveGraphFilters(filters, activeClusterKey, focusNodeId),
     [filters, activeClusterKey, focusNodeId]
   );
+  const graphLimitNotice = rawGraphData.stats.limited
+    ? `Showing the first ${rawGraphData.stats.node_limit || totalNodeCount} nodes and ${rawGraphData.stats.edge_limit || rawGraphData.edges.length} connections for browser performance. Narrow the filters to inspect a smaller neighborhood.`
+    : null;
   const emptyStateMessage = useMemo(() => {
+    if (!workspaceId) return 'Select a workspace to load its knowledge graph.';
     if (graphLoadError) return 'Knowledge graph data is unavailable right now.';
     if (totalNodeCount === 0) return 'No knowledge graph data exists for this workspace yet.';
     if (activeFiltersApplied) return 'No graph nodes match the current workspace and filters.';
     return 'No graph nodes are available to display right now.';
-  }, [graphLoadError, totalNodeCount, activeFiltersApplied]);
+  }, [activeFiltersApplied, graphLoadError, totalNodeCount, workspaceId]);
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -607,6 +624,7 @@ export function KnowledgeGraphView({ notes = EMPTY_NOTES }: KnowledgeGraphViewPr
       </div>
 
       {graphLoadError && <div style={{ marginBottom: 16, background: TT.inkDeep, border: '1px solid rgba(255,69,69,0.25)', borderLeft: `3px solid ${TT.error}`, borderRadius: 3, padding: '12px 16px', color: TT.snow, fontSize: 11, letterSpacing: '0.03em' }}>{graphLoadError}</div>}
+      {graphLimitNotice && <div style={{ marginBottom: 16, background: TT.inkDeep, border: '1px solid rgba(245,230,66,0.22)', borderLeft: `3px solid ${TT.yolk}`, borderRadius: 3, padding: '12px 16px', color: TT.inkMuted, fontSize: 11, letterSpacing: '0.03em' }}>{graphLimitNotice}</div>}
 
       <div style={{ display: 'grid', gridTemplateColumns: '2.1fr 1fr', gap: 12, marginBottom: 20 }}>
         <div style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: 16 }}>

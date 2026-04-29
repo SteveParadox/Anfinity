@@ -27,7 +27,9 @@ import {
 } from '@/components/ui/empty';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { AuthContext } from '@/contexts/AuthContext';
+import { useProductSettings } from '@/hooks/useProductSettings';
 import { api } from '@/lib/api';
+import { approvalPriorityOrDefault, buildDefaultApprovalDueDate } from '@/lib/productSettings';
 import type {
   ApprovalWorkflowItem,
   ApprovalWorkflowPriority,
@@ -98,11 +100,11 @@ function DashboardStat({
   accentClass: string;
 }) {
   return (
-    <Card className="border-zinc-800 bg-zinc-950">
+    <Card className="border-border bg-background">
       <CardContent className="flex items-center justify-between px-6 py-5">
         <div className="space-y-1">
-          <div className="text-2xl font-semibold text-zinc-50">{value}</div>
-          <div className="text-sm text-zinc-400">{label}</div>
+          <div className="text-2xl font-semibold text-foreground">{value}</div>
+          <div className="text-sm text-muted-foreground">{label}</div>
         </div>
         <div className={`rounded-lg border p-2 ${accentClass}`}>
           <Icon className="size-5" />
@@ -118,6 +120,11 @@ export function WorkflowsView() {
   const hasPermission = authContext?.hasPermission ?? (() => false);
   const canViewDashboard = Boolean(
     currentWorkspaceId && hasPermission(currentWorkspaceId, 'workflows', 'view'),
+  );
+  const { workspace: workspaceSettings } = useProductSettings(currentWorkspaceId, Boolean(currentWorkspaceId));
+  const approvalsEnabled = Boolean(workspaceSettings?.settings.approvals.enabled ?? true);
+  const defaultApprovalDueAt = buildDefaultApprovalDueDate(
+    workspaceSettings?.settings.approvals.default_due_days ?? 5,
   );
 
   const [selectedTab, setSelectedTab] = useState<TabValue>('submitted');
@@ -168,7 +175,7 @@ export function WorkflowsView() {
         label: 'Total Items',
         value: summary.total,
         icon: CircleDot,
-        accentClass: 'border-zinc-800 bg-zinc-900 text-zinc-200',
+        accentClass: 'border-border bg-muted text-foreground',
       },
       {
         label: 'Awaiting Review',
@@ -224,6 +231,10 @@ export function WorkflowsView() {
   );
 
   const handleApprove = async (item: ApprovalWorkflowItem) => {
+    if (!approvalsEnabled) {
+      setError('Approval workflows are disabled for this workspace.');
+      return;
+    }
     await runAction(item, () =>
       api.approveApprovalWorkflow(item.noteId, {
         currentStatus: item.approvalStatus,
@@ -232,6 +243,10 @@ export function WorkflowsView() {
   };
 
   const handleCancel = async (item: ApprovalWorkflowItem) => {
+    if (!approvalsEnabled) {
+      setError('Approval workflows are disabled for this workspace.');
+      return;
+    }
     await runAction(item, () =>
       api.cancelApprovalWorkflow(item.noteId, {
         currentStatus: item.approvalStatus,
@@ -240,6 +255,10 @@ export function WorkflowsView() {
   };
 
   const openDialog = (mode: DialogMode, item: ApprovalWorkflowItem) => {
+    if (!approvalsEnabled) {
+      setError('Approval workflows are disabled for this workspace.');
+      return;
+    }
     setDialogState({ mode, item });
   };
 
@@ -285,10 +304,10 @@ export function WorkflowsView() {
 
   if (!currentWorkspaceId) {
     return (
-      <div className="min-h-screen bg-zinc-950 p-8">
-        <Empty className="border-zinc-800 bg-zinc-950 text-zinc-50">
+      <div className="min-h-screen bg-background p-8">
+        <Empty className="border-border bg-background text-foreground">
           <EmptyHeader>
-            <EmptyMedia variant="icon" className="bg-zinc-900 text-zinc-200">
+            <EmptyMedia variant="icon" className="bg-muted text-foreground">
               <CircleDot />
             </EmptyMedia>
             <EmptyTitle>Select a workspace</EmptyTitle>
@@ -303,10 +322,10 @@ export function WorkflowsView() {
 
   if (!canViewDashboard) {
     return (
-      <div className="min-h-screen bg-zinc-950 p-8">
-        <Empty className="border-zinc-800 bg-zinc-950 text-zinc-50">
+      <div className="min-h-screen bg-background p-8">
+        <Empty className="border-border bg-background text-foreground">
           <EmptyHeader>
-            <EmptyMedia variant="icon" className="bg-zinc-900 text-zinc-200">
+            <EmptyMedia variant="icon" className="bg-muted text-foreground">
               <ShieldCheck />
             </EmptyMedia>
             <EmptyTitle>You do not have workflow access</EmptyTitle>
@@ -320,20 +339,20 @@ export function WorkflowsView() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 px-6 py-8 text-zinc-50 md:px-8">
+    <div className="min-h-screen bg-background px-6 py-8 text-foreground md:px-8">
       <div className="mx-auto flex max-w-7xl flex-col gap-6">
         <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div className="space-y-2">
-            <div className="text-xs uppercase tracking-[0.22em] text-zinc-400">Approval Workflows</div>
+            <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">Approval Workflows</div>
             <div className="flex items-center gap-3">
-              <h1 className="text-4xl font-semibold tracking-tight text-zinc-50">Reviews Dashboard</h1>
+              <h1 className="text-4xl font-semibold tracking-tight text-foreground">Reviews Dashboard</h1>
               {summary.overdue > 0 ? (
                 <div className="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-1 text-xs font-medium text-rose-300">
                   {summary.overdue} overdue
                 </div>
               ) : null}
             </div>
-            <p className="max-w-3xl text-sm text-zinc-400">
+            <p className="max-w-3xl text-sm text-muted-foreground">
               Track every workspace note through draft, submission, review, and final decision with strict server-side transition checks.
             </p>
           </div>
@@ -345,12 +364,20 @@ export function WorkflowsView() {
               void handleRefresh();
             }}
             disabled={loading}
-            className="border-zinc-800 bg-zinc-950 text-zinc-100 hover:bg-zinc-900"
+            className="border-border bg-background text-foreground hover:bg-muted"
           >
             {loading ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
             Refresh
           </Button>
         </div>
+
+        {!approvalsEnabled ? (
+          <Card className="border-amber-500/30 bg-amber-500/10 text-amber-100">
+            <CardContent className="px-6 py-4 text-sm">
+              Approval workflows are disabled in workspace settings. History remains visible here, but submission and review actions are paused.
+            </CardContent>
+          </Card>
+        ) : null}
 
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           {stats.map((stat) => (
@@ -358,18 +385,18 @@ export function WorkflowsView() {
           ))}
         </div>
 
-        <Card className="border-zinc-800 bg-zinc-950">
-          <CardHeader className="gap-4 border-b border-zinc-800 pb-4">
+        <Card className="border-border bg-background">
+          <CardHeader className="gap-4 border-b border-border pb-4">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div>
-                <CardTitle className="text-zinc-50">Review Queue</CardTitle>
-                <CardDescription className="text-zinc-400">
+                <CardTitle className="text-foreground">Review Queue</CardTitle>
+                <CardDescription className="text-muted-foreground">
                   Filter by workflow state, then review items inline without leaving the dashboard.
                 </CardDescription>
               </div>
 
               <Tabs value={selectedTab} onValueChange={(value) => setSelectedTab(value as TabValue)}>
-                <TabsList className="h-auto flex-wrap gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2">
+                <TabsList className="h-auto flex-wrap gap-2 rounded-xl border border-border bg-muted p-2">
                   {TAB_ORDER.map((tab) => {
                     const count = tab === 'all'
                       ? summary.total
@@ -397,16 +424,16 @@ export function WorkflowsView() {
             ) : null}
 
             {loading ? (
-              <div className="flex min-h-[240px] items-center justify-center rounded-lg border border-dashed border-zinc-800 bg-zinc-950">
-                <div className="flex items-center gap-3 text-sm text-zinc-400">
+              <div className="flex min-h-[240px] items-center justify-center rounded-lg border border-dashed border-border bg-background">
+                <div className="flex items-center gap-3 text-sm text-muted-foreground">
                   <Loader2 className="size-4 animate-spin" />
                   Loading approval items...
                 </div>
               </div>
             ) : items.length === 0 ? (
-              <Empty className="border-zinc-800 bg-zinc-950 text-zinc-50">
+              <Empty className="border-border bg-background text-foreground">
                 <EmptyHeader>
-                  <EmptyMedia variant="icon" className="bg-zinc-900 text-zinc-200">
+                  <EmptyMedia variant="icon" className="bg-muted text-foreground">
                     <Send />
                   </EmptyMedia>
                   <EmptyTitle>No {TAB_LABELS[selectedTab].toLowerCase()} items</EmptyTitle>
@@ -416,7 +443,7 @@ export function WorkflowsView() {
                       : 'There are no items in this workflow state right now.'}
                   </EmptyDescription>
                 </EmptyHeader>
-                <EmptyContent className="text-zinc-400">
+                <EmptyContent className="text-muted-foreground">
                   Use the draft tab to submit notes, or switch filters to inspect past decisions.
                 </EmptyContent>
               </Empty>
@@ -427,7 +454,7 @@ export function WorkflowsView() {
                   return (
                     <div
                       key={item.noteId}
-                      className="grid gap-4 rounded-xl border border-zinc-800 bg-zinc-950 p-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_auto]"
+                      className="grid gap-4 rounded-xl border border-border bg-background p-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)_auto]"
                     >
                       <div className="space-y-3">
                         <div className="flex flex-wrap items-center gap-2">
@@ -441,50 +468,50 @@ export function WorkflowsView() {
                         </div>
 
                         <div className="space-y-1">
-                          <div className="text-lg font-semibold text-zinc-50">{item.title}</div>
-                          <div className="text-sm text-zinc-400">
+                          <div className="text-lg font-semibold text-foreground">{item.title}</div>
+                          <div className="text-sm text-muted-foreground">
                             {item.summary?.trim() || 'No summary available yet.'}
                           </div>
                         </div>
 
-                        <div className="grid gap-2 text-sm text-zinc-400 sm:grid-cols-2">
+                        <div className="grid gap-2 text-sm text-muted-foreground sm:grid-cols-2">
                           <div>
-                            <span className="text-zinc-500">Author:</span>{' '}
+                            <span className="text-foreground0">Author:</span>{' '}
                             {item.author?.name || item.author?.email || item.authorUserId}
                           </div>
                           <div>
-                            <span className="text-zinc-500">Submitted:</span>{' '}
+                            <span className="text-foreground0">Submitted:</span>{' '}
                             {formatRelativeDate(item.approvalSubmittedAt)}
                           </div>
                           <div>
-                            <span className="text-zinc-500">Due:</span>{' '}
-                            <span className={item.isOverdue ? 'text-rose-300' : 'text-zinc-300'}>
+                            <span className="text-foreground0">Due:</span>{' '}
+                            <span className={item.isOverdue ? 'text-rose-300' : 'text-foreground'}>
                               {formatDueDate(item.approvalDueAt, item.isOverdue)}
                             </span>
                           </div>
                           <div>
-                            <span className="text-zinc-500">Last decision:</span>{' '}
+                            <span className="text-foreground0">Last decision:</span>{' '}
                             {item.approvalDecidedAt ? formatRelativeDate(item.approvalDecidedAt) : 'Pending'}
                           </div>
                         </div>
                       </div>
 
-                      <div className="grid gap-2 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 text-sm text-zinc-400">
+                      <div className="grid gap-2 rounded-lg border border-border bg-muted/40 p-3 text-sm text-muted-foreground">
                         <div>
-                          <div className="text-xs uppercase tracking-[0.14em] text-zinc-500">Submitted By</div>
-                          <div className="mt-1 text-zinc-200">
+                          <div className="text-xs uppercase tracking-[0.14em] text-foreground0">Submitted By</div>
+                          <div className="mt-1 text-foreground">
                             {item.submittedBy?.name || item.submittedBy?.email || 'Not submitted'}
                           </div>
                         </div>
                         <div>
-                          <div className="text-xs uppercase tracking-[0.14em] text-zinc-500">Decided By</div>
-                          <div className="mt-1 text-zinc-200">
+                          <div className="text-xs uppercase tracking-[0.14em] text-foreground0">Decided By</div>
+                          <div className="mt-1 text-foreground">
                             {item.decidedBy?.name || item.decidedBy?.email || 'Awaiting review'}
                           </div>
                         </div>
                         <div>
-                          <div className="text-xs uppercase tracking-[0.14em] text-zinc-500">Due Date</div>
-                          <div className="mt-1 text-zinc-200">
+                          <div className="text-xs uppercase tracking-[0.14em] text-foreground0">Due Date</div>
+                          <div className="mt-1 text-foreground">
                             {item.approvalDueAt ? format(item.approvalDueAt, 'MMM d, yyyy') : 'Not set'}
                           </div>
                         </div>
@@ -495,7 +522,7 @@ export function WorkflowsView() {
                           <Button
                             type="button"
                             onClick={() => openDialog('submit', item)}
-                            disabled={isBusy}
+                            disabled={isBusy || !approvalsEnabled}
                             className="justify-start"
                           >
                             <Send className="size-4" />
@@ -507,7 +534,7 @@ export function WorkflowsView() {
                           <Button
                             type="button"
                             onClick={() => openDialog('resubmit', item)}
-                            disabled={isBusy}
+                            disabled={isBusy || !approvalsEnabled}
                             className="justify-start"
                           >
                             <RefreshCw className="size-4" />
@@ -521,7 +548,7 @@ export function WorkflowsView() {
                             onClick={() => {
                               void handleApprove(item);
                             }}
-                            disabled={isBusy}
+                            disabled={isBusy || !approvalsEnabled}
                             className="justify-start bg-emerald-600 text-white hover:bg-emerald-500"
                           >
                             {isBusy ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
@@ -534,7 +561,7 @@ export function WorkflowsView() {
                             type="button"
                             variant="outline"
                             onClick={() => openDialog('request_changes', item)}
-                            disabled={isBusy}
+                            disabled={isBusy || !approvalsEnabled}
                             className="justify-start border-orange-500/30 bg-orange-500/10 text-orange-200 hover:bg-orange-500/20"
                           >
                             <AlertTriangle className="size-4" />
@@ -547,7 +574,7 @@ export function WorkflowsView() {
                             type="button"
                             variant="outline"
                             onClick={() => openDialog('reject', item)}
-                            disabled={isBusy}
+                            disabled={isBusy || !approvalsEnabled}
                             className="justify-start border-rose-500/30 bg-rose-500/10 text-rose-200 hover:bg-rose-500/20"
                           >
                             <XCircle className="size-4" />
@@ -562,8 +589,8 @@ export function WorkflowsView() {
                             onClick={() => {
                               void handleCancel(item);
                             }}
-                            disabled={isBusy}
-                            className="justify-start text-zinc-300 hover:bg-zinc-900 hover:text-zinc-50"
+                            disabled={isBusy || !approvalsEnabled}
+                            className="justify-start text-foreground hover:bg-muted hover:text-foreground"
                           >
                             {isBusy ? <Loader2 className="size-4 animate-spin" /> : <XCircle className="size-4" />}
                             Cancel
@@ -571,7 +598,7 @@ export function WorkflowsView() {
                         ) : null}
 
                         {!Object.values(item.availableActions).some(Boolean) ? (
-                          <div className="rounded-lg border border-dashed border-zinc-800 px-3 py-4 text-sm text-zinc-500">
+                          <div className="rounded-lg border border-dashed border-border px-3 py-4 text-sm text-foreground0">
                             No actions available in the current state.
                           </div>
                         ) : null}
@@ -592,10 +619,11 @@ export function WorkflowsView() {
         }}
         mode={dialogState?.mode || 'submit'}
         isSubmitting={Boolean(dialogState && busyNoteId === dialogState.item.noteId)}
-        initialPriority={dialogState?.item.approvalPriority}
-        initialDueAt={dialogState?.item.approvalDueAt}
+        initialPriority={approvalPriorityOrDefault(dialogState?.item.approvalPriority, workspaceSettings?.settings)}
+        initialDueAt={dialogState?.item.approvalDueAt || defaultApprovalDueAt}
         onConfirm={handleDialogConfirm}
       />
     </div>
   );
 }
+

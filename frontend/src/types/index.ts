@@ -1,12 +1,65 @@
+export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
+export type WorkspacePermissionSection =
+  | 'workspace'
+  | 'settings'
+  | 'members'
+  | 'documents'
+  | 'notes'
+  | 'search'
+  | 'knowledge_graph'
+  | 'chat'
+  | 'workflows';
+export type WorkspacePermissionAction = 'view' | 'create' | 'update' | 'delete' | 'manage';
+
+export type PlanName = 'free' | 'pro' | 'team' | 'enterprise';
+export type ApprovalWorkflowStatus = 'draft' | 'submitted' | 'needs_changes' | 'approved' | 'rejected' | 'cancelled';
+export type ApprovalWorkflowPriority = 'low' | 'normal' | 'high' | 'critical';
+export type ThinkingSessionPhase = 'waiting' | 'gathering' | 'synthesizing' | 'refining' | 'completed';
+export type NoteType = 'note' | 'web-clip' | 'document' | 'voice' | 'ai-generated';
+
+export interface WorkspacePermissions {
+  workspaceId: string;
+  role: WorkspaceRole;
+  permissions: Record<WorkspacePermissionSection, Record<WorkspacePermissionAction, boolean>>;
+  [key: string]: any;
+}
+
 export interface User {
   id: string;
   email: string;
   name?: string;
   full_name?: string;
-  avatar?: string;
-  plan?: 'free' | 'pro' | 'team' | 'enterprise';
+  fullName?: string;
+  plan?: PlanName;
   is_active?: boolean;
   created_at?: string;
+  [key: string]: any;
+}
+
+export interface Workspace {
+  id: string;
+  name: string;
+  description?: string;
+  role?: WorkspaceRole;
+  member_count?: number;
+  memberCount?: number;
+  members?: User[];
+  created_at?: string;
+  updated_at?: string;
+  createdAt?: Date | string;
+  updatedAt?: Date | string;
+  [key: string]: any;
+}
+
+export interface NoteAccess {
+  noteId: string;
+  accessSource: string;
+  canView: boolean;
+  canUpdate: boolean;
+  canDelete: boolean;
+  canManage: boolean;
+  collaboratorRole?: 'viewer' | 'editor' | 'owner' | string;
+  [key: string]: any;
 }
 
 export interface Note {
@@ -17,14 +70,13 @@ export interface Note {
   tags: string[];
   connections: string[];
   userId: string;
-  workspaceId?: string;
+  workspaceId: string;
   createdAt: Date;
   updatedAt: Date;
   confidence?: number;
   source?: string;
-  type: 'note' | 'web-clip' | 'document' | 'voice' | 'ai-generated';
+  type: NoteType;
   word_count?: number;
-  embedding?: string;
   access?: NoteAccess;
   approvalStatus?: ApprovalWorkflowStatus;
   approvalPriority?: ApprovalWorkflowPriority;
@@ -33,40 +85,92 @@ export interface Note {
   approvalSubmittedByUserId?: string;
   approvalDecidedAt?: Date;
   approvalDecidedByUserId?: string;
+  [key: string]: any;
 }
 
-export interface NoteAccess {
-  noteId: string;
-  accessSource: string;
-  canView: boolean;
-  canUpdate: boolean;
-  canDelete: boolean;
-  canManage: boolean;
-  collaboratorRole?: 'viewer' | 'editor';
+export interface Document {
+  id: string;
+  title: string;
+  workspaceId?: string;
+  status: string;
+  sourceType?: string;
+  storageUrl?: string;
+  tokenCount?: number;
+  chunkCount?: number;
+  createdAt: Date | string | number;
+  updatedAt: Date | string | number;
+  [key: string]: any;
 }
 
-export interface NoteInvite {
+export interface AIInsight {
+  id: string;
+  type: 'connection' | 'trend' | 'suggestion' | 'summary';
+  title?: string;
+  description?: string;
+  content?: string;
+  sources: string[];
+  confidence: number;
+  relatedNotes?: string[];
+  createdAt: Date | string | number;
+  [key: string]: any;
+}
+
+export interface PricingPlan {
+  id: PlanName | string;
+  name: string;
+  price: number;
+  features: string[];
+  limits?: Record<string, number | null>;
+  [key: string]: any;
+}
+
+export interface SearchResult {
+  id: string;
+  title: string;
+  content?: string;
+  snippet?: string;
+  score?: number;
+  confidence?: number;
+  source?: string;
+  note?: Note;
+  [key: string]: any;
+}
+
+export interface NoteCommentUser {
+  id: string;
+  email?: string;
+  name?: string;
+  avatarUrl?: string;
+  [key: string]: any;
+}
+
+export interface NoteCommentMention {
+  userId?: string;
+  displayName?: string;
+  [key: string]: any;
+}
+
+export interface NoteCommentReactionSummary {
+  emoji: string;
+  count: number;
+  reactedByCurrentUser?: boolean;
+  [key: string]: any;
+}
+
+export interface NoteComment {
   id: string;
   noteId: string;
-  inviterUserId?: string;
-  inviteeEmail?: string;
-  inviteeUserId?: string;
-  role: 'viewer' | 'editor';
-  status: 'pending' | 'accepted' | 'revoked' | 'expired';
-  expiresAt: Date;
-  acceptedAt?: Date;
-  revokedAt?: Date;
-  message?: string;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-export interface NoteContributionBreakdown {
-  noteCreated: number;
-  noteUpdated: number;
-  noteRestored: number;
-  thinkingContributions: number;
-  votesCast: number;
+  body: string;
+  author?: NoteCommentUser | null;
+  authorUserId?: string;
+  parentCommentId?: string | null;
+  replies: NoteComment[];
+  mentions: NoteCommentMention[];
+  reactions: NoteCommentReactionSummary[];
+  createdAt?: Date;
+  updatedAt?: Date;
+  deletedAt?: Date | null;
+  [key: string]: any;
 }
 
 export interface NoteContribution {
@@ -76,87 +180,87 @@ export interface NoteContribution {
   contributorName?: string;
   contributorEmail?: string;
   contributionCount: number;
-  breakdown: NoteContributionBreakdown;
+  breakdown: Record<string, number>;
   firstContributionAt?: Date;
   lastContributionAt?: Date;
+  [key: string]: any;
 }
 
-export type NoteCommentReactionType =
-  | 'thumbs_up'
-  | 'heart'
-  | 'laugh'
-  | 'hooray'
-  | 'eyes'
-  | 'rocket';
-
-export interface NoteCommentUser {
-  id: string;
-  email: string;
-  name: string;
-}
-
-export interface NoteCommentMention {
-  id: string;
-  commentId: string;
-  mentionedUserId: string;
-  mentionToken: string;
-  startOffset: number;
-  endOffset: number;
-  user?: NoteCommentUser | null;
-}
-
-export interface NoteCommentReactionSummary {
-  emoji: NoteCommentReactionType;
-  emojiValue: string;
-  count: number;
-  reactedByCurrentUser: boolean;
-}
-
-export interface NoteComment {
+export interface NoteVersion {
   id: string;
   noteId: string;
-  authorUserId: string;
-  parentCommentId?: string;
-  depth: number;
-  body: string;
-  isResolved: boolean;
-  resolvedByUserId?: string;
-  resolvedAt?: Date;
-  createdAt?: Date;
-  updatedAt?: Date;
-  author?: NoteCommentUser | null;
-  resolvedBy?: NoteCommentUser | null;
-  mentions: NoteCommentMention[];
-  reactions: NoteCommentReactionSummary[];
-  replies: NoteComment[];
+  versionNumber: number;
+  title?: string;
+  content?: string;
+  tags: string[];
+  snapshot?: Record<string, any>;
+  changeType?: string;
+  changeReason: string;
+  metadata?: Record<string, any>;
+  diffSegments: Array<{ type: 'added' | 'deleted' | 'unchanged' | string; text?: string; wordCount: number }>;
+  wordCount?: number;
+  changedByUserId?: string;
+  changedBy?: NoteCommentUser;
+  createdAt: Date;
+  [key: string]: any;
 }
 
-export type ApprovalWorkflowStatus =
-  | 'draft'
-  | 'submitted'
-  | 'needs_changes'
-  | 'approved'
-  | 'rejected'
-  | 'cancelled';
+export interface NoteConnectionSuggestion {
+  id: string;
+  sourceNoteId?: string;
+  noteId?: string;
+  suggestedNoteId?: string;
+  suggestedNote: {
+    id?: string;
+    title?: string;
+    contentPreview?: string;
+    tags: string[];
+    [key: string]: any;
+  };
+  score?: number;
+  similarityScore: number;
+  reason?: string;
+  status?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+  [key: string]: any;
+}
 
-export type ApprovalWorkflowPriority = 'low' | 'normal' | 'high' | 'critical';
+export interface NoteInvite {
+  id: string;
+  noteId: string;
+  inviterUserId?: string;
+  inviteeEmail?: string;
+  inviteeUserId?: string;
+  role: 'viewer' | 'editor' | string;
+  status: 'pending' | 'accepted' | 'revoked' | 'expired' | string;
+  expiresAt: Date;
+  acceptedAt?: Date;
+  revokedAt?: Date;
+  message?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  [key: string]: any;
+}
 
-export interface ApprovalWorkflowAvailableActions {
-  submit: boolean;
-  resubmit: boolean;
-  cancel: boolean;
-  approve: boolean;
-  reject: boolean;
-  request_changes: boolean;
+export interface UserNotification {
+  id: string;
+  type?: string;
+  title?: string;
+  body?: string;
+  readAt?: Date | null;
+  createdAt?: Date;
+  [key: string]: any;
 }
 
 export interface ApprovalWorkflowItem {
+  id?: string;
   noteId: string;
   workspaceId?: string;
   title: string;
-  summary?: string;
-  noteType: string;
-  authorUserId: string;
+  noteTitle?: string;
+  status?: ApprovalWorkflowStatus;
+  priority?: ApprovalWorkflowPriority;
   approvalStatus: ApprovalWorkflowStatus;
   approvalPriority: ApprovalWorkflowPriority;
   approvalDueAt?: Date;
@@ -164,141 +268,100 @@ export interface ApprovalWorkflowItem {
   approvalSubmittedByUserId?: string;
   approvalDecidedAt?: Date;
   approvalDecidedByUserId?: string;
-  isOverdue: boolean;
-  availableActions: ApprovalWorkflowAvailableActions;
-  author?: NoteCommentUser | null;
+  dueAt?: Date | null;
+  submittedAt?: Date | null;
+  decidedAt?: Date | null;
   submittedBy?: NoteCommentUser | null;
   decidedBy?: NoteCommentUser | null;
+  isOverdue?: boolean;
+  latestTransition?: ApprovalWorkflowTransition | null;
+  [key: string]: any;
 }
 
 export interface ApprovalWorkflowSummary {
   countsByStatus: Record<ApprovalWorkflowStatus, number>;
   total: number;
   overdue: number;
+  [key: string]: any;
 }
 
 export interface ApprovalWorkflowTransition {
   id: string;
-  noteId: string;
-  workspaceId?: string;
-  actorUserId?: string;
-  fromStatus: ApprovalWorkflowStatus;
+  workflowItemId?: string;
+  fromStatus?: ApprovalWorkflowStatus | null;
   toStatus: ApprovalWorkflowStatus;
+  actor?: NoteCommentUser | null;
   comment?: string;
+  createdAt?: Date;
   dueAtSnapshot?: Date;
-  prioritySnapshot: ApprovalWorkflowPriority;
-  createdAt?: Date;
-  actor?: NoteCommentUser | null;
+  prioritySnapshot?: ApprovalWorkflowPriority;
+  [key: string]: any;
 }
 
-export type UserNotificationType =
-  | 'automation'
-  | 'note_comment'
-  | 'comment_mention'
-  | 'comment_reply'
-  | 'approval_submitted'
-  | 'approval_approved'
-  | 'approval_rejected'
-  | 'approval_needs_changes';
-
-export interface UserNotification {
-  id: string;
-  userId: string;
-  actorUserId?: string;
-  workspaceId?: string;
-  noteId?: string;
-  commentId?: string;
-  notificationType: UserNotificationType;
-  payload: Record<string, unknown>;
-  isRead: boolean;
-  readAt?: Date;
-  createdAt?: Date;
-  actor?: NoteCommentUser | null;
-}
-
-export type NoteConnectionSuggestionStatus = 'pending' | 'confirmed' | 'dismissed';
-
-export interface NoteConnectionSuggestion {
-  id: string;
-  workspaceId: string;
+export interface OnboardingReadingItem {
   noteId: string;
-  suggestedNote: {
-    id: string;
-    title: string;
-    contentPreview: string;
-    tags: string[];
-    createdAt: Date;
-  };
-  similarityScore: number;
-  reason: string;
-  status: NoteConnectionSuggestionStatus;
-  metadata: Record<string, unknown>;
-  respondedAt?: Date;
-  createdAt: Date;
-}
-
-export interface NoteVersionDiffSegment {
-  type: 'added' | 'deleted' | 'unchanged';
-  text: string;
-  wordCount: number;
-}
-
-export interface NoteVersion {
-  id: string;
-  noteId: string;
-  workspaceId?: string;
-  userId: string;
-  versionNumber: number;
-  changeReason: 'created' | 'updated' | 'restored' | string;
-  restoredFromVersionId?: string;
   title: string;
-  content: string;
-  summary?: string;
-  tags: string[];
-  connections: string[];
-  noteType: string;
-  sourceUrl?: string;
-  wordCount: number;
-  diffSegments: NoteVersionDiffSegment[];
-  metadata: Record<string, unknown>;
-  createdAt: Date;
+  reason: string;
+  [key: string]: any;
 }
 
-export type ThinkingSessionPhase =
-  | 'waiting'
-  | 'gathering'
-  | 'synthesizing'
-  | 'refining'
-  | 'completed';
+export interface OnboardingWeek {
+  weekNumber: number;
+  theme: string;
+  objectives: string[];
+  readingList: OnboardingReadingItem[];
+  conceptCheckpoints: string[];
+  supportNoteIds: string[];
+  [key: string]: any;
+}
 
-export type ThinkingSynthesisStatus =
-  | 'pending'
-  | 'streaming'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
+export interface OnboardingGlossaryEntry {
+  term: string;
+  definition: string;
+  supportNoteIds: string[];
+  [key: string]: any;
+}
+
+export interface OnboardingGroundingMetadata {
+  groundingConfidence: 'low' | 'medium' | 'high';
+  usedNoteIds: string[];
+  modelCandidateNoteCount: number;
+  roleQueries: string[];
+  warnings: string[];
+  [key: string]: any;
+}
+
+export interface OnboardingCandidateNote {
+  noteId: string;
+  title: string;
+  score?: number;
+  [key: string]: any;
+}
+
+export interface OnboardingCurriculum {
+  role: string;
+  summary: string;
+  weeks: OnboardingWeek[];
+  glossary: OnboardingGlossaryEntry[];
+  grounding: OnboardingGroundingMetadata;
+  candidateNotes: OnboardingCandidateNote[];
+  [key: string]: any;
+}
 
 export interface ThinkingParticipant {
   id: string;
   userId: string;
-  user?: {
-    id: string;
-    email: string;
-    name: string;
-  } | null;
+  user?: NoteCommentUser | null;
   joinedAt?: Date;
-  lastSeenAt?: Date;
+  lastSeenAt?: Date | null;
+  [key: string]: any;
 }
 
 export interface ThinkingContribution {
   id: string;
   sessionId: string;
   authorUserId: string;
-  author?: {
-    id: string;
-    email: string;
-    name: string;
-  } | null;
+  author?: NoteCommentUser | null;
   content: string;
   createdPhase: ThinkingSessionPhase;
   voteCount: number;
@@ -306,71 +369,18 @@ export interface ThinkingContribution {
   rank: number;
   createdAt?: Date;
   updatedAt?: Date;
+  [key: string]: any;
 }
 
 export interface ThinkingSynthesisRun {
   id: string;
   sessionId: string;
-  triggeredByUserId?: string;
-  triggeredBy?: {
-    id: string;
-    email: string;
-    name: string;
-  } | null;
-  status: ThinkingSynthesisStatus;
-  model: string;
-  contributionCount: number;
-  outputText: string;
-  errorMessage?: string | null;
-  startedAt?: Date;
-  completedAt?: Date;
-  failedAt?: Date;
+  status: 'pending' | 'streaming' | 'completed' | 'failed' | 'cancelled' | string;
+  output?: string;
+  error?: string;
   createdAt?: Date;
   updatedAt?: Date;
-}
-
-export interface ThinkingSession {
-  id: string;
-  workspaceId: string;
-  noteId?: string | null;
-  roomId: string;
-  title: string;
-  promptContext?: string | null;
-  createdByUserId: string;
-  hostUserId: string;
-  creator?: {
-    id: string;
-    email: string;
-    name: string;
-  } | null;
-  host?: {
-    id: string;
-    email: string;
-    name: string;
-  } | null;
-  phase: ThinkingSessionPhase;
-  phaseEnteredAt?: Date;
-  waitingStartedAt?: Date;
-  gatheringStartedAt?: Date;
-  synthesizingStartedAt?: Date;
-  refiningStartedAt?: Date;
-  completedAt?: Date;
-  activeSynthesisRunId?: string | null;
-  synthesisOutput: string;
-  refinedOutput: string;
-  finalOutput: string;
-  lastRefinedByUserId?: string | null;
-  lastRefinedBy?: {
-    id: string;
-    email: string;
-    name: string;
-  } | null;
-  createdAt?: Date;
-  updatedAt?: Date;
-  participants: ThinkingParticipant[];
-  contributions: ThinkingContribution[];
-  synthesisRuns: ThinkingSynthesisRun[];
-  activeSynthesisRun?: ThinkingSynthesisRun | null;
+  [key: string]: any;
 }
 
 export interface ThinkingSessionSummary {
@@ -380,10 +390,32 @@ export interface ThinkingSessionSummary {
   roomId: string;
   title: string;
   phase: ThinkingSessionPhase;
-  hostUserId: string;
+  hostUserId?: string;
   activeSynthesisRunId?: string | null;
   createdAt?: Date;
   updatedAt?: Date;
+  [key: string]: any;
+}
+
+export interface ThinkingSession extends ThinkingSessionSummary {
+  promptContext?: string | null;
+  createdByUserId?: string;
+  creator?: NoteCommentUser | null;
+  host?: NoteCommentUser | null;
+  phaseEnteredAt?: Date;
+  waitingStartedAt?: Date;
+  gatheringStartedAt?: Date;
+  synthesizingStartedAt?: Date;
+  refiningStartedAt?: Date;
+  completedAt?: Date;
+  synthesisOutput: string;
+  refinedOutput: string;
+  finalOutput: string;
+  participants: ThinkingParticipant[];
+  contributions: ThinkingContribution[];
+  synthesisRuns: ThinkingSynthesisRun[];
+  activeSynthesisRun?: ThinkingSynthesisRun | null;
+  [key: string]: any;
 }
 
 export interface ThinkingSessionAccess {
@@ -395,16 +427,58 @@ export interface ThinkingSessionAccess {
   canControl: boolean;
   isHost: boolean;
   phase: ThinkingSessionPhase;
+  [key: string]: any;
 }
 
-export type GraphNodeType = 'workspace' | 'note' | 'entity' | 'tag';
+export type WorkflowTriggerType =
+  | 'note_created'
+  | 'note_updated'
+  | 'note_deleted'
+  | 'approval_submitted'
+  | 'approval_approved'
+  | 'approval_rejected'
+  | 'document_processed'
+  | string;
 
+export interface WorkflowCondition {
+  field?: string;
+  operator?: string;
+  value?: any;
+  [key: string]: any;
+}
+
+export interface WorkflowAction {
+  id?: string;
+  type: string;
+  config?: Record<string, any>;
+  [key: string]: any;
+}
+
+export interface Workflow {
+  id: string;
+  workspaceId?: string;
+  name: string;
+  description?: string;
+  triggerType: WorkflowTriggerType;
+  conditions: WorkflowCondition[];
+  actions: WorkflowAction[];
+  enabled?: boolean;
+  isActive?: boolean;
+  createdAt?: Date;
+  updatedAt?: Date;
+  [key: string]: any;
+}
+
+export type GraphNodeType = 'workspace' | 'note' | 'document' | 'entity' | 'tag';
 export type GraphEdgeType =
   | 'workspace_contains_note'
+  | 'workspace_contains_document'
   | 'note_mentions_entity'
   | 'note_has_tag'
   | 'note_links_note'
   | 'note_related_note'
+  | 'document_mentions_entity'
+  | 'document_has_tag'
   | 'entity_co_occurs_with_entity'
   | 'tag_co_occurs_with_tag';
 
@@ -412,9 +486,12 @@ export interface KnowledgeGraphNodeMetadata {
   workspace_id?: string;
   note_id?: string;
   note_ids: string[];
+  document_id?: string;
+  document_ids?: string[];
   note_type?: string;
   tags?: string[];
   updated_at?: string | null;
+  created_at?: string | null;
   entity_type?: string;
   tag_source?: string;
   cluster_id?: string;
@@ -423,12 +500,13 @@ export interface KnowledgeGraphNodeMetadata {
   cluster_description?: string;
   cluster_score?: number;
   cluster_rank?: number;
-  [key: string]: unknown;
+  [key: string]: any;
 }
 
 export interface KnowledgeGraphEdgeMetadata {
   shared_signals?: number;
-  [key: string]: unknown;
+  confidence?: number;
+  [key: string]: any;
 }
 
 export interface KnowledgeGraphNode {
@@ -454,6 +532,9 @@ export interface KnowledgeGraphStats {
   total_clusters: number;
   node_types: Partial<Record<GraphNodeType, number>>;
   edge_types: Partial<Record<GraphEdgeType, number>>;
+  limited?: boolean;
+  node_limit?: number;
+  edge_limit?: number;
 }
 
 export interface KnowledgeGraphFilters {
@@ -466,13 +547,8 @@ export interface KnowledgeGraphFilters {
   dateTo?: string;
   clusterIds: string[];
   confidenceThreshold: number;
-}
-
-export interface KnowledgeGraph {
-  nodes: KnowledgeGraphNode[];
-  edges: KnowledgeGraphEdge[];
-  clusters: KnowledgeGraphCluster[];
-  stats: KnowledgeGraphStats;
+  nodeLimit?: number;
+  edgeLimit?: number;
 }
 
 export interface KnowledgeGraphCluster {
@@ -483,7 +559,14 @@ export interface KnowledgeGraphCluster {
   importance: number;
   node_ids: string[];
   node_count: number;
-  metadata: Record<string, unknown>;
+  metadata: Record<string, any>;
+}
+
+export interface KnowledgeGraph {
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+  clusters: KnowledgeGraphCluster[];
+  stats: KnowledgeGraphStats;
 }
 
 export interface GraphClusterInputNode {
@@ -491,288 +574,12 @@ export interface GraphClusterInputNode {
   type: GraphNodeType;
   label: string;
   value: number;
-  metadata: Record<string, unknown>;
+  metadata: Record<string, any>;
   embedding: number[];
 }
 
 export interface GraphClusterInput {
   workspace_id: string;
   nodes: GraphClusterInputNode[];
-  stats: {
-    total_nodes: number;
-    embeddable_nodes: number;
-    embedding_dimension: number;
-    [key: string]: unknown;
-  };
-}
-
-export interface Workspace {
-  id: string;
-  name: string;
-  description?: string;
-  role?: 'owner' | 'admin' | 'member' | 'viewer';
-  owner_id?: string;
-  member_count?: number;
-  members: WorkspaceMember[];
-  createdAt: Date;
-  updatedAt: Date;
-  created_at?: string;
-  updated_at?: string;
-}
-
-export interface OnboardingCandidateNote {
-  noteId: string;
-  title: string;
-  excerpt: string;
-  summary?: string;
-  tags: string[];
-  noteType: string;
-  semanticScore: number;
-  popularityScore: number;
-  freshnessScore: number;
-  completenessScore: number;
-  rankingScore: number;
-  matchedQueries: string[];
-  queryHits: number;
-  popularityCount: number;
-  groundingSources: string[];
-}
-
-export interface OnboardingReadingItem {
-  noteId: string;
-  title: string;
-  reason: string;
-}
-
-export interface OnboardingWeek {
-  weekNumber: number;
-  theme: string;
-  objectives: string[];
-  readingList: OnboardingReadingItem[];
-  conceptCheckpoints: string[];
-  supportNoteIds: string[];
-}
-
-export interface OnboardingGlossaryEntry {
-  term: string;
-  definition: string;
-  supportNoteIds: string[];
-}
-
-export interface OnboardingGroundingMetadata {
-  candidateNoteCount: number;
-  modelCandidateNoteCount: number;
-  selectedNoteCount: number;
-  groundingConfidence: 'low' | 'medium' | 'high';
-  insufficientContent: boolean;
-  warnings: string[];
-  roleQueries: string[];
-  fallbackQueries: string[];
-  usedNoteIds: string[];
-}
-
-export interface OnboardingCurriculum {
-  roleInput: string;
-  role: string;
-  normalizedRole: string;
-  summary: string;
-  weeks: OnboardingWeek[];
-  glossary: OnboardingGlossaryEntry[];
-  grounding: OnboardingGroundingMetadata;
-  candidateNotes: OnboardingCandidateNote[];
-}
-
-export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
-export type WorkspacePermissionSection =
-  | 'workspace'
-  | 'settings'
-  | 'members'
-  | 'documents'
-  | 'notes'
-  | 'search'
-  | 'knowledge_graph'
-  | 'chat'
-  | 'workflows';
-export type WorkspacePermissionAction = 'view' | 'create' | 'update' | 'delete' | 'manage';
-
-export interface WorkspacePermissionState {
-  view: boolean;
-  create: boolean;
-  update: boolean;
-  delete: boolean;
-  manage: boolean;
-}
-
-export interface WorkspacePermissions {
-  workspace_id: string;
-  role: WorkspaceRole;
-  permissions: Record<WorkspacePermissionSection, WorkspacePermissionState>;
-}
-
-export interface WorkspaceMember {
-  userId: string;
-  role: WorkspaceRole;
-  joinedAt: Date;
-}
-
-export interface SearchResult {
-  chunk_id: string;
-  document_id: string;
-  document_title: string;
-  text: string;
-  similarity: number;
-}
-
-export interface SearchDisplayResult {
-  note: Note;
-  score: number;
-  highlights: string[];
-  matchedNodes?: string[];
-}
-
-export interface AIInsight {
-  id: string;
-  type: 'connection' | 'summary' | 'suggestion' | 'trend';
-  content: string;
-  sources: string[];
-  confidence: number;
-  createdAt: Date;
-}
-
-export interface Workflow {
-  id: string;
-  name: string;
-  workspaceId: string;
-  triggerType: WorkflowTriggerType;
-  conditions: WorkflowCondition[];
-  actions: WorkflowAction[];
-  isActive: boolean;
-  createdAt: Date;
-  updatedAt?: Date;
-}
-
-export type WorkflowTriggerType =
-  | 'note.created'
-  | 'note.updated'
-  | 'note.deleted'
-  | 'note.approval_submitted'
-  | 'note.approval_approved'
-  | 'note.approval_rejected'
-  | 'note.approval_needs_changes'
-  | 'document.completed'
-  | 'thinking_session.completed'
-  | 'webhook.received';
-
-export type WorkflowConditionOperator =
-  | 'equals'
-  | 'not_equals'
-  | 'contains'
-  | 'not_contains'
-  | 'matches_regex'
-  | 'greater_than'
-  | 'less_than'
-  | 'exists';
-
-export interface WorkflowCondition {
-  path?: string;
-  operator?: WorkflowConditionOperator;
-  value?: unknown;
-  all?: WorkflowCondition[];
-  any?: WorkflowCondition[];
-  not?: WorkflowCondition;
-}
-
-export interface WorkflowTrigger {
-  type: WorkflowTriggerType;
-  config: Record<string, any>;
-}
-
-export type WorkflowActionType =
-  | 'send_notification'
-  | 'create_note'
-  | 'update_note'
-  | 'append_note_content'
-  | 'add_note_tags'
-  | 'remove_note_tags'
-  | 'set_note_type'
-  | 'link_notes'
-  | 'submit_for_approval'
-  | 'approve_note'
-  | 'reject_note'
-  | 'request_approval_changes'
-  | 'call_webhook'
-  | 'send_email';
-
-export interface WorkflowAction {
-  id?: string;
-  type: WorkflowActionType;
-  config: Record<string, any>;
-}
-
-export interface PricingPlan {
-  id: string;
-  name: string;
-  description: string;
-  price: number;
-  priceUnit: string;
-  features: string[];
-  limitations: string[];
-  highlighted?: boolean;
-  cta: string;
-}
-
-export interface QueryRequest {
-  workspace_id: string;
-  query: string;
-  top_k?: number;
-  model?: string;
-}
-
-export interface QueryResponse {
-  query_id: string;
-  answer: string;
-  confidence: number;
-  confidence_factors?: {
-    similarity_avg?: number;
-    document_diversity?: number;
-    source_coverage?: number;
-  };
-  sources: SearchResult[];
-  model_used: string;
-  tokens_used: number;
-  response_time_ms: number;
-}
-
-export interface FeedbackRequest {
-  rating: number;
-  comment?: string;
-}
-
-export interface FeedbackResponse {
-  feedback_id: string;
-  message: string;
-}
-
-export interface Document {
-  id: string;
-  workspaceId: string;
-  title: string;
-  sourceType: 'upload' | 'slack' | 'notion' | 'google' | 'github' | 'web';
-  status: 'pending' | 'processing' | 'indexed' | 'failed';
-  tokenCount: number;
-  chunkCount: number;
-  storageUrl?: string;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-export interface Chunk {
-  id: string;
-  documentId: string;
-  chunkIndex: number;
-  text: string;
-  tokenCount: number;
-  contextBefore?: string;
-  contextAfter?: string;
-  metadata?: Record<string, any>;
+  stats?: Record<string, any>;
 }

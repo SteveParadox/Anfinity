@@ -47,10 +47,27 @@ const ACCEPTED_MIME_TYPES: Record<string, string> = {
   'application/pdf': 'PDF',
   'text/plain': 'TXT',
   'text/markdown': 'MD',
+  'text/x-markdown': 'MD',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'DOCX',
 };
 
-const ACCEPTED_EXTENSIONS = '.pdf,.txt,.md,.docx';
+const ACCEPTED_EXTENSION_LABELS: Record<string, string> = {
+  '.pdf': 'PDF',
+  '.txt': 'TXT',
+  '.md': 'MD',
+  '.markdown': 'MD',
+  '.docx': 'DOCX',
+};
+
+const ACCEPTED_EXTENSIONS = '.pdf,.txt,.md,.markdown,.docx';
+
+function getAcceptedFileLabel(file: File): string | undefined {
+  const mimeLabel = file.type ? ACCEPTED_MIME_TYPES[file.type] : undefined;
+  if (mimeLabel) return mimeLabel;
+  const dotIndex = file.name.lastIndexOf('.');
+  const extension = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : '';
+  return ACCEPTED_EXTENSION_LABELS[extension];
+}
 
 /** Maps ingestion status → rough progress percentage when the API has no `percentage`. */
 const STATUS_PROGRESS: Record<string, number> = {
@@ -69,18 +86,18 @@ const PROCESSING_STATUSES = new Set(['downloading', 'parsing', 'chunking', 'embe
 // ─── Design tokens ────────────────────────────────────────────────────────────
 
 const TT = {
-  inkBlack: '#0A0A0A',
-  inkDeep: '#111111',
-  inkRaised: '#1A1A1A',
-  inkBorder: '#252525',
-  inkMid: '#3A3A3A',
-  inkMuted: '#5A5A5A',
-  inkSubtle: '#888888',
-  snow: '#F5F5F5',
-  yolk: '#F5E642',
+  inkBlack: 'var(--theme-canvas)',
+  inkDeep: 'var(--theme-panel)',
+  inkRaised: 'var(--theme-panel-raised)',
+  inkBorder: 'var(--theme-border)',
+  inkMid: 'var(--theme-border-strong)',
+  inkMuted: 'var(--theme-text-muted)',
+  inkSubtle: 'var(--theme-text-subtle)',
+  snow: 'var(--theme-text)',
+  yolk: 'var(--theme-accent)',
   errorBg: 'rgba(255, 69, 69, 0.10)',
   errorBorder: 'rgba(255, 69, 69, 0.30)',
-  errorText: '#FF4545',
+  errorText: 'var(--theme-error)',
   successBg: 'rgba(76, 175, 80, 0.10)',
   successText: '#4CAF50',
   warnBg: 'rgba(245, 230, 66, 0.10)',
@@ -230,8 +247,8 @@ export function DocumentUploadView({
 
   // ── File validation ───────────────────────────────────────────────────────
   const validateFile = useCallback((file: File): string | null => {
-    if (!ACCEPTED_MIME_TYPES[file.type]) {
-      const supported = Object.values(ACCEPTED_MIME_TYPES).join(', ');
+    if (!getAcceptedFileLabel(file)) {
+      const supported = Array.from(new Set(Object.values(ACCEPTED_EXTENSION_LABELS))).join(', ');
       return `"${file.name}" is not a supported file type. Please upload ${supported}.`;
     }
     if (file.size > MAX_FILE_SIZE_BYTES) {
@@ -527,7 +544,7 @@ export function DocumentUploadView({
                     <p style={{ color: TT.inkSubtle, fontSize: '13px' }}>
                       {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
                       {' · '}
-                      {ACCEPTED_MIME_TYPES[selectedFile.type] ?? 'Unknown'}
+                      {getAcceptedFileLabel(selectedFile) ?? 'Unknown'}
                     </p>
                   </>
                 ) : (

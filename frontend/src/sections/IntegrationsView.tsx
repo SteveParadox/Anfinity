@@ -15,6 +15,8 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
+import { useProductSettings } from '@/hooks/useProductSettings';
+import { describeIntegrationSyncPolicy } from '@/lib/productSettings';
 
 type Provider = {
   provider: string;
@@ -49,17 +51,17 @@ type SyncItem = {
 type IntegrationFilter = 'all' | 'connected' | 'attention' | 'inactive';
 
 const TT = {
-  inkBlack: '#0A0A0A',
-  inkDeep: '#111111',
-  inkRaised: '#1A1A1A',
-  inkBorder: '#252525',
-  inkMid: '#3A3A3A',
-  inkMuted: '#5A5A5A',
-  inkSubtle: '#888888',
-  snow: '#F5F5F5',
-  yolk: '#F5E642',
+  inkBlack: 'var(--theme-canvas)',
+  inkDeep: 'var(--theme-panel)',
+  inkRaised: 'var(--theme-panel-raised)',
+  inkBorder: 'var(--theme-border)',
+  inkMid: 'var(--theme-border-strong)',
+  inkMuted: 'var(--theme-text-muted)',
+  inkSubtle: 'var(--theme-text-subtle)',
+  snow: 'var(--theme-text)',
+  yolk: 'var(--theme-accent)',
   green: '#44D17A',
-  red: '#FF4545',
+  red: 'var(--theme-error)',
   blue: '#7DD3FC',
   fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif",
   fontMono: "'IBM Plex Mono', monospace",
@@ -69,7 +71,7 @@ const TT = {
 function providerDescription(provider: Provider): string {
   const descriptions: Record<string, string> = {
     slack: 'Post rich Block Kit updates with action buttons into workspace channels.',
-    notion: 'Two-way note sync using CogniFlowID properties and Notion-safe content chunking.',
+    notion: 'Two-way note sync using AnfinityID properties and Notion-safe content chunking.',
     google: 'Capture filtered Gmail messages and sync Calendar events into meeting notes.',
   };
   return descriptions[provider.provider] || provider.capabilities.join(', ');
@@ -173,6 +175,7 @@ function FilterButton({
 
 export function IntegrationsView() {
   const { currentWorkspaceId } = useAuth();
+  const { workspace: workspaceSettings } = useProductSettings(currentWorkspaceId, Boolean(currentWorkspaceId));
   const [providers, setProviders] = useState<Provider[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [syncItems, setSyncItems] = useState<Record<string, SyncItem[]>>({});
@@ -187,6 +190,9 @@ export function IntegrationsView() {
   const [runningInlineSyncId, setRunningInlineSyncId] = useState<string | null>(null);
 
   const deferredQuery = useDeferredValue(searchQuery.trim().toLowerCase());
+  const autoSyncEnabled = Boolean(workspaceSettings?.settings.integrations.auto_sync_enabled ?? true);
+  const syncFrequency = workspaceSettings?.settings.integrations.sync_frequency ?? 'hourly';
+  const syncPolicySummary = describeIntegrationSyncPolicy(workspaceSettings?.settings);
 
   const refresh = async () => {
     if (!currentWorkspaceId) return;
@@ -419,6 +425,10 @@ export function IntegrationsView() {
 
       {error && <StatusBanner tone="error" message={error} />}
       {message && <StatusBanner tone="success" message={message} />}
+      <StatusBanner
+        tone={autoSyncEnabled ? 'success' : 'warning'}
+        message={`${syncPolicySummary} Current cadence: ${syncFrequency}.`}
+      />
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 12, marginBottom: 20 }}>
         {[
@@ -582,6 +592,7 @@ export function IntegrationsView() {
                   {selectedConnector.last_sync_at ? (
                     <p style={smallTextStyle}>Last sync: {new Date(selectedConnector.last_sync_at).toLocaleString()}</p>
                   ) : null}
+                  <p style={smallTextStyle}>Workspace policy: {autoSyncEnabled ? `${syncFrequency} automatic sync` : 'manual sync only'}</p>
                 </div>
                 <ConnectorStatePill connector={selectedConnector} />
               </div>
@@ -714,7 +725,7 @@ function ConnectorConfigForm({
         <Field label="Notion database ID">
           <input value={draft.database_id || ''} onChange={(event) => onChange('database_id', event.target.value)} style={inputStyle} />
         </Field>
-        <Field label="CogniFlow push tag">
+        <Field label="Anfinity push tag">
           <input value={draft.notion_push_tag || ''} onChange={(event) => onChange('notion_push_tag', event.target.value)} style={inputStyle} />
         </Field>
         <label style={checkboxLabelStyle}>
@@ -772,11 +783,23 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function StatusBanner({ tone, message }: { tone: 'success' | 'error'; message: string }) {
+function StatusBanner({ tone, message }: { tone: 'success' | 'warning' | 'error'; message: string }) {
   const Icon = tone === 'success' ? CheckCircle2 : AlertCircle;
-  const color = tone === 'success' ? TT.green : TT.red;
+  const color = tone === 'success' ? TT.green : tone === 'warning' ? TT.yolk : TT.red;
   return (
-    <div role="status" style={{ ...bannerStyle, color, borderColor: tone === 'success' ? 'rgba(68,209,122,0.35)' : 'rgba(255,69,69,0.35)' }}>
+    <div
+      role="status"
+      style={{
+        ...bannerStyle,
+        color,
+        borderColor:
+          tone === 'success'
+            ? 'rgba(68,209,122,0.35)'
+            : tone === 'warning'
+              ? 'rgba(245,230,66,0.35)'
+              : 'rgba(255,69,69,0.35)',
+      }}
+    >
       <Icon size={14} aria-hidden />
       {message}
     </div>

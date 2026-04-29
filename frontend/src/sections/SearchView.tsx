@@ -8,6 +8,18 @@ import type { Note } from '@/types';
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
+import { useProductSettings } from '@/hooks/useProductSettings';
+import { clampSearchTopK } from '@/lib/productSettings';
+import {
+  SEMANTIC_FEEDBACK_REASON_OPTIONS,
+  SEMANTIC_FEEDBACK_TYPE_LABELS,
+  ratingForSemanticFeedback,
+  requiresReasonForSemanticFeedback,
+  semanticFeedbackResultIds,
+  semanticFeedbackResultSnapshot,
+  type SemanticFeedbackReasonCode,
+  type SemanticFeedbackType,
+} from '@/lib/semanticFeedback';
 
 interface QueryResult {
   query_id: string;
@@ -110,18 +122,57 @@ interface SemanticSearchResponsePayload {
   search_log_id?: string | null;
 }
 
+type FeedbackType = SemanticFeedbackType;
+type FeedbackReasonCode = SemanticFeedbackReasonCode;
+
+interface SubmittedFeedbackState {
+  feedbackId: string;
+  feedbackType: FeedbackType;
+  reasonCode?: FeedbackReasonCode;
+  comment?: string;
+  updatedExisting: boolean;
+}
+
+interface FeedbackDraftState {
+  feedbackType: FeedbackType | null;
+  feedbackReason: FeedbackReasonCode | '';
+  feedbackComment: string;
+  showDetails: boolean;
+  submitting: boolean;
+  message: string | null;
+  error: string | null;
+  submitted: SubmittedFeedbackState | null;
+}
+
+type FeedbackDraftUpdater =
+  | Partial<FeedbackDraftState>
+  | ((current: FeedbackDraftState) => FeedbackDraftState);
+
+function createFeedbackDraftState(): FeedbackDraftState {
+  return {
+    feedbackType: null,
+    feedbackReason: '',
+    feedbackComment: '',
+    showDetails: false,
+    submitting: false,
+    message: null,
+    error: null,
+    submitted: null,
+  };
+}
+
 const TT = {
-  inkBlack:  '#0A0A0A',
-  inkDeep:   '#111111',
-  inkRaised: '#1A1A1A',
-  inkBorder: '#252525',
-  inkMid:    '#3A3A3A',
-  inkMuted:  '#5A5A5A',
-  inkSubtle: '#888888',
-  snow:      '#F5F5F5',
-  yolk:      '#F5E642',
+  inkBlack:  'var(--theme-canvas)',
+  inkDeep:   'var(--theme-panel)',
+  inkRaised: 'var(--theme-panel-raised)',
+  inkBorder: 'var(--theme-border)',
+  inkMid:    'var(--theme-border-strong)',
+  inkMuted:  'var(--theme-text-muted)',
+  inkSubtle: 'var(--theme-text-subtle)',
+  snow:      'var(--theme-text)',
+  yolk:      'var(--theme-accent)',
   yolkBright:'#FFF176',
-  error:     '#FF4545',
+  error:     'var(--theme-error)',
   fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif",
   fontMono:    "'IBM Plex Mono', monospace",
   fontBody:    "'IBM Plex Sans', sans-serif",
@@ -175,12 +226,9 @@ export function SearchView() {
   const [error, setError] = useState<string | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   
-  // STEP 8: Feedback state
-  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
-  const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
-  const [feedbackComment, setFeedbackComment] = useState('');
-  const [showFeedbackComment, setShowFeedbackComment] = useState(false);
-  const [answerFeedbackStatus, setAnswerFeedbackStatus] = useState<'verified' | 'rejected' | null>(null);
+  // Feedback state (separate per output)
+  const [answerFeedbackDraft, setAnswerFeedbackDraft] = useState<FeedbackDraftState>(() => createFeedbackDraftState());
+  const [resultFeedbackDrafts, setResultFeedbackDrafts] = useState<Record<string, FeedbackDraftState>>({});
   
   const [showStep7Format, setShowStep7Format] = useState(false);
   
@@ -209,6 +257,36 @@ export function SearchView() {
   const workspaceId = authContext?.currentWorkspaceId;
   const hasPermission = authContext?.hasPermission ?? (() => false);
   const canUseSearch = Boolean(workspaceId && hasPermission(workspaceId, 'search', 'view'));
+  const { user: productSettings } = useProductSettings(workspaceId, Boolean(workspaceId));
+  const smartHighlightsEnabled = productSettings?.settings.ai_search.smart_highlights ?? true;
+  const showSimilarityEvidence = productSettings?.settings.ai_search.show_similarity_scores ?? true;
+  const defaultSearchTopK = clampSearchTopK(productSettings?.settings.ai_search.default_top_k ?? 6);
+
+  const getResultFeedbackDraft = (resultId: string): FeedbackDraftState =>
+    resultFeedbackDrafts[resultId] ?? createFeedbackDraftState();
+
+  const patchAnswerFeedbackDraft = (updater: FeedbackDraftUpdater) => {
+    setAnswerFeedbackDraft((prev) => (typeof updater === 'function' ? updater(prev) : { ...prev, ...updater }));
+  };
+
+  const patchResultFeedbackDraft = (resultId: string, updater: FeedbackDraftUpdater) => {
+    setResultFeedbackDrafts((prev) => {
+      const current = prev[resultId] ?? createFeedbackDraftState();
+      const next = typeof updater === 'function' ? updater(current) : { ...current, ...updater };
+      return { ...prev, [resultId]: next };
+    });
+  };
+
+  const applyFeedbackTypeSelection = (patchDraft: (updater: FeedbackDraftUpdater) => void, nextType: FeedbackType) => {
+    patchDraft((current) => ({
+      ...current,
+      feedbackType: nextType,
+      feedbackReason: requiresReasonForSemanticFeedback(nextType) ? current.feedbackReason : '',
+      showDetails: current.showDetails || requiresReasonForSemanticFeedback(nextType),
+      error: null,
+      message: null,
+    }));
+  };
 
   // Load notes from workspace for generating suggestions
   useEffect(() => {
@@ -456,16 +534,14 @@ export function SearchView() {
     setSemanticResults([]);
     setSearchLogId(null);
     setQueryResults(null);
-    setAnswerFeedbackStatus(null);
-    setFeedbackMessage(null);
-    setFeedbackComment('');
-    setShowFeedbackComment(false);
+    setAnswerFeedbackDraft(createFeedbackDraftState());
+    setResultFeedbackDrafts({});
     setShowStep7Format(false);
 
     try {
       const [searchResult, answerResult] = await Promise.allSettled([
-        api.search(queryToUse, workspaceId, { limit: 10 }),
-        api.query(queryToUse, workspaceId, { limit: 5 }),
+        api.search(queryToUse, workspaceId, { limit: defaultSearchTopK }),
+        api.query(queryToUse, workspaceId, { limit: defaultSearchTopK }),
       ]);
 
       const partialErrors: string[] = [];
@@ -552,6 +628,75 @@ export function SearchView() {
 
   const suggested = generateSuggestions();
 
+  const feedbackResultIds = useMemo(() => semanticFeedbackResultIds(semanticResults), [semanticResults]);
+  const feedbackResultSnapshot = useMemo(() => semanticFeedbackResultSnapshot(semanticResults), [semanticResults]);
+
+  const toSubmittedFeedbackState = (item: {
+    feedback_id: string;
+    feedback_type: string;
+    reason_code?: string;
+    comment?: string;
+  }): SubmittedFeedbackState => ({
+    feedbackId: item.feedback_id,
+    feedbackType: item.feedback_type as FeedbackType,
+    reasonCode: (item.reason_code || undefined) as FeedbackReasonCode | undefined,
+    comment: item.comment,
+    updatedExisting: true,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadFeedbackForCurrentSearch = async () => {
+      if (!queryResults?.answer_id) {
+        setAnswerFeedbackDraft(createFeedbackDraftState());
+        setResultFeedbackDrafts({});
+        return;
+      }
+      try {
+        const items = await api.listCurrentAnswerFeedback(queryResults.answer_id, {
+          search_log_id: searchLogId || undefined,
+          query_id: queryResults.query_id,
+        });
+
+        if (cancelled) {
+          return;
+        }
+
+        const nextAnswerDraft = createFeedbackDraftState();
+        const nextResultDrafts: Record<string, FeedbackDraftState> = {};
+
+        for (const item of items) {
+          const submitted = toSubmittedFeedbackState(item);
+          const hydratedDraft: FeedbackDraftState = {
+            ...createFeedbackDraftState(),
+            feedbackType: submitted.feedbackType,
+            feedbackReason: (submitted.reasonCode || '') as FeedbackReasonCode | '',
+            feedbackComment: submitted.comment || '',
+            submitted,
+          };
+
+          if (item.target_kind === 'answer') {
+            nextAnswerDraft.feedbackType = hydratedDraft.feedbackType;
+            nextAnswerDraft.feedbackReason = hydratedDraft.feedbackReason;
+            nextAnswerDraft.feedbackComment = hydratedDraft.feedbackComment;
+            nextAnswerDraft.submitted = hydratedDraft.submitted;
+          } else if (item.target_kind === 'result' && item.target_result_id) {
+            nextResultDrafts[item.target_result_id] = hydratedDraft;
+          }
+        }
+
+        setAnswerFeedbackDraft(nextAnswerDraft);
+        setResultFeedbackDrafts(nextResultDrafts);
+      } catch (err) {
+        console.error('Failed to load scoped feedback for current search:', err);
+      }
+    };
+    loadFeedbackForCurrentSearch();
+    return () => {
+      cancelled = true;
+    };
+  }, [queryResults?.answer_id, queryResults?.query_id, searchLogId]);
+
   if (workspaceId && !canUseSearch) {
     return (
       <div style={{ padding: 32, background: TT.inkBlack, minHeight: '100vh', fontFamily: TT.fontMono }}>
@@ -562,46 +707,84 @@ export function SearchView() {
     );
   }
 
-  // STEP 8: Submit feedback on answer quality
-  const handleSubmitFeedback = async (status: 'verified' | 'rejected') => {
-    console.log('👍 [FEEDBACK START] Submitting feedback - Status: %s, Answer ID: %s', status, queryResults?.answer_id);
-    
-    if (!queryResults?.answer_id) {
-      console.warn('⚠️ [VALIDATION] No answer ID found');
+  const submitFeedback = async (targetKind: 'answer' | 'result', targetResultId?: string) => {
+    const scopedResultId = targetKind === 'result' ? targetResultId || '' : '';
+    const draft = targetKind === 'answer' ? answerFeedbackDraft : getResultFeedbackDraft(scopedResultId);
+    const patchDraft = (
+      updater: Partial<FeedbackDraftState> | ((current: FeedbackDraftState) => FeedbackDraftState),
+    ) => {
+      if (targetKind === 'answer') {
+        patchAnswerFeedbackDraft(updater);
+        return;
+      }
+      if (!scopedResultId) return;
+      patchResultFeedbackDraft(scopedResultId, updater);
+    };
+
+    if (!queryResults?.answer_id || !draft.feedbackType) {
+      patchDraft({ error: 'Select a feedback option before submitting.' });
       return;
     }
-    
-    setFeedbackSubmitting(true);
-    setFeedbackMessage(null);
-    
+    if (targetKind === 'result' && !targetResultId) {
+      patchDraft({ error: 'No search result selected for result-level feedback.' });
+      return;
+    }
+    if (requiresReasonForSemanticFeedback(draft.feedbackType) && !draft.feedbackReason) {
+      patchDraft({ error: 'Select a reason for partial/negative feedback.' });
+      return;
+    }
+
+    patchDraft({ submitting: true, message: null, error: null });
+
     try {
-      console.debug('📡 [API CALL] Calling api.submitAnswerFeedback()');
-      const result = await api.submitAnswerFeedback(
-        queryResults.answer_id,
-        status,
-        feedbackComment || undefined
-      );
-      console.log('✅ [FEEDBACK SUCCESS] Feedback submitted - Chunks updated: %d', result.chunks_updated.length);
-      
-      setAnswerFeedbackStatus(status);
-      const message = status === 'verified'
-        ? `✓ Answer marked as correct. ${result.chunks_updated.length} source chunk(s) credibility updated.`
-        : `✗ Answer marked as incorrect. ${result.chunks_updated.length} source chunk(s) credibility adjusted. Thank you for improving the model!`;
-      
-      setFeedbackMessage(message);
-      console.debug('📢 [MESSAGE] Feedback message set: %s', message);
-      
-      // Clear form after 2 seconds
-      setTimeout(() => {
-        console.debug('🧹 [CLEANUP] Clearing feedback form');
-        setFeedbackComment('');
-        setShowFeedbackComment(false);
-        setFeedbackMessage(null);
-      }, 2000);
-      
+      const result = await api.submitAnswerFeedback(queryResults.answer_id, {
+        feedback_type: draft.feedbackType,
+        target_kind: targetKind,
+        target_result_id: targetResultId,
+        search_log_id: searchLogId || undefined,
+        query_id: queryResults.query_id,
+        query_text: query,
+        rating_value: ratingForSemanticFeedback(draft.feedbackType),
+        reason_code: (draft.feedbackReason || undefined) as FeedbackReasonCode | undefined,
+        comment: draft.feedbackComment || undefined,
+        result_ids: feedbackResultIds,
+        result_snapshot: feedbackResultSnapshot,
+        answer_snapshot: {
+          answer_id: queryResults.answer_id,
+          confidence: queryResults.confidence,
+          sources: queryResults.sources,
+        },
+        retrieval_diagnostics: {
+          top_k: 10,
+          workspace_id: workspaceId,
+          source_count: semanticResults.length,
+        },
+      });
+
+      const submitted: SubmittedFeedbackState = {
+        feedbackId: result.feedback_id,
+        feedbackType: draft.feedbackType,
+        reasonCode: (draft.feedbackReason || undefined) as FeedbackReasonCode | undefined,
+        comment: draft.feedbackComment || undefined,
+        updatedExisting: result.updated_existing,
+      };
+
+      const messagePrefix = result.updated_existing ? 'Feedback updated.' : 'Feedback submitted.';
+      const weightMessage = targetKind === 'answer' && result.chunks_updated.length > 0
+        ? ` ${result.chunks_updated.length} source chunk(s) reweighted.`
+        : '';
+      if (result.search_log_id) {
+        setSearchLogId((current) => current || result.search_log_id || current);
+      }
+      patchDraft((current) => ({
+        ...current,
+        submitting: false,
+        error: null,
+        message: `${messagePrefix}${weightMessage}`,
+        submitted,
+      }));
     } catch (err) {
       let errorMsg = 'Failed to submit feedback. Please try again.';
-      
       if (err instanceof Error) {
         const msg = err.message.toLowerCase();
         if (msg.includes('timeout')) {
@@ -612,12 +795,164 @@ export function SearchView() {
           errorMsg = err.message;
         }
       }
-      
-      console.error('❌ [FEEDBACK FAILED] Feedback error:', errorMsg, err);
-      setFeedbackMessage(`Error: ${errorMsg}`);
+      patchDraft((current) => ({
+        ...current,
+        submitting: false,
+        error: errorMsg,
+        message: null,
+      }));
     } finally {
-      setFeedbackSubmitting(false);
+      patchDraft((current) => ({
+        ...current,
+        submitting: false,
+      }));
     }
+  };
+
+  const renderFeedbackPanel = ({
+    title,
+    subtitle,
+    draft,
+    patchDraft,
+    targetKind,
+    targetResultId,
+    compact = false,
+  }: {
+    title: string;
+    subtitle?: string;
+    draft: FeedbackDraftState;
+    patchDraft: (updater: FeedbackDraftUpdater) => void;
+    targetKind: 'answer' | 'result';
+    targetResultId?: string;
+    compact?: boolean;
+  }) => {
+    const needsReason = Boolean(draft.feedbackType && requiresReasonForSemanticFeedback(draft.feedbackType));
+    const savedFeedback = draft.submitted
+      ? `${SEMANTIC_FEEDBACK_TYPE_LABELS[draft.submitted.feedbackType]}${draft.submitted.reasonCode ? ` - ${draft.submitted.reasonCode}` : ''}`
+      : null;
+
+    return (
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          background: compact ? TT.inkRaised : 'rgba(245,230,66,0.04)',
+          border: `1px solid ${compact ? TT.inkBorder : 'rgba(245,230,66,0.15)'}`,
+          borderRadius: 3,
+          padding: compact ? '10px 12px' : '12px 14px',
+          marginTop: compact ? 10 : 0,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 8 }}>
+          <div>
+            <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: compact ? TT.inkMuted : TT.yolk, marginBottom: subtitle ? 4 : 0 }}>
+              {title}
+            </div>
+            {subtitle && (
+              <div style={{ fontFamily: TT.fontBody, fontSize: 11, lineHeight: 1.5, color: TT.inkMuted }}>
+                {subtitle}
+              </div>
+            )}
+          </div>
+          {savedFeedback && (
+            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, lineHeight: 1.4, color: TT.inkMid, textAlign: 'right', maxWidth: 180 }}>
+              Saved: {savedFeedback}
+            </span>
+          )}
+        </div>
+
+        {draft.message && (
+          <div style={{ background: 'rgba(76,175,80,0.1)', border: '1px solid rgba(76,175,80,0.3)', borderRadius: 3, padding: '8px 10px', marginBottom: 8, color: '#4CAF50', fontSize: 10, fontFamily: TT.fontMono }}>
+            {draft.message}
+          </div>
+        )}
+        {draft.error && (
+          <div style={{ background: 'rgba(255,69,69,0.1)', border: '1px solid rgba(255,69,69,0.3)', borderRadius: 3, padding: '8px 10px', marginBottom: 8, color: TT.error, fontSize: 10, fontFamily: TT.fontMono }}>
+            {draft.error}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              applyFeedbackTypeSelection(patchDraft, 'correct');
+            }}
+            style={{ flex: 1, minWidth: 110, height: 30, background: draft.feedbackType === 'correct' ? '#4CAF50' : TT.yolk, border: `1px solid ${draft.feedbackType === 'correct' ? '#4CAF50' : TT.yolk}`, borderRadius: 3, color: TT.inkBlack, fontFamily: TT.fontMono, fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: 'pointer' }}
+          >
+            Correct
+          </button>
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              applyFeedbackTypeSelection(patchDraft, 'partially_correct');
+            }}
+            style={{ flex: 1, minWidth: 110, height: 30, background: draft.feedbackType === 'partially_correct' ? TT.yolk : TT.inkRaised, border: `1px solid ${draft.feedbackType === 'partially_correct' ? TT.yolk : TT.inkBorder}`, borderRadius: 3, color: draft.feedbackType === 'partially_correct' ? TT.inkBlack : TT.inkMuted, fontFamily: TT.fontMono, fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: 'pointer' }}
+          >
+            Partial
+          </button>
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              applyFeedbackTypeSelection(patchDraft, 'wrong_result');
+            }}
+            style={{ flex: 1, minWidth: 110, height: 30, background: draft.feedbackType === 'wrong_result' ? TT.error : TT.inkRaised, border: `1px solid ${draft.feedbackType === 'wrong_result' ? TT.error : TT.inkBorder}`, borderRadius: 3, color: draft.feedbackType === 'wrong_result' ? TT.snow : TT.inkMuted, fontFamily: TT.fontMono, fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: 'pointer' }}
+          >
+            Wrong / Irrelevant
+          </button>
+        </div>
+
+        {(draft.showDetails || needsReason) && (
+          <div style={{ display: 'grid', gap: 8, marginBottom: 8 }}>
+            <select
+              value={draft.feedbackReason}
+              onChange={(event) => {
+                event.stopPropagation();
+                patchDraft({ feedbackReason: (event.target.value as FeedbackReasonCode) || '' });
+              }}
+              onClick={(event) => event.stopPropagation()}
+              style={{ height: 32, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, color: TT.snow, fontFamily: TT.fontMono, fontSize: 10, padding: '0 10px' }}
+            >
+              <option value="">Select reason</option>
+              {SEMANTIC_FEEDBACK_REASON_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <textarea
+              value={draft.feedbackComment}
+              onChange={(event) => {
+                event.stopPropagation();
+                patchDraft({ feedbackComment: event.target.value });
+              }}
+              onClick={(event) => event.stopPropagation()}
+              placeholder="Optional details to help improve retrieval and highlights"
+              style={{ width: '100%', minHeight: compact ? 56 : 64, padding: '8px 12px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, color: TT.snow, fontFamily: TT.fontMono, fontSize: 11, resize: 'vertical', boxSizing: 'border-box' }}
+            />
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              void submitFeedback(targetKind, targetResultId);
+            }}
+            disabled={draft.submitting || !draft.feedbackType}
+            style={{ flex: 1, height: 30, background: TT.yolk, border: `1px solid ${TT.yolk}`, borderRadius: 3, color: TT.inkBlack, fontFamily: TT.fontMono, fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: draft.submitting || !draft.feedbackType ? 'not-allowed' : 'pointer', opacity: draft.submitting || !draft.feedbackType ? 0.6 : 1 }}
+          >
+            {draft.submitting ? 'Saving...' : targetKind === 'answer' ? 'Save answer feedback' : 'Save result feedback'}
+          </button>
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              patchDraft((current) => ({ ...current, showDetails: !current.showDetails }));
+            }}
+            style={{ minWidth: 128, height: 30, background: 'transparent', border: `1px dashed ${TT.inkBorder}`, borderRadius: 3, color: TT.inkMuted, fontFamily: TT.fontMono, fontSize: 9, letterSpacing: '0.05em', textTransform: 'uppercase', cursor: 'pointer' }}
+          >
+            {draft.showDetails || needsReason ? 'Hide details' : 'Add details'}
+          </button>
+        </div>
+      </div>
+    );
   };
 
   // STEP 8: Load credibility analytics
@@ -904,13 +1239,13 @@ export function SearchView() {
             )}
             
             {/* Result count row */}
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-              <span style={{ fontSize: 10.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: TT.inkMuted }}>
-                <span style={{ color: TT.snow }}>{filteredResults.length}</span> results
-                {searchConfidence !== null && ` • Search confidence: ${searchConfidence}%`}
+             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+               <span style={{ fontSize: 10.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: TT.inkMuted }}>
+                 <span style={{ color: TT.snow }}>{filteredResults.length}</span> results
+                 {showSimilarityEvidence && searchConfidence !== null && ` • Search confidence: ${searchConfidence}%`}
               </span>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                {queryResults && (
+                {queryResults && showSimilarityEvidence && (
                   <span
                     style={{
                       fontSize: 9,
@@ -929,13 +1264,38 @@ export function SearchView() {
                   </span>
                 )}
                 <Brain size={11} color={TT.yolk} />
-                <span style={{ fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk }}>AI-Enhanced</span>
-              </div>
-            </div>
+                 <span style={{ fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk }}>AI-Enhanced</span>
+               </div>
+             </div>
 
-            {filteredResults.length === 0 && !error ? (
-              <div style={{ textAlign: 'center', padding: '60px 0' }}>
-                <Lightbulb size={36} color={TT.inkMid} style={{ margin: '0 auto 16px' }} />
+             {queryResults && hasGroundedAnswer && (
+               <div style={{ background: 'rgba(245,230,66,0.04)', border: `1px solid rgba(245,230,66,0.15)`, borderRadius: 3, padding: '14px 16px', marginBottom: 16 }}>
+                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 8 }}>
+                   <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk }}>
+                     Overall Search Answer
+                   </div>
+                   {showSimilarityEvidence ? (
+                     <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: queryResults.confidence > 0.8 ? '#4CAF50' : queryResults.confidence > 0.5 ? TT.yolk : TT.error }}>
+                       {Math.round(queryResults.confidence * 100)}% confidence
+                     </span>
+                   ) : null}
+                 </div>
+                 <p style={{ fontFamily: TT.fontBody, fontSize: 12, lineHeight: 1.6, color: TT.snow, margin: 0 }}>
+                   {queryResults.answer}
+                 </p>
+                 {renderFeedbackPanel({
+                   title: 'Feedback for the overall answer',
+                   subtitle: 'Use this only for the generated answer as a whole. Result cards below capture feedback for each individual search output.',
+                   draft: answerFeedbackDraft,
+                   patchDraft: patchAnswerFeedbackDraft,
+                   targetKind: 'answer',
+                 })}
+               </div>
+             )}
+
+             {filteredResults.length === 0 && !error ? (
+               <div style={{ textAlign: 'center', padding: '60px 0' }}>
+                 <Lightbulb size={36} color={TT.inkMid} style={{ margin: '0 auto 16px' }} />
                 <div style={{ fontFamily: TT.fontDisplay, fontSize: 24, letterSpacing: '0.06em', color: TT.snow, marginBottom: 8 }}>NO STRONG MATCHES</div>
                 <p style={{ fontSize: 10.5, letterSpacing: '0.04em', color: TT.inkMuted, textTransform: 'uppercase' }}>Try a more specific natural-language query or add notes with clearer source content</p>
               </div>
@@ -975,25 +1335,35 @@ export function SearchView() {
                             <span style={{ fontFamily: TT.fontMono, fontSize: 13, fontWeight: 500, color: TT.snow, letterSpacing: '0.02em' }}>
                               {result.note.title}
                             </span>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '1px 7px', background: 'rgba(245,230,66,0.07)', border: '1px solid rgba(245,230,66,0.15)', borderRadius: 2, flexShrink: 0 }}>
-                              <Brain size={9} color={TT.yolk} />
-                              <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.yolk }}>{Math.round(result.score * 100)}% match</span>
-                            </div>
-                            <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: result.confidence === 'low' ? TT.inkMuted : TT.snow }}>
-                              {confidenceLabel(result.confidence, result.confidenceScore)}
-                            </span>
+                            {showSimilarityEvidence ? (
+                              <>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '1px 7px', background: 'rgba(245,230,66,0.07)', border: '1px solid rgba(245,230,66,0.15)', borderRadius: 2, flexShrink: 0 }}>
+                                  <Brain size={9} color={TT.yolk} />
+                                  <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.yolk }}>{Math.round(result.score * 100)}% match</span>
+                                </div>
+                                <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', color: result.confidence === 'low' ? TT.inkMuted : TT.snow }}>
+                                  {confidenceLabel(result.confidence, result.confidenceScore)}
+                                </span>
+                              </>
+                            ) : null}
                           </div>
 
                           {/* Highlights */}
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 10 }}>
-                            {result.highlights.slice(0, 2).map((h, i) => (
-                              <div key={`${h.start_offset}-${i}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                                <Quote size={9} color={h.confidence === 'low' ? TT.inkMid : TT.yolk} style={{ marginTop: 3, flexShrink: 0 }} />
-                                <span style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.5, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                                  {renderHighlightedText(h.text, h.matched_terms)}
-                                </span>
-                              </div>
-                            ))}
+                            {smartHighlightsEnabled ? (
+                              result.highlights.slice(0, 2).map((h, i) => (
+                                <div key={`${h.start_offset}-${i}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                                  <Quote size={9} color={h.confidence === 'low' ? TT.inkMid : TT.yolk} style={{ marginTop: 3, flexShrink: 0 }} />
+                                  <span style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.5, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                                    {renderHighlightedText(h.text, h.matched_terms)}
+                                  </span>
+                                </div>
+                              ))
+                            ) : (
+                              <span style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.5, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                                {result.legacyHighlight || result.note.content.slice(0, 180)}
+                              </span>
+                            )}
                           </div>
 
                           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 10 }}>
@@ -1006,7 +1376,7 @@ export function SearchView() {
                             <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
                               Chunk {result.chunkIndex + 1}
                             </span>
-                            {result.highlights[0]?.heading && (
+                            {smartHighlightsEnabled && result.highlights[0]?.heading && (
                               <span style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
                                 {result.highlights[0].heading}
                               </span>
@@ -1019,23 +1389,33 @@ export function SearchView() {
                           </div>
 
                           {/* Tags + timestamp */}
-                          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 5 }}>
-                            {result.note.tags.slice(0, 4).map((tag) => (
-                              <span key={tag} style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
-                                {tag}
+                           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 5 }}>
+                             {result.note.tags.slice(0, 4).map((tag) => (
+                               <span key={tag} style={{ fontFamily: TT.fontMono, fontSize: 8.5, letterSpacing: '0.05em', textTransform: 'uppercase', padding: '1px 6px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 2, color: TT.inkMuted }}>
+                                 {tag}
                               </span>
                             ))}
                             <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMid }}>
                               <Clock size={9} />
                               {Number.isNaN(result.note.createdAt.getTime())
                                 ? 'Semantic match'
-                                : formatDistanceToNow(result.note.createdAt, { addSuffix: true })}
-                            </span>
-                          </div>
-                        </div>
+                               : formatDistanceToNow(result.note.createdAt, { addSuffix: true })}
+                             </span>
+                           </div>
 
-                        <ArrowRight size={14} color={TT.inkMid} style={{ flexShrink: 0, marginTop: 2 }} />
-                      </div>
+                           {renderFeedbackPanel({
+                             title: 'Feedback for this result',
+                             subtitle: 'Rate this specific search output separately from the overall answer.',
+                             draft: getResultFeedbackDraft(result.raw.chunk_id),
+                             patchDraft: (updater) => patchResultFeedbackDraft(result.raw.chunk_id, updater),
+                             targetKind: 'result',
+                             targetResultId: result.raw.chunk_id,
+                             compact: true,
+                           })}
+                         </div>
+
+                         <ArrowRight size={14} color={TT.inkMid} style={{ flexShrink: 0, marginTop: 2 }} />
+                       </div>
                     </div>
                   </motion.div>
                 ))}
@@ -1207,14 +1587,16 @@ export function SearchView() {
                   </span>
                 </div>
                 <p style={{ fontFamily: TT.fontBody, fontSize: 13, lineHeight: 1.7, color: TT.inkSubtle, whiteSpace: 'pre-wrap', margin: 0 }}>
-                  {renderHighlightedText(
-                    selectedResult.note.content,
-                    selectedResult.highlights.flatMap((highlight) => highlight.matched_terms || [])
-                  )}
+                  {smartHighlightsEnabled
+                    ? renderHighlightedText(
+                        selectedResult.note.content,
+                        selectedResult.highlights.flatMap((highlight) => highlight.matched_terms || [])
+                      )
+                    : selectedResult.note.content}
                 </p>
               </div>
 
-              {selectedResult.highlights.length > 0 && (
+              {smartHighlightsEnabled && selectedResult.highlights.length > 0 && (
                 <div style={{ background: 'rgba(245,230,66,0.04)', border: `1px solid rgba(245,230,66,0.15)`, borderRadius: 3, padding: '12px 14px', marginBottom: 12 }}>
                   <div style={{ fontSize: 8.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.yolk, marginBottom: 8 }}>
                     Smart Highlights
@@ -1268,167 +1650,29 @@ export function SearchView() {
                 <span style={{ fontSize: 9.5, color: TT.inkMid, letterSpacing: '0.04em' }}>
                   Semantic match grounded in matched source text
                 </span>
-                {queryResults?.confidence && hasGroundedAnswer && (
+                {queryResults?.confidence && hasGroundedAnswer && showSimilarityEvidence && (
                   <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 9.5, color: TT.yolk }}>
                     <Brain size={10} /> {Math.round(queryResults.confidence * 100)}% confidence
                   </span>
                 )}
               </div>
 
-              {/* STEP 8: Feedback Section */}
-              <div style={{ marginTop: 16, borderTop: `1px solid ${TT.inkBorder}`, paddingTop: 12 }}>
-                <div style={{ fontSize: 9.5, letterSpacing: '0.06em', textTransform: 'uppercase', color: TT.inkMuted, marginBottom: 10 }}>
-                  STEP 8: Is this answer correct?
-                </div>
-                
-                {/* Feedback message */}
-                {feedbackMessage && (
-                  <div style={{
-                    background: answerFeedbackStatus === 'verified' ? 'rgba(76,175,80,0.1)' : 'rgba(255,69,69,0.1)',
-                    border: `1px solid ${answerFeedbackStatus === 'verified' ? 'rgba(76,175,80,0.3)' : 'rgba(255,69,69,0.3)'}`,
-                    borderRadius: 3,
-                    padding: '8px 12px',
-                    marginBottom: 10,
-                    color: answerFeedbackStatus === 'verified' ? '#4CAF50' : TT.error,
-                    fontSize: 10,
-                    fontFamily: TT.fontMono
-                  }}>
-                    {feedbackMessage}
-                  </div>
-                )}
-                
-                {/* Feedback buttons */}
-                <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-                  <button
-                    onClick={() => handleSubmitFeedback('verified')}
-                    disabled={feedbackSubmitting || answerFeedbackStatus === 'verified'}
-                    style={{
-                      flex: 1,
-                      height: 32,
-                      background: answerFeedbackStatus === 'verified' ? '#4CAF50' : TT.yolk,
-                      border: `1px solid ${answerFeedbackStatus === 'verified' ? '#4CAF50' : TT.yolk}`,
-                      borderRadius: 3,
-                      color: TT.inkBlack,
-                      fontFamily: TT.fontMono,
-                      fontSize: 10,
-                      letterSpacing: '0.06em',
-                      textTransform: 'uppercase',
-                      cursor: feedbackSubmitting || answerFeedbackStatus === 'verified' ? 'not-allowed' : 'pointer',
-                      opacity: feedbackSubmitting || answerFeedbackStatus === 'verified' ? 0.7 : 1,
-                      transition: 'all 0.15s',
-                    }}
-                    onMouseEnter={(e) => {
-                      if (!feedbackSubmitting && answerFeedbackStatus !== 'verified') {
-                        (e.currentTarget as HTMLElement).style.background = TT.yolkBright;
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      if (answerFeedbackStatus !== 'verified') {
-                        (e.currentTarget as HTMLElement).style.background = TT.yolk;
-                      }
-                    }}
-                  >
-                    {feedbackSubmitting ? 'Saving...' : answerFeedbackStatus === 'verified' ? '✓ Verified' : 'Verify Correct'}
-                  </button>
-                  
-                  <button
-                    onClick={() => handleSubmitFeedback('rejected')}
-                    disabled={feedbackSubmitting || answerFeedbackStatus === 'rejected'}
-                    style={{
-                      flex: 1,
-                      height: 32,
-                      background: answerFeedbackStatus === 'rejected' ? TT.error : TT.inkRaised,
-                      border: `1px solid ${answerFeedbackStatus === 'rejected' ? TT.error : TT.inkBorder}`,
-                      borderRadius: 3,
-                      color: answerFeedbackStatus === 'rejected' ? TT.snow : TT.inkMuted,
-                      fontFamily: TT.fontMono,
-                      fontSize: 10,
-                      letterSpacing: '0.06em',
-                      textTransform: 'uppercase',
-                      cursor: feedbackSubmitting || answerFeedbackStatus === 'rejected' ? 'not-allowed' : 'pointer',
-                      opacity: feedbackSubmitting || answerFeedbackStatus === 'rejected' ? 0.7 : 1,
-                      transition: 'all 0.15s',
-                    }}
-                    onMouseEnter={(e) => {
-                      if (!feedbackSubmitting && answerFeedbackStatus !== 'rejected') {
-                        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(255,69,69,0.5)';
-                        (e.currentTarget as HTMLElement).style.background = 'rgba(255,69,69,0.08)';
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      if (answerFeedbackStatus !== 'rejected') {
-                        (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder;
-                        (e.currentTarget as HTMLElement).style.background = TT.inkRaised;
-                      }
-                    }}
-                  >
-                    {feedbackSubmitting ? 'Saving...' : answerFeedbackStatus === 'rejected' ? '✗ Rejected' : 'Reject Incorrect'}
-                  </button>
-                </div>
-                
-                {/* Optional comment field */}
-                {!answerFeedbackStatus && (
-                  <button
-                    onClick={() => setShowFeedbackComment(!showFeedbackComment)}
-                    style={{
-                      width: '100%',
-                      height: 28,
-                      background: 'transparent',
-                      border: `1px dashed ${TT.inkBorder}`,
-                      borderRadius: 3,
-                      color: TT.inkMuted,
-                      fontFamily: TT.fontMono,
-                      fontSize: 9,
-                      letterSpacing: '0.05em',
-                      textTransform: 'uppercase',
-                      cursor: 'pointer',
-                      transition: 'all 0.15s',
-                    }}
-                    onMouseEnter={(e) => {
-                      (e.currentTarget as HTMLElement).style.borderColor = 'rgba(245,230,66,0.3)';
-                      (e.currentTarget as HTMLElement).style.color = TT.yolk;
-                    }}
-                    onMouseLeave={(e) => {
-                      (e.currentTarget as HTMLElement).style.borderColor = TT.inkBorder;
-                      (e.currentTarget as HTMLElement).style.color = TT.inkMuted;
-                    }}
-                  >
-                    {showFeedbackComment ? '✕ Hide comment' : '+ Add optional comment'}
-                  </button>
-                )}
-                
-                {/* Comment textarea */}
-                {showFeedbackComment && !answerFeedbackStatus && (
-                  <textarea
-                    value={feedbackComment}
-                    onChange={(e) => setFeedbackComment(e.target.value)}
-                    placeholder="Why is this answer correct/incorrect? (optional)"
-                    style={{
-                      width: '100%',
-                      minHeight: 60,
-                      marginTop: 8,
-                      padding: '8px 12px',
-                      background: TT.inkRaised,
-                      border: `1px solid ${TT.inkBorder}`,
-                      borderRadius: 3,
-                      color: TT.snow,
-                      fontFamily: TT.fontMono,
-                      fontSize: 11,
-                      resize: 'none',
-                      outline: 'none',
-                      boxSizing: 'border-box',
-                      fontStyle: !feedbackComment ? 'italic' : 'normal',
-                    }}
-                    onFocus={(e) => {
-                      (e.currentTarget as HTMLTextAreaElement).style.borderColor = TT.yolk;
-                      (e.currentTarget as HTMLTextAreaElement).style.boxShadow = '0 0 0 3px rgba(245,230,66,0.1)';
-                    }}
-                    onBlur={(e) => {
-                      (e.currentTarget as HTMLTextAreaElement).style.borderColor = TT.inkBorder;
-                      (e.currentTarget as HTMLTextAreaElement).style.boxShadow = 'none';
-                    }}
-                  />
-                )}
+              <div style={{ marginTop: 16, borderTop: `1px solid ${TT.inkBorder}`, paddingTop: 12, display: 'grid', gap: 12 }}>
+                {queryResults && hasGroundedAnswer && renderFeedbackPanel({
+                  title: 'Overall answer feedback',
+                  subtitle: 'This is separate from result-specific feedback and applies only to the generated answer.',
+                  draft: answerFeedbackDraft,
+                  patchDraft: patchAnswerFeedbackDraft,
+                  targetKind: 'answer',
+                })}
+                {renderFeedbackPanel({
+                  title: 'Feedback for this result',
+                  subtitle: 'This saves against the exact note chunk and highlight you are viewing now.',
+                  draft: getResultFeedbackDraft(selectedResult.raw.chunk_id),
+                  patchDraft: (updater) => patchResultFeedbackDraft(selectedResult.raw.chunk_id, updater),
+                  targetKind: 'result',
+                  targetResultId: selectedResult.raw.chunk_id,
+                })}
               </div>
             </div>
           </motion.div>

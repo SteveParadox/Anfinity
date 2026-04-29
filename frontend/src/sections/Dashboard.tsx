@@ -18,9 +18,10 @@ import {
 } from 'lucide-react';
 import { format, formatDistanceToNow } from 'date-fns';
 import { startTransition, useContext, useDeferredValue, useEffect, useState } from 'react';
-import { api } from '@/lib/api';
+import { api, type WorkspaceStatsResponse } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { UsageDashboard } from '@/components/billing/UsageDashboard';
 import type { AIInsight, Note, User } from '@/types';
 
 interface DashboardProps {
@@ -84,8 +85,8 @@ function MonoChip({ children, yellow = false }: { children: React.ReactNode; yel
       className={cn(
         'inline-flex items-center px-2 py-0.5 text-[9.5px] font-medium tracking-[0.1em] uppercase border',
         yellow
-          ? 'bg-[rgba(245,230,66,0.1)] text-[#F5E642] border-[rgba(245,230,66,0.25)]'
-          : 'bg-[#1A1A1A] text-[#5A5A5A] border-[#252525]'
+          ? 'bg-[rgba(245,230,66,0.1)] text-[var(--theme-accent)] border-[rgba(245,230,66,0.25)]'
+          : 'bg-[var(--theme-panel-raised)] text-[var(--theme-text-muted)] border-[var(--theme-border)]'
       )}
       style={{ fontFamily: "'IBM Plex Mono', monospace" }}
     >
@@ -98,7 +99,7 @@ function YellowDot() {
   return (
     <span
       className="inline-block h-1 w-1 flex-shrink-0 rounded-full"
-      style={{ background: '#F5E642', boxShadow: '0 0 6px rgba(245,230,66,0.8)' }}
+      style={{ background: 'var(--theme-accent)', boxShadow: '0 0 6px rgba(245,230,66,0.8)' }}
     />
   );
 }
@@ -125,9 +126,9 @@ function PillButton({
         height: 30,
         padding: '0 10px',
         borderRadius: 3,
-        border: `1px solid ${active ? 'rgba(245,230,66,0.35)' : '#252525'}`,
-        background: active ? 'rgba(245,230,66,0.08)' : '#0A0A0A',
-        color: active ? '#F5E642' : '#5A5A5A',
+        border: `1px solid ${active ? 'rgba(245,230,66,0.35)' : 'var(--theme-border)'}`,
+        background: active ? 'rgba(245,230,66,0.08)' : 'var(--theme-canvas)',
+        color: active ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
         fontFamily: "'IBM Plex Mono', monospace",
         fontSize: 10,
         letterSpacing: '0.08em',
@@ -185,21 +186,21 @@ function EmptyPanel({
   return (
     <div
       style={{
-        border: '1px dashed #252525',
+        border: '1px dashed var(--theme-border)',
         borderRadius: 3,
         padding: '20px 18px',
-        background: '#0A0A0A',
+        background: 'var(--theme-canvas)',
       }}
     >
       <p
         className="text-[11px] uppercase tracking-[0.1em]"
-        style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Mono', monospace" }}
+        style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Mono', monospace" }}
       >
         {title}
       </p>
       <p
         className="mt-2 text-[12px] leading-[1.6]"
-        style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Sans', sans-serif" }}
+        style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Sans', sans-serif" }}
       >
         {description}
       </p>
@@ -208,7 +209,7 @@ function EmptyPanel({
         onClick={onAction}
         className="mt-4 inline-flex items-center gap-2 transition-colors duration-150 focus-visible:outline-none"
         style={{
-          color: '#F5E642',
+          color: 'var(--theme-accent)',
           background: 'transparent',
           border: 'none',
           padding: 0,
@@ -317,11 +318,15 @@ export function Dashboard({
   const authContext = useContext(AuthContext);
   const workspaceId = authContext?.currentWorkspaceId;
   const workspaces = authContext?.workspaces ?? [];
+  const hasPermission = authContext?.hasPermission ?? (() => false);
+  const canManageBilling = Boolean(workspaceId && hasPermission(workspaceId, 'settings', 'manage'));
 
   const [notes, setNotes] = useState<Note[]>([]);
   const [insights, setInsights] = useState<AIInsight[]>([]);
   const [workspaceStats, setWorkspaceStats] = useState<{
     documents: { total: number; indexed: number; processing: number };
+    notes?: WorkspaceStatsResponse['notes'];
+    chunks?: WorkspaceStatsResponse['chunks'];
     vectors: number;
   } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -646,34 +651,34 @@ export function Dashboard({
     return (
       <div
         className="space-y-6 p-8"
-        style={{ background: '#0A0A0A', minHeight: '100vh', fontFamily: "'IBM Plex Sans', sans-serif" }}
+        style={{ background: 'var(--theme-canvas)', minHeight: '100vh', fontFamily: "'IBM Plex Sans', sans-serif" }}
       >
         <div className="flex items-center gap-2">
           <YellowDot />
           <span
             className="text-[9.5px] uppercase tracking-[0.1em]"
-            style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+            style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
           >
             Overview
           </span>
         </div>
         <div
           style={{
-            background: '#111111',
-            border: '1px solid #252525',
+            background: 'var(--theme-panel)',
+            border: '1px solid var(--theme-border)',
             borderRadius: 3,
             padding: 24,
           }}
         >
           <h1
             className="text-[44px] uppercase leading-none"
-            style={{ fontFamily: "'Bebas Neue', 'Arial Narrow', sans-serif", color: '#F5F5F5', letterSpacing: '0.04em' }}
+            style={{ fontFamily: "'Bebas Neue', 'Arial Narrow', sans-serif", color: 'var(--theme-text)', letterSpacing: '0.04em' }}
           >
-            <span style={{ color: '#F5E642' }}>S</span>elect a workspace
+            <span style={{ color: 'var(--theme-accent)' }}>S</span>elect a workspace
           </h1>
           <p
             className="mt-4 max-w-xl text-[13px] leading-[1.7]"
-            style={{ color: '#888888', fontFamily: "'IBM Plex Sans', sans-serif" }}
+            style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Sans', sans-serif" }}
           >
             The dashboard needs a workspace context before it can show activity, insights, and inline actions.
           </p>
@@ -689,7 +694,7 @@ export function Dashboard({
         initial="hidden"
         animate="visible"
         className="space-y-6 p-8"
-        style={{ background: '#0A0A0A', minHeight: '100vh', fontFamily: "'IBM Plex Sans', sans-serif" }}
+        style={{ background: 'var(--theme-canvas)', minHeight: '100vh', fontFamily: "'IBM Plex Sans', sans-serif" }}
       >
         <motion.div variants={itemVariants} className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
           <div>
@@ -697,7 +702,7 @@ export function Dashboard({
               <YellowDot />
               <span
                 className="text-[9.5px] uppercase tracking-[0.1em]"
-                style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
               >
                 Overview
               </span>
@@ -705,20 +710,20 @@ export function Dashboard({
             <div className="flex flex-wrap items-end gap-4">
               <h1
                 className="text-[44px] uppercase leading-none"
-                style={{ fontFamily: "'Bebas Neue', 'Arial Narrow', sans-serif", color: '#F5F5F5', letterSpacing: '0.04em' }}
+                style={{ fontFamily: "'Bebas Neue', 'Arial Narrow', sans-serif", color: 'var(--theme-text)', letterSpacing: '0.04em' }}
               >
-                <span style={{ color: '#F5E642' }}>W</span>elcome, {user?.name ? user.name.split(' ')[0] : 'User'}
+                <span style={{ color: 'var(--theme-accent)' }}>W</span>elcome, {user?.name ? user.name.split(' ')[0] : 'User'}
               </h1>
               <MonoChip yellow>{user?.plan ? user.plan.charAt(0).toUpperCase() + user.plan.slice(1) : 'Free'}</MonoChip>
             </div>
-            <div style={{ width: 36, height: 3, background: '#F5E642', marginTop: 10 }} />
+            <div style={{ width: 36, height: 3, background: 'var(--theme-accent)', marginTop: 10 }} />
             <div className="mt-4 flex flex-wrap items-center gap-3">
               {showInitialLoading ? (
                 <SkeletonBlock width={280} height={16} />
               ) : (
                 <p
                   className="text-[12px] uppercase tracking-[0.04em]"
-                  style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                  style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                 >
                   {workspaceStats?.documents.total ?? 0} documents, {notes.length} notes, {totalTags} active tags
                 </p>
@@ -737,7 +742,7 @@ export function Dashboard({
               style={{
                 fontFamily: "'Bebas Neue', sans-serif",
                 background: 'transparent',
-                color: '#F5E642',
+                color: 'var(--theme-accent)',
                 border: '1px solid rgba(245,230,66,0.28)',
                 borderRadius: 3,
               }}
@@ -753,8 +758,8 @@ export function Dashboard({
                 style={{
                   fontFamily: "'Bebas Neue', sans-serif",
                   background: 'transparent',
-                  color: '#5A5A5A',
-                  border: '1px solid #252525',
+                  color: 'var(--theme-text-muted)',
+                  border: '1px solid var(--theme-border)',
                   borderRadius: 3,
                 }}
               >
@@ -772,9 +777,9 @@ export function Dashboard({
             className="flex h-[42px] items-center gap-2 px-5 text-[15px] uppercase tracking-[0.12em] transition-all duration-150 focus-visible:outline-none"
             style={{
               fontFamily: "'Bebas Neue', sans-serif",
-              background: '#F5E642',
-              color: '#0A0A0A',
-              border: '2px solid #F5E642',
+              background: 'var(--theme-accent)',
+              color: 'var(--theme-canvas)',
+              border: '2px solid var(--theme-accent)',
               borderRadius: 3,
               boxShadow: '0 4px 20px rgba(245,230,66,0.15)',
             }}
@@ -796,8 +801,8 @@ export function Dashboard({
               style={{
                 fontFamily: "'Bebas Neue', sans-serif",
                 background: 'transparent',
-                color: '#5A5A5A',
-                border: '1px solid #252525',
+                color: 'var(--theme-text-muted)',
+                border: '1px solid var(--theme-border)',
                 borderRadius: 3,
               }}
             >
@@ -824,14 +829,14 @@ export function Dashboard({
                     ? '1px solid rgba(255,69,69,0.3)'
                     : feedback?.tone === 'success'
                       ? '1px solid rgba(245,230,66,0.25)'
-                      : '1px solid #252525',
+                      : '1px solid var(--theme-border)',
                 background:
                   feedback?.tone === 'error' || error
                     ? 'rgba(255,69,69,0.08)'
                     : feedback?.tone === 'success'
                       ? 'rgba(245,230,66,0.08)'
-                      : '#111111',
-                color: feedback?.tone === 'error' || error ? '#FF8A8A' : '#F5F5F5',
+                      : 'var(--theme-panel)',
+                color: feedback?.tone === 'error' || error ? '#FF8A8A' : 'var(--theme-text)',
                 padding: '12px 16px',
               }}
             >
@@ -850,7 +855,7 @@ export function Dashboard({
                     style={{
                       background: 'transparent',
                       border: 'none',
-                      color: '#F5E642',
+                      color: 'var(--theme-accent)',
                       fontFamily: "'IBM Plex Mono', monospace",
                       fontSize: 10,
                       letterSpacing: '0.08em',
@@ -867,6 +872,12 @@ export function Dashboard({
           )}
         </AnimatePresence>
 
+        {workspaceId ? (
+          <motion.div variants={itemVariants}>
+            <UsageDashboard workspaceId={workspaceId} canManageBilling={canManageBilling} />
+          </motion.div>
+        ) : null}
+
         <motion.div variants={itemVariants} className="space-y-3">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {showInitialLoading
@@ -874,9 +885,9 @@ export function Dashboard({
                   <div
                     key={`stat-skeleton-${index}`}
                     style={{
-                      background: '#111111',
-                      border: '1px solid #252525',
-                      borderLeft: '3px solid #F5E642',
+                      background: 'var(--theme-panel)',
+                      border: '1px solid var(--theme-border)',
+                      borderLeft: '3px solid var(--theme-accent)',
                       borderRadius: 3,
                       padding: '20px 20px 16px',
                     }}
@@ -897,9 +908,9 @@ export function Dashboard({
                       aria-pressed={active}
                       className="text-left transition-all duration-150 focus-visible:outline-none"
                       style={{
-                        background: active ? 'rgba(245,230,66,0.04)' : '#111111',
-                        border: `1px solid ${active ? 'rgba(245,230,66,0.32)' : '#252525'}`,
-                        borderLeft: '3px solid #F5E642',
+                        background: active ? 'rgba(245,230,66,0.04)' : 'var(--theme-panel)',
+                        border: `1px solid ${active ? 'rgba(245,230,66,0.32)' : 'var(--theme-border)'}`,
+                        borderLeft: '3px solid var(--theme-accent)',
                         borderRadius: 3,
                         padding: '20px 20px 16px',
                         boxShadow: active ? '0 0 0 1px rgba(245,230,66,0.08)' : 'none',
@@ -918,11 +929,11 @@ export function Dashboard({
                             justifyContent: 'center',
                           }}
                         >
-                          <Icon size={14} color="#F5E642" />
+                          <Icon size={14} color="var(--theme-accent)" />
                         </div>
                         <span
                           className="text-[9px] uppercase tracking-[0.06em]"
-                          style={{ color: active ? '#F5E642' : '#888888', fontFamily: "'IBM Plex Mono', monospace" }}
+                          style={{ color: active ? 'var(--theme-accent)' : 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Mono', monospace" }}
                         >
                           {change}
                         </span>
@@ -930,13 +941,13 @@ export function Dashboard({
 
                       <div
                         className="text-[38px] leading-none"
-                        style={{ fontFamily: "'Bebas Neue', sans-serif", color: '#F5F5F5', letterSpacing: '0.02em' }}
+                        style={{ fontFamily: "'Bebas Neue', sans-serif", color: 'var(--theme-text)', letterSpacing: '0.02em' }}
                       >
                         {value}
                       </div>
                       <div
                         className="mt-1 text-[9.5px] uppercase tracking-[0.08em]"
-                        style={{ color: active ? '#F5E642' : '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                        style={{ color: active ? 'var(--theme-accent)' : 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                       >
                         {label}
                       </div>
@@ -949,8 +960,8 @@ export function Dashboard({
             <div
               className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between"
               style={{
-                background: '#111111',
-                border: '1px solid #252525',
+                background: 'var(--theme-panel)',
+                border: '1px solid var(--theme-border)',
                 borderRadius: 3,
                 padding: '14px 16px',
               }}
@@ -958,13 +969,13 @@ export function Dashboard({
               <div>
                 <p
                   className="text-[10px] uppercase tracking-[0.08em]"
-                  style={{ color: '#F5E642', fontFamily: "'IBM Plex Mono', monospace" }}
+                  style={{ color: 'var(--theme-accent)', fontFamily: "'IBM Plex Mono', monospace" }}
                 >
                   Active Focus
                 </p>
                 <p
                   className="mt-1 text-[13px] leading-[1.6]"
-                  style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Sans', sans-serif" }}
+                  style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Sans', sans-serif" }}
                 >
                   {activeStat.description}
                 </p>
@@ -979,13 +990,13 @@ export function Dashboard({
 
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
           <motion.div variants={itemVariants} className="lg:col-span-2">
-            <div style={{ background: '#111111', border: '1px solid #252525', borderRadius: 3, height: '100%' }}>
-              <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4" style={{ borderBottom: '1px solid #1A1A1A' }}>
+            <div style={{ background: 'var(--theme-panel)', border: '1px solid var(--theme-border)', borderRadius: 3, height: '100%' }}>
+              <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4" style={{ borderBottom: '1px solid var(--theme-panel-raised)' }}>
                 <div className="flex items-center gap-2">
-                  <Clock size={13} color="#F5E642" />
+                  <Clock size={13} color="var(--theme-accent)" />
                   <span
                     className="text-[11px] uppercase tracking-[0.1em]"
-                    style={{ color: '#888888', fontFamily: "'IBM Plex Mono', monospace" }}
+                    style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Mono', monospace" }}
                   >
                     Recent Notes
                   </span>
@@ -1000,7 +1011,7 @@ export function Dashboard({
                     fontSize: 10,
                     letterSpacing: '0.06em',
                     textTransform: 'uppercase',
-                    color: '#F5E642',
+                    color: 'var(--theme-accent)',
                     background: 'none',
                     border: 'none',
                     cursor: 'pointer',
@@ -1016,22 +1027,22 @@ export function Dashboard({
                   <div
                     className="flex items-center gap-2"
                     style={{
-                      background: '#0A0A0A',
-                      border: '1px solid #1A1A1A',
+                      background: 'var(--theme-canvas)',
+                      border: '1px solid var(--theme-panel-raised)',
                       borderRadius: 3,
                       padding: '0 10px',
                       minHeight: 38,
                     }}
                   >
-                    <Search size={13} color="#5A5A5A" />
+                    <Search size={13} color="var(--theme-text-muted)" />
                     <input
                       aria-label="Search notes on dashboard"
                       value={searchQuery}
                       onChange={(event) => setSearchQuery(event.target.value)}
                       placeholder="Search notes, summaries, or tags"
-                      className="w-full bg-transparent text-[12px] outline-none placeholder:text-[#3A3A3A]"
+                      className="w-full bg-transparent text-[12px] outline-none placeholder:text-[var(--theme-border-strong)]"
                       style={{
-                        color: '#F5F5F5',
+                        color: 'var(--theme-text)',
                         fontFamily: "'IBM Plex Sans', sans-serif",
                       }}
                     />
@@ -1041,7 +1052,7 @@ export function Dashboard({
                         onClick={() => setSearchQuery('')}
                         className="focus-visible:outline-none"
                         aria-label="Clear note search"
-                        style={{ background: 'transparent', border: 'none', color: '#5A5A5A', cursor: 'pointer', padding: 0 }}
+                        style={{ background: 'transparent', border: 'none', color: 'var(--theme-text-muted)', cursor: 'pointer', padding: 0 }}
                       >
                         <X size={12} />
                       </button>
@@ -1089,7 +1100,7 @@ export function Dashboard({
                     {Array.from({ length: 4 }).map((_, index) => (
                       <div
                         key={`note-loading-${index}`}
-                        style={{ background: '#0A0A0A', border: '1px solid #1A1A1A', borderRadius: 3, padding: '12px 14px' }}
+                        style={{ background: 'var(--theme-canvas)', border: '1px solid var(--theme-panel-raised)', borderRadius: 3, padding: '12px 14px' }}
                       >
                         <SkeletonBlock width="40%" height={13} />
                         <SkeletonBlock width="100%" height={12} style={{ marginTop: 10 }} />
@@ -1124,9 +1135,9 @@ export function Dashboard({
                             onKeyDown={(event) => handleNoteCardKeyDown(event, note)}
                             className="cursor-pointer focus-visible:outline-none"
                             style={{
-                              background: isSelected ? 'rgba(245,230,66,0.04)' : '#0A0A0A',
-                              border: `1px solid ${isSelected ? 'rgba(245,230,66,0.28)' : '#1A1A1A'}`,
-                              borderLeft: `3px solid ${isSelected ? '#F5E642' : 'transparent'}`,
+                              background: isSelected ? 'rgba(245,230,66,0.04)' : 'var(--theme-canvas)',
+                              border: `1px solid ${isSelected ? 'rgba(245,230,66,0.28)' : 'var(--theme-panel-raised)'}`,
+                              borderLeft: `3px solid ${isSelected ? 'var(--theme-accent)' : 'transparent'}`,
                               borderRadius: 3,
                               padding: '12px 14px',
                             }}
@@ -1136,7 +1147,7 @@ export function Dashboard({
                                 <div className="flex flex-wrap items-center gap-2">
                                   <h3
                                     className="truncate text-[13px]"
-                                    style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Mono', monospace", fontWeight: 500 }}
+                                    style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Mono', monospace", fontWeight: 500 }}
                                   >
                                     {note.title}
                                   </h3>
@@ -1144,7 +1155,7 @@ export function Dashboard({
                                 </div>
                                 <p
                                   className="mt-1 line-clamp-2 text-[11px] leading-[1.5]"
-                                  style={{ color: '#888888', fontFamily: "'IBM Plex Sans', sans-serif" }}
+                                  style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Sans', sans-serif" }}
                                 >
                                   {getNotePreview(note)}
                                 </p>
@@ -1159,9 +1170,9 @@ export function Dashboard({
                                       }}
                                       className="focus-visible:outline-none"
                                       style={{
-                                        background: selectedTag === tag ? 'rgba(245,230,66,0.1)' : '#1A1A1A',
-                                        color: selectedTag === tag ? '#F5E642' : '#5A5A5A',
-                                        border: `1px solid ${selectedTag === tag ? 'rgba(245,230,66,0.22)' : '#252525'}`,
+                                        background: selectedTag === tag ? 'rgba(245,230,66,0.1)' : 'var(--theme-panel-raised)',
+                                        color: selectedTag === tag ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                                        border: `1px solid ${selectedTag === tag ? 'rgba(245,230,66,0.22)' : 'var(--theme-border)'}`,
                                         borderRadius: 2,
                                         padding: '2px 6px',
                                         fontFamily: "'IBM Plex Mono', monospace",
@@ -1176,7 +1187,7 @@ export function Dashboard({
                                   ))}
                                   <span
                                     className="text-[9.5px]"
-                                    style={{ color: '#3A3A3A', fontFamily: "'IBM Plex Mono', monospace" }}
+                                    style={{ color: 'var(--theme-border-strong)', fontFamily: "'IBM Plex Mono', monospace" }}
                                   >
                                     {formatDistanceToNow(
                                       note.updatedAt instanceof Date ? note.updatedAt : new Date(note.updatedAt),
@@ -1196,10 +1207,10 @@ export function Dashboard({
                                       borderRadius: 2,
                                     }}
                                   >
-                                    <Brain size={10} color="#F5E642" />
+                                    <Brain size={10} color="var(--theme-accent)" />
                                     <span
                                       className="text-[9.5px]"
-                                      style={{ color: '#F5E642', fontFamily: "'IBM Plex Mono', monospace" }}
+                                      style={{ color: 'var(--theme-accent)', fontFamily: "'IBM Plex Mono', monospace" }}
                                     >
                                       {Math.round(note.confidence * 100)}%
                                     </span>
@@ -1216,9 +1227,9 @@ export function Dashboard({
                                     className="focus-visible:outline-none"
                                     style={{
                                       background: 'transparent',
-                                      border: '1px solid #252525',
+                                      border: '1px solid var(--theme-border)',
                                       borderRadius: 3,
-                                      color: '#F5E642',
+                                      color: 'var(--theme-accent)',
                                       padding: '5px 8px',
                                       fontFamily: "'IBM Plex Mono', monospace",
                                       fontSize: 9,
@@ -1239,9 +1250,9 @@ export function Dashboard({
                                     className="focus-visible:outline-none"
                                     style={{
                                       background: 'transparent',
-                                      border: '1px solid #252525',
+                                      border: '1px solid var(--theme-border)',
                                       borderRadius: 3,
-                                      color: '#5A5A5A',
+                                      color: 'var(--theme-text-muted)',
                                       padding: '5px 8px',
                                       cursor: 'pointer',
                                     }}
@@ -1261,7 +1272,7 @@ export function Dashboard({
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <p
                     className="text-[10px] uppercase tracking-[0.08em]"
-                    style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                    style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                   >
                     Showing {visibleNotes.length} of {filteredNotes.length} matching notes
                     {activeFilterCount > 0 ? ` • ${activeFilterCount} active filters` : ''}
@@ -1276,13 +1287,13 @@ export function Dashboard({
           </motion.div>
 
           <motion.div variants={itemVariants}>
-            <div style={{ background: '#111111', border: '1px solid #252525', borderRadius: 3, height: '100%' }}>
-              <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4" style={{ borderBottom: '1px solid #1A1A1A' }}>
+            <div style={{ background: 'var(--theme-panel)', border: '1px solid var(--theme-border)', borderRadius: 3, height: '100%' }}>
+              <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4" style={{ borderBottom: '1px solid var(--theme-panel-raised)' }}>
                 <div className="flex items-center gap-2">
-                  <Sparkles size={13} color="#F5E642" />
+                  <Sparkles size={13} color="var(--theme-accent)" />
                   <span
                     className="text-[11px] uppercase tracking-[0.1em]"
-                    style={{ color: '#888888', fontFamily: "'IBM Plex Mono', monospace" }}
+                    style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Mono', monospace" }}
                   >
                     AI Insights
                   </span>
@@ -1308,7 +1319,7 @@ export function Dashboard({
                     {Array.from({ length: 3 }).map((_, index) => (
                       <div
                         key={`insight-loading-${index}`}
-                        style={{ background: '#0A0A0A', border: '1px solid #1A1A1A', borderRadius: 3, padding: '12px 14px' }}
+                        style={{ background: 'var(--theme-canvas)', border: '1px solid var(--theme-panel-raised)', borderRadius: 3, padding: '12px 14px' }}
                       >
                         <SkeletonBlock width="100%" height={12} />
                         <SkeletonBlock width="84%" height={12} style={{ marginTop: 8 }} />
@@ -1336,28 +1347,28 @@ export function Dashboard({
                           aria-expanded={expanded}
                           className="w-full text-left transition-all duration-150 focus-visible:outline-none"
                           style={{
-                            background: expanded ? 'rgba(245,230,66,0.04)' : '#0A0A0A',
-                            border: `1px solid ${expanded ? 'rgba(245,230,66,0.22)' : '#1A1A1A'}`,
+                            background: expanded ? 'rgba(245,230,66,0.04)' : 'var(--theme-canvas)',
+                            border: `1px solid ${expanded ? 'rgba(245,230,66,0.22)' : 'var(--theme-panel-raised)'}`,
                             borderRadius: 3,
                             padding: '12px 14px',
                           }}
                         >
                           <p
                             className={cn('text-[12px] leading-[1.6]', !expanded && 'line-clamp-3')}
-                            style={{ color: '#888888', fontFamily: "'IBM Plex Sans', sans-serif" }}
+                            style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Sans', sans-serif" }}
                           >
                             {insight.content}
                           </p>
                           <div className="mt-3 flex items-center justify-between gap-2">
                             <span
                               className="text-[9px] uppercase tracking-[0.07em]"
-                              style={{ color: expanded ? '#F5E642' : '#3A3A3A', fontFamily: "'IBM Plex Mono', monospace" }}
+                              style={{ color: expanded ? 'var(--theme-accent)' : 'var(--theme-border-strong)', fontFamily: "'IBM Plex Mono', monospace" }}
                             >
                               {insight.type}
                             </span>
                             <span
                               className="text-[9px]"
-                              style={{ color: '#F5E642', fontFamily: "'IBM Plex Mono', monospace", opacity: 0.75 }}
+                              style={{ color: 'var(--theme-accent)', fontFamily: "'IBM Plex Mono', monospace", opacity: 0.75 }}
                             >
                               {Math.round(insight.confidence * 100)}% conf
                             </span>
@@ -1374,11 +1385,11 @@ export function Dashboard({
                               >
                                 <div
                                   className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t pt-3"
-                                  style={{ borderColor: '#1A1A1A' }}
+                                  style={{ borderColor: 'var(--theme-panel-raised)' }}
                                 >
                                   <p
                                     className="text-[10px] uppercase tracking-[0.08em]"
-                                    style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                                    style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                                   >
                                     Updated {formatDistanceToNow(insight.createdAt, { addSuffix: true })}
                                   </p>
@@ -1403,9 +1414,9 @@ export function Dashboard({
                   style={{
                     fontFamily: "'Bebas Neue', sans-serif",
                     background: 'transparent',
-                    border: '1px solid #252525',
+                    border: '1px solid var(--theme-border)',
                     borderRadius: 3,
-                    color: '#5A5A5A',
+                    color: 'var(--theme-text-muted)',
                     cursor: 'pointer',
                   }}
                 >
@@ -1417,13 +1428,13 @@ export function Dashboard({
         </div>
 
         <motion.div variants={itemVariants}>
-          <div style={{ background: '#111111', border: '1px solid #252525', borderRadius: 3 }}>
-            <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4" style={{ borderBottom: '1px solid #1A1A1A' }}>
+          <div style={{ background: 'var(--theme-panel)', border: '1px solid var(--theme-border)', borderRadius: 3 }}>
+            <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4" style={{ borderBottom: '1px solid var(--theme-panel-raised)' }}>
               <div className="flex items-center gap-2">
-                <TrendingUp size={13} color="#F5E642" />
+                <TrendingUp size={13} color="var(--theme-accent)" />
                 <span
                   className="text-[11px] uppercase tracking-[0.1em]"
-                  style={{ color: '#888888', fontFamily: "'IBM Plex Mono', monospace" }}
+                  style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Mono', monospace" }}
                 >
                   Knowledge Growth
                 </span>
@@ -1482,9 +1493,9 @@ export function Dashboard({
                           className="flex-1 focus-visible:outline-none"
                           style={{
                             height: `${bucket.height}%`,
-                            background: active || bucket.isCurrent ? '#F5E642' : 'rgba(245,230,66,0.18)',
+                            background: active || bucket.isCurrent ? 'var(--theme-accent)' : 'rgba(245,230,66,0.18)',
                             borderRadius: '2px 2px 0 0',
-                            border: `1px solid ${active ? '#F5E642' : 'transparent'}`,
+                            border: `1px solid ${active ? 'var(--theme-accent)' : 'transparent'}`,
                             boxShadow: active ? '0 0 12px rgba(245,230,66,0.25)' : 'none',
                           }}
                         />
@@ -1498,7 +1509,7 @@ export function Dashboard({
                         key={bucket.key}
                         className="flex-1 text-center text-[8.5px] uppercase tracking-[0.04em]"
                         style={{
-                          color: selectedChartKey === bucket.key ? '#F5E642' : '#3A3A3A',
+                          color: selectedChartKey === bucket.key ? 'var(--theme-accent)' : 'var(--theme-border-strong)',
                           fontFamily: "'IBM Plex Mono', monospace",
                         }}
                       >
@@ -1510,18 +1521,18 @@ export function Dashboard({
                   {selectedBucket ? (
                     <div
                       className="flex flex-col gap-3 border-t pt-3 md:flex-row md:items-center md:justify-between"
-                      style={{ borderColor: '#1A1A1A' }}
+                      style={{ borderColor: 'var(--theme-panel-raised)' }}
                     >
                       <div>
                         <p
                           className="text-[10px] uppercase tracking-[0.08em]"
-                          style={{ color: '#F5E642', fontFamily: "'IBM Plex Mono', monospace" }}
+                          style={{ color: 'var(--theme-accent)', fontFamily: "'IBM Plex Mono', monospace" }}
                         >
                           Drill-down
                         </p>
                         <p
                           className="mt-1 text-[13px] leading-[1.6]"
-                          style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Sans', sans-serif" }}
+                          style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Sans', sans-serif" }}
                         >
                           {selectedBucket.count} note{selectedBucket.count === 1 ? '' : 's'} updated in {selectedBucket.description}.
                           {selectedChartKey ? ' The recent notes list is filtered to this period.' : ' Select a bar to filter the notes list instantly.'}
@@ -1543,12 +1554,12 @@ export function Dashboard({
       <Sheet open={noteSheetOpen} onOpenChange={setNoteSheetOpen}>
         <SheetContent
           side="right"
-          className="border-zinc-800 bg-[#111111] p-0 text-[#F5F5F5] sm:max-w-md"
+          className="border-zinc-800 bg-[var(--theme-panel)] p-0 text-[var(--theme-text)] sm:max-w-md"
           aria-describedby={selectedNote ? `dashboard-note-description-${selectedNote.id}` : undefined}
         >
           {selectedNote ? (
             <>
-              <SheetHeader className="border-b border-zinc-900 bg-[#0A0A0A] p-5">
+              <SheetHeader className="border-b border-zinc-900 bg-[var(--theme-canvas)] p-5">
                 <div className="flex items-start gap-3">
                   <div
                     style={{
@@ -1562,19 +1573,19 @@ export function Dashboard({
                       justifyContent: 'center',
                     }}
                   >
-                    <FileText size={16} color="#F5E642" />
+                    <FileText size={16} color="var(--theme-accent)" />
                   </div>
                   <div className="min-w-0 flex-1">
                     <SheetTitle
                       className="truncate text-[20px] uppercase tracking-[0.04em]"
-                      style={{ fontFamily: "'Bebas Neue', sans-serif", color: '#F5F5F5' }}
+                      style={{ fontFamily: "'Bebas Neue', sans-serif", color: 'var(--theme-text)' }}
                     >
                       {selectedNote.title}
                     </SheetTitle>
                     <SheetDescription
                       id={`dashboard-note-description-${selectedNote.id}`}
                       className="mt-2 text-[12px] leading-[1.6]"
-                      style={{ color: '#888888', fontFamily: "'IBM Plex Sans', sans-serif" }}
+                      style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Sans', sans-serif" }}
                     >
                       {getNotePreview(selectedNote)}
                     </SheetDescription>
@@ -1595,9 +1606,9 @@ export function Dashboard({
                       }}
                       className="focus-visible:outline-none"
                       style={{
-                        background: selectedTag === tag ? 'rgba(245,230,66,0.1)' : '#0A0A0A',
-                        color: selectedTag === tag ? '#F5E642' : '#5A5A5A',
-                        border: `1px solid ${selectedTag === tag ? 'rgba(245,230,66,0.2)' : '#252525'}`,
+                        background: selectedTag === tag ? 'rgba(245,230,66,0.1)' : 'var(--theme-canvas)',
+                        color: selectedTag === tag ? 'var(--theme-accent)' : 'var(--theme-text-muted)',
+                        border: `1px solid ${selectedTag === tag ? 'rgba(245,230,66,0.2)' : 'var(--theme-border)'}`,
                         borderRadius: 2,
                         padding: '4px 7px',
                         fontFamily: "'IBM Plex Mono', monospace",
@@ -1614,8 +1625,8 @@ export function Dashboard({
 
                 <div
                   style={{
-                    background: '#0A0A0A',
-                    border: '1px solid #1A1A1A',
+                    background: 'var(--theme-canvas)',
+                    border: '1px solid var(--theme-panel-raised)',
                     borderRadius: 3,
                     padding: '14px 16px',
                   }}
@@ -1624,44 +1635,44 @@ export function Dashboard({
                     <div>
                       <p
                         className="text-[9px] uppercase tracking-[0.08em]"
-                        style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                        style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                       >
                         Updated
                       </p>
-                      <p className="mt-1 text-[12px]" style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                      <p className="mt-1 text-[12px]" style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Sans', sans-serif" }}>
                         {format(selectedNote.updatedAt instanceof Date ? selectedNote.updatedAt : new Date(selectedNote.updatedAt), 'MMM d, yyyy')}
                       </p>
                     </div>
                     <div>
                       <p
                         className="text-[9px] uppercase tracking-[0.08em]"
-                        style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                        style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                       >
                         Confidence
                       </p>
-                      <p className="mt-1 text-[12px]" style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                      <p className="mt-1 text-[12px]" style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Sans', sans-serif" }}>
                         {selectedNote.confidence ? `${Math.round(selectedNote.confidence * 100)}%` : 'Not scored'}
                       </p>
                     </div>
                     <div>
                       <p
                         className="text-[9px] uppercase tracking-[0.08em]"
-                        style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                        style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                       >
                         Connections
                       </p>
-                      <p className="mt-1 text-[12px]" style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                      <p className="mt-1 text-[12px]" style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Sans', sans-serif" }}>
                         {selectedNote.connections?.length ?? 0}
                       </p>
                     </div>
                     <div>
                       <p
                         className="text-[9px] uppercase tracking-[0.08em]"
-                        style={{ color: '#5A5A5A', fontFamily: "'IBM Plex Mono', monospace" }}
+                        style={{ color: 'var(--theme-text-muted)', fontFamily: "'IBM Plex Mono', monospace" }}
                       >
                         Words
                       </p>
-                      <p className="mt-1 text-[12px]" style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                      <p className="mt-1 text-[12px]" style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Sans', sans-serif" }}>
                         {selectedNote.word_count ?? selectedNote.content.split(/\s+/).filter(Boolean).length}
                       </p>
                     </div>
@@ -1671,7 +1682,7 @@ export function Dashboard({
                 <div>
                   <p
                     className="text-[10px] uppercase tracking-[0.08em]"
-                    style={{ color: '#F5E642', fontFamily: "'IBM Plex Mono', monospace" }}
+                    style={{ color: 'var(--theme-accent)', fontFamily: "'IBM Plex Mono', monospace" }}
                   >
                     Next Actions
                   </p>
@@ -1692,7 +1703,7 @@ export function Dashboard({
                   <div>
                     <p
                       className="text-[10px] uppercase tracking-[0.08em]"
-                      style={{ color: '#F5E642', fontFamily: "'IBM Plex Mono', monospace" }}
+                      style={{ color: 'var(--theme-accent)', fontFamily: "'IBM Plex Mono', monospace" }}
                     >
                       Summary
                     </p>
@@ -1708,13 +1719,13 @@ export function Dashboard({
                 <div>
                   <p
                     className="text-[10px] uppercase tracking-[0.08em]"
-                    style={{ color: '#F5E642', fontFamily: "'IBM Plex Mono', monospace" }}
+                    style={{ color: 'var(--theme-accent)', fontFamily: "'IBM Plex Mono', monospace" }}
                   >
                     Preview
                   </p>
                   <p
                     className="mt-2 text-[13px] leading-[1.7]"
-                    style={{ color: '#888888', fontFamily: "'IBM Plex Sans', sans-serif" }}
+                    style={{ color: 'var(--theme-text-subtle)', fontFamily: "'IBM Plex Sans', sans-serif" }}
                   >
                     {selectedNote.content.length > 420 ? `${selectedNote.content.slice(0, 420)}...` : selectedNote.content}
                   </p>
@@ -1724,17 +1735,17 @@ export function Dashboard({
                   <div
                     className="flex items-center justify-between gap-3"
                     style={{
-                      background: '#0A0A0A',
-                      border: '1px solid #1A1A1A',
+                      background: 'var(--theme-canvas)',
+                      border: '1px solid var(--theme-panel-raised)',
                       borderRadius: 3,
                       padding: '12px 14px',
                     }}
                   >
                     <div className="flex items-center gap-2">
-                      <CheckCircle2 size={13} color="#F5E642" />
+                      <CheckCircle2 size={13} color="var(--theme-accent)" />
                       <span
                         className="text-[10px] uppercase tracking-[0.08em]"
-                        style={{ color: '#F5F5F5', fontFamily: "'IBM Plex Mono', monospace" }}
+                        style={{ color: 'var(--theme-text)', fontFamily: "'IBM Plex Mono', monospace" }}
                       >
                         Approval: {selectedNote.approvalStatus}
                       </span>
@@ -1750,3 +1761,4 @@ export function Dashboard({
     </>
   );
 }
+

@@ -3,14 +3,17 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
-  Plus, Search, Filter, Edit2, Trash2, Link2,
+  Plus, Search, Edit2, Trash2, Link2,
   Sparkles, Brain, Globe, Mic, FileText, X, Check, Tag, Users, MessageSquare, Reply, CheckCircle2, RotateCcw,
 } from 'lucide-react';
 import type { Note, NoteComment, NoteConnectionSuggestion, NoteContribution, NoteVersion, Workspace } from '@/types';
 import { formatDistanceToNow } from 'date-fns';
 import { api } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
+import { useProductSettings } from '@/hooks/useProductSettings';
+import { useEntitlementGuard } from '@/hooks/useEntitlementGuard';
 import { getCollaboratorColor } from '@/lib/collaboration/colors';
+import { UpgradePrompt } from '@/components/billing/UpgradePrompt';
 import { CollaborativeNoteEditor } from '@/components/notes/CollaborativeNoteEditor';
 import { OnboardingAcceleratorPanel } from '@/components/notes/OnboardingAcceleratorPanel';
 import { NoteInvitePanel } from '@/components/notes/NoteInvitePanel';
@@ -26,18 +29,18 @@ interface NotesViewProps {
 }
 
 const TT = {
-  inkBlack:  '#0A0A0A',
-  inkDeep:   '#111111',
-  inkRaised: '#1A1A1A',
-  inkBorder: '#252525',
-  inkMid:    '#3A3A3A',
-  inkMuted:  '#5A5A5A',
-  inkSubtle: '#888888',
+  inkBlack:  'var(--theme-canvas)',
+  inkDeep:   'var(--theme-panel)',
+  inkRaised: 'var(--theme-panel-raised)',
+  inkBorder: 'var(--theme-border)',
+  inkMid:    'var(--theme-border-strong)',
+  inkMuted:  'var(--theme-text-muted)',
+  inkSubtle: 'var(--theme-text-subtle)',
   inkDim:    '#6A6A6A',
-  snow:      '#F5F5F5',
-  yolk:      '#F5E642',
+  snow:      'var(--theme-text)',
+  yolk:      'var(--theme-accent)',
   yolkBright:'#FFF176',
-  error:     '#FF4545',
+  error:     'var(--theme-error)',
   errorDim:  'rgba(255,69,69,0.08)',
   fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif",
   fontMono:    "'IBM Plex Mono', monospace",
@@ -814,6 +817,7 @@ export function NotesView({
   const workspaceId = currentWorkspaceId || initialSelectedWorkspace;
   const defaultWorkspaceId = workspaceId || workspaces[0]?.id || '';
   const activeWorkspace = workspaceId ? workspaces.find((workspace) => workspace.id === workspaceId) || null : null;
+  const { user: userSettings, workspace: workspaceSettings } = useProductSettings(workspaceId, Boolean(workspaceId));
   const canViewWorkspaceNotes = Boolean(workspaceId && hasPermission(workspaceId, 'notes', 'view'));
   const canCreateWorkspaceNotes = Boolean(defaultWorkspaceId && hasPermission(defaultWorkspaceId, 'notes', 'create'));
   const canGenerateOnboarding = Boolean(
@@ -832,7 +836,20 @@ export function NotesView({
       ? hasPermission(selectedNote.workspaceId, 'notes', 'update')
       : selectedNote?.userId === user?.id
   );
+  const assistantTipsEnabled = Boolean(userSettings?.settings.onboarding.assistant_tips ?? true);
+  const allowNoteInvites = Boolean(userSettings?.settings.collaboration.allow_note_invites ?? true);
+  const showRealtimePresence = Boolean(userSettings?.settings.collaboration.presence_visible ?? true);
+  const showCollaboratorCursors = Boolean(userSettings?.settings.collaboration.show_collaborator_cursors ?? true);
+  const workspaceCommentThreadsEnabled = Boolean(workspaceSettings?.settings.collaboration.comment_threads_enabled ?? true);
+  const workspaceMentionsEnabled = Boolean(workspaceSettings?.settings.collaboration.mentions_enabled ?? true);
+  const defaultNoteVisibility = workspaceSettings?.settings.notes.default_visibility ?? 'private';
   const collaborationToken = api.getToken();
+  const {
+    guardedFetch,
+    entitlement,
+    hasEntitlementError,
+    dismissUpgradePrompt,
+  } = useEntitlementGuard();
 
   const createEmptyNote = (targetWorkspaceId = '') => ({
     title: '',
@@ -865,9 +882,18 @@ export function NotesView({
   }, [propWorkspaces, ctxWorkspaces]);
 
   useEffect(() => {
-    if (!defaultWorkspaceId) return;
-
     setNewNote((prev) => {
+      if (defaultNoteVisibility !== 'workspace') {
+        if (prev.title || prev.content || prev.tags.length > 0) {
+          return prev;
+        }
+        return prev.workspaceId ? { ...prev, workspaceId: '' } : prev;
+      }
+
+      if (!defaultWorkspaceId) {
+        return prev;
+      }
+
       const hasValidWorkspaceSelection =
         !!prev.workspaceId && workspaces.some((ws) => ws.id === prev.workspaceId);
 
@@ -877,7 +903,7 @@ export function NotesView({
 
       return { ...prev, workspaceId: defaultWorkspaceId };
     });
-  }, [defaultWorkspaceId, workspaces]);
+  }, [defaultNoteVisibility, defaultWorkspaceId, workspaces]);
 
   useEffect(() => {
     collaborativeSyncRequestRef.current += 1;
@@ -1173,13 +1199,13 @@ export function NotesView({
     if (!hasPermission(targetWorkspaceId, 'notes', 'create')) return;
 
     try {
-      const createdNoteResponse: any = await api.createNote({
+      const createdNoteResponse: any = await guardedFetch(() => api.createNote({
         workspace_id: targetWorkspaceId,
         title: newNote.title,
         content: newNote.content,
         tags: newNote.tags,
         note_type: newNote.noteType,
-      });
+      }));
       const createdNote = normalizeNote(createdNoteResponse);
 
       if (targetWorkspaceId === workspaceId) {
@@ -1484,6 +1510,19 @@ export function NotesView({
         </div>
       )}
 
+      {hasEntitlementError && entitlement ? (
+        <div style={{ marginBottom: 20 }}>
+          <UpgradePrompt
+            entitlement={entitlement}
+            onDismiss={dismissUpgradePrompt}
+            onUpgrade={() => {
+              window.location.assign('/pricing');
+            }}
+            upgradeLabel="View pricing"
+          />
+        </div>
+      ) : null}
+
       {/* ── Filters ─────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap' }}>
         <div style={{ position: 'relative', flex: 1, minWidth: 200 }}>
@@ -1519,39 +1558,16 @@ export function NotesView({
           />
         </div>
 
-        <Select
-          value={initialSelectedWorkspace || 'all'}
-          onValueChange={(v) => onWorkspaceChange(v === 'all' ? null : v)}
-        >
-          <SelectTrigger
-            style={{
-              width: 200, height: 40,
-              background: TT.inkRaised,
-              border: `1px solid ${TT.inkBorder}`,
-              borderRadius: 3,
-              color: TT.inkMuted,
-              fontFamily: TT.fontMono,
-              fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase',
-            }}
-          >
-            <Filter size={11} style={{ marginRight: 6 }} />
-            <SelectValue placeholder="All workspaces" />
-          </SelectTrigger>
-          <SelectContent style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 3 }}>
-            <SelectItem value="all">All workspaces</SelectItem>
-            {workspaces.map((ws) => (
-              <SelectItem key={ws.id} value={ws.id}>{ws.name}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
       </div>
-      <OnboardingAcceleratorPanel
-        workspaceId={workspaceId}
-        workspaceName={activeWorkspace?.name || null}
-        notes={notes}
-        canGenerate={canGenerateOnboarding}
-        onOpenNote={openNoteById}
-      />
+      {assistantTipsEnabled ? (
+        <OnboardingAcceleratorPanel
+          workspaceId={workspaceId}
+          workspaceName={activeWorkspace?.name || null}
+          notes={notes}
+          canGenerate={canGenerateOnboarding}
+          onOpenNote={openNoteById}
+        />
+      ) : null}
 
       {/* ── Notes Grid ──────────────────────────────────────────── */}
       <div
@@ -1793,6 +1809,11 @@ export function NotesView({
                 ))}
               </SelectContent>
             </Select>
+            <p style={{ marginTop: 8, fontFamily: TT.fontBody, fontSize: 11, lineHeight: 1.5, color: TT.inkMuted }}>
+              {defaultNoteVisibility === 'workspace'
+                ? 'Workspace settings default new notes to shared workspace visibility, so the current workspace is preselected.'
+                : 'Workspace settings prefer private capture, so workspace sharing is left for you to choose explicitly in this composer.'}
+            </p>
           </div>
           <div>
             <FieldLabel>Tags</FieldLabel>
@@ -1874,7 +1895,13 @@ export function NotesView({
                 (user?.id && editingNote.userId === user.id)
                 || (editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'manage'))
               )}
+              enabled={allowNoteInvites}
             />
+            {!allowNoteInvites ? (
+              <div style={{ padding: '10px 12px', borderRadius: 3, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, color: TT.inkMuted, fontSize: 11.5 }}>
+                Note invites are hidden by your personal collaboration settings.
+              </div>
+            ) : null}
             <div>
               <FieldLabel>Content</FieldLabel>
               <CollaborativeNoteEditor
@@ -1888,6 +1915,8 @@ export function NotesView({
                   canUpdate: Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update')),
                 }}
                 editable={Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update'))}
+                showPresence={showRealtimePresence}
+                showCollaboratorCursors={showCollaboratorCursors}
                 onPlainTextChange={(content) => {
                   setEditingNote((current) => {
                     if (!current || current.id !== editingNote.id || current.content === content) {
@@ -2622,7 +2651,11 @@ export function NotesView({
                       </span>
                     </div>
                     <p style={{ fontFamily: TT.fontBody, fontSize: 11.5, color: TT.inkMuted, lineHeight: 1.55 }}>
-                      Comments stay attached to this note, support nested replies, and resolve typed @mentions against workspace members on the server.
+                      {workspaceCommentThreadsEnabled
+                        ? workspaceMentionsEnabled
+                          ? 'Comments stay attached to this note, support nested replies, and resolve typed @mentions against workspace members on the server.'
+                          : 'Comments stay attached to this note and support nested replies. Workspace mentions are currently disabled.'
+                        : 'Comment threads are disabled for this workspace, so discussion is view-only right now.'}
                     </p>
                   </div>
                   <span style={{ fontFamily: TT.fontMono, fontSize: 9, color: TT.inkMuted, textTransform: 'uppercase' }}>
@@ -2630,16 +2663,26 @@ export function NotesView({
                   </span>
                 </div>
 
-                {canCommentOnSelectedNote ? (
+                {!workspaceCommentThreadsEnabled ? (
+                  <div style={{ padding: '12px 14px', borderRadius: 3, background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, color: TT.inkMuted, fontSize: 11.5 }}>
+                    Comment threads are disabled for this workspace in Settings.
+                  </div>
+                ) : canCommentOnSelectedNote ? (
                   <CommentComposer
                     value={newCommentBody}
                     onChange={setNewCommentBody}
                     onSubmit={handleSubmitComment}
                     disabled={!newCommentBody.trim() || submittingComment}
                     submitLabel={submittingComment ? 'Posting' : 'Comment'}
-                    placeholder="Add context, ask a question, or mention a teammate with @name or @email."
+                    placeholder={
+                      workspaceMentionsEnabled
+                        ? 'Add context, ask a question, or mention a teammate with @name or @email.'
+                        : 'Add context or ask a question for collaborators.'
+                    }
                     helperText={
-                      selectedNoteWorkspaceMembers.length > 0
+                      !workspaceMentionsEnabled
+                        ? 'Mentions are disabled for this workspace.'
+                        : selectedNoteWorkspaceMembers.length > 0
                         ? `Mentions resolve against workspace members like ${selectedNoteWorkspaceMembers
                             .slice(0, 3)
                             .map((member: any) => getMentionExample(member))

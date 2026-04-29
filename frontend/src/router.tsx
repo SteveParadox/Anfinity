@@ -25,13 +25,13 @@ function InnerRouter() {
   // Get token from API module
   useEffect(() => {
     const authToken = api.getToken();
-    console.debug('🔐 [TOKEN UPDATE] Token fetched from API:', authToken ? '****' : 'undefined');
-    console.debug('🔐 [WORKSPACE ID] Current workspace:', currentWorkspaceId);
+    console.debug(' [TOKEN UPDATE] Token fetched from API:', authToken ? '****' : 'undefined');
+    console.debug(' [WORKSPACE ID] Current workspace:', currentWorkspaceId);
     if (authToken) {
       setToken(authToken);
-      console.log('✅ [TOKEN SET] Token successfully set for WebSocket:', authToken ? '****' : 'undefined');
+      console.log(' [TOKEN SET] Token successfully set for WebSocket:', authToken ? '****' : 'undefined');
     } else {
-      console.warn('⚠️ [TOKEN MISSING] No token available for WebSocket connection');
+      console.warn(' [TOKEN MISSING] No token available for WebSocket connection');
       setToken(undefined);
     }
   }, [user, currentWorkspaceId]);
@@ -78,7 +78,7 @@ function InnerRouter() {
 
 /**
  * Main router component
- * Wraps the entire app with routing and auth provider
+ * Wraps the app with routing and auth provider
  */
 export function AppRouter() {
   return (
