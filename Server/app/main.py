@@ -11,7 +11,8 @@ from fastapi.exceptions import RequestValidationError
 
 from app.config import get_ollama_request_headers, settings
 from app.database.session import init_db
-from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions, notifications, approval_workflows, automations, onboarding, competitive_intelligence
+from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions, notifications, approval_workflows, automations, onboarding, competitive_intelligence, preferences, billing
+from app.core.entitlements import EntitlementRequiredError
 from app.events import websocket_router
 from app.middleware.logging import RequestLoggingMiddleware
 
@@ -185,6 +186,23 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         metadata={"headers": dict(exc.headers or {})} if exc.headers else None,
     )
 
+
+@app.exception_handler(EntitlementRequiredError)
+async def entitlement_required_handler(request: Request, exc: EntitlementRequiredError):
+    """Handle plan-limit/entitlement denials with a typed 402 contract."""
+    logger.warning(
+        "Entitlement required on %s %s: %s",
+        request.method,
+        request.url.path,
+        exc.metadata.to_dict(),
+    )
+    return ErrorResponse(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail=exc.metadata.message,
+        code=exc.metadata.code,
+        metadata=exc.metadata.to_dict(),
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler."""
@@ -202,6 +220,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Include routers
 app.include_router(auth.router)
 app.include_router(workspaces.router)
+app.include_router(preferences.router)
+app.include_router(billing.router)
 app.include_router(documents.router)
 app.include_router(notes.router)
 app.include_router(approval_workflows.router)

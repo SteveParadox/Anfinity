@@ -9,7 +9,7 @@ class ProductionSettings:
     # Database
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql://user:password@db-instance:5432/cogniflow"
+        "postgresql://user:password@db-instance:5432/anfinity"
     )
     DATABASE_POOL_SIZE: int = 30  # Increased for production
     DATABASE_MAX_OVERFLOW: int = 20
@@ -28,7 +28,7 @@ class ProductionSettings:
     AWS_ACCESS_KEY_ID: str = os.getenv("AWS_ACCESS_KEY_ID", "")
     AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
     S3_ENDPOINT_URL: Optional[str] = os.getenv("S3_ENDPOINT_URL")  # None for AWS
-    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "cogniflow-prod")
+    S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "anfinity-prod")
     S3_REGION: str = os.getenv("S3_REGION", "us-east-1")
     S3_ENABLE_VERSIONING: bool = True
     S3_STORAGE_CLASS: str = "STANDARD_IA"  # Cost optimization

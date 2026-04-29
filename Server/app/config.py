@@ -202,7 +202,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
     
     # Application
-    APP_NAME: str = "CogniFlow API"
+    APP_NAME: str = "Anfinity API"
     APP_VERSION: str = "1.0.0"
     ENVIRONMENT: str = "development"
     DEBUG: bool = Field(default=True)
@@ -226,7 +226,7 @@ class Settings(BaseSettings):
     CORS_HEADERS: list = Field(default=["*"])
     
     # Database
-    DATABASE_URL: str = Field(default="postgresql://postgres:postgres@localhost:5432/cogniflow")
+    DATABASE_URL: str = Field(default="postgresql://postgres:postgres@localhost:5432/anfinity")
     DATABASE_POOL_SIZE: int = 30  # Increased from 20 for concurrent load testing
     DATABASE_MAX_OVERFLOW: int = 20  # Increased from 10 for concurrent load testing
     
@@ -236,14 +236,14 @@ class Settings(BaseSettings):
     # Qdrant Vector DB
     QDRANT_URL: str = Field(default="http://localhost:6333")
     QDRANT_API_KEY: Optional[str] = None
-    QDRANT_COLLECTION_PREFIX: str = "cogniflow"
+    QDRANT_COLLECTION_PREFIX: str = "anfinity"
     QDRANT_REQUIRED: bool = Field(default=True)  # Fail-fast if Qdrant unavailable (set to False for development without Qdrant)
     
     # S3 Storage
     AWS_ACCESS_KEY_ID: str = Field(default="minioadmin")
     AWS_SECRET_ACCESS_KEY: str = Field(default="minioadmin")
     S3_ENDPOINT_URL: Optional[str] = Field(default="http://localhost:9000")
-    S3_BUCKET_NAME: str = Field(default="cogniflow")
+    S3_BUCKET_NAME: str = Field(default="anfinity")
     S3_REGION: str = Field(default="us-east-1")
     
     # LLM - Provider Selection (Primary)
@@ -315,6 +315,18 @@ class Settings(BaseSettings):
     GITHUB_CLIENT_ID: Optional[str] = None
     GITHUB_CLIENT_SECRET: Optional[str] = None
 
+    # Billing / Stripe
+    STRIPE_SECRET_KEY: Optional[str] = None
+    STRIPE_PUBLISHABLE_KEY: Optional[str] = None
+    STRIPE_WEBHOOK_SECRET: Optional[str] = None
+    STRIPE_PORTAL_RETURN_URL: str = Field(default="http://localhost:5173")
+    STRIPE_PRICE_ID_PRO_MONTHLY: Optional[str] = None
+    STRIPE_PRICE_ID_PRO_ANNUAL: Optional[str] = None
+    STRIPE_PRICE_ID_TEAM_MONTHLY: Optional[str] = None
+    STRIPE_PRICE_ID_TEAM_ANNUAL: Optional[str] = None
+    STRIPE_PRICE_ID_ENTERPRISE_MONTHLY: Optional[str] = None
+    STRIPE_PRICE_ID_ENTERPRISE_ANNUAL: Optional[str] = None
+
     # Competitive Intelligence
     COMPETITIVE_JINA_READER_BASE_URL: str = "https://r.jina.ai"
     COMPETITIVE_JINA_TIMEOUT_SECONDS: int = 20
@@ -338,8 +350,7 @@ class Settings(BaseSettings):
         "application/pdf",
         "text/plain",
         "text/markdown",
-        "text/html",
-        "application/xhtml+xml",
+        "text/x-markdown",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ])
     
