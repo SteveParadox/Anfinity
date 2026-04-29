@@ -6,14 +6,14 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/cogniflow
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/anfinity
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
       S3_ENDPOINT_URL: http://minio:9000
-      S3_BUCKET_NAME: cogniflow
+      S3_BUCKET_NAME: anfinity
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       COHERE_API_KEY: ${COHERE_API_KEY:-}
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
@@ -33,21 +33,21 @@ services:
       - ./app:/app/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
     networks:
-      - cogniflow
+      - anfinity
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/cogniflow
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/anfinity
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
       S3_ENDPOINT_URL: http://minio:9000
-      S3_BUCKET_NAME: cogniflow
+      S3_BUCKET_NAME: anfinity
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       COHERE_API_KEY: ${COHERE_API_KEY:-}
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
@@ -67,20 +67,20 @@ services:
       - ./app:/app/app
     command: celery -A app.tasks.worker worker --loglevel=info --concurrency=4
     networks:
-      - cogniflow
+      - anfinity
 
   beat:
     build:
       context: .
       dockerfile: Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/cogniflow
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/anfinity
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
       S3_ENDPOINT_URL: http://minio:9000
-      S3_BUCKET_NAME: cogniflow
+      S3_BUCKET_NAME: anfinity
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
     depends_on:
@@ -96,14 +96,14 @@ services:
       - ./app:/app/app
     command: celery -A app.tasks.worker beat --loglevel=info
     networks:
-      - cogniflow
+      - anfinity
 
   postgres:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: cogniflow
+      POSTGRES_DB: anfinity
     ports:
       - "5432:5432"
     volumes:
@@ -114,7 +114,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - cogniflow
+      - anfinity
 
   redis:
     image: redis:7-alpine
@@ -123,7 +123,7 @@ services:
     volumes:
       - redis_data:/data
     networks:
-      - cogniflow
+      - anfinity
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -135,7 +135,7 @@ services:
     environment:
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
     networks:
-      - cogniflow
+      - anfinity
 
   minio:
     image: minio/minio:latest
@@ -149,7 +149,7 @@ services:
       - minio_data:/data
     command: server /data --console-address ":9001"
     networks:
-      - cogniflow
+      - anfinity
 
   createbuckets:
     image: minio/mc:latest
@@ -163,7 +163,7 @@ services:
       exit 0;
       "
     networks:
-      - cogniflow
+      - anfinity
 
 volumes:
   postgres_data:
@@ -172,5 +172,5 @@ volumes:
   minio_data:
 
 networks:
-  cogniflow:
+  anfinity:
     driver: bridge

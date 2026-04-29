@@ -16,6 +16,7 @@ qdrant-client==1.17.1
 
 # Embeddings
 openai>=1.109.1,<2.0.0
+stripe==12.2.0
 ollama>=0.0.11  # Ollama fallback for LLM
 cohere==4.45
 sentence-transformers==2.2.2
