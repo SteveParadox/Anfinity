@@ -153,7 +153,7 @@ class OpenAIEmbedder(EmbeddingProvider):
                     ) from last_error
                 
                 logger.warning(
-                    "⚠️ OpenAI embedding quota/rate limit exceeded. "
+                    " OpenAI embedding quota/rate limit exceeded. "
                     "Attempting fallback to %s (dimension-compatible: %dD)...",
                     self._fallback_provider.model_name,
                     fallback_dim
@@ -315,7 +315,7 @@ class OllamaEmbedder(EmbeddingProvider):
                 headers=get_ollama_request_headers(include_content_type=False),
             )
             response.raise_for_status()
-            logger.info(f"✅ Ollama server is accessible at {self._base_url}")
+            logger.info(f" Ollama server is accessible at {self._base_url}")
         except Exception as e:
             error_msg = f"Cannot connect to Ollama server at {self._base_url}: {e}"
             logger.error(error_msg)
@@ -351,15 +351,15 @@ class OllamaEmbedder(EmbeddingProvider):
         except Exception as ollama_err:
             if self._fallback_provider:
                 logger.warning(
-                    f"⚠️ Ollama embedding failed. Attempting fallback to {self._fallback_provider.model_name}..."
+                    f" Ollama embedding failed. Attempting fallback to {self._fallback_provider.model_name}..."
                 )
                 try:
                     all_embeddings = self._fallback_provider.embed(texts)
                     self._actual_provider_used = "fallback"
-                    logger.info(f"✅ Successfully embedded using {self._fallback_provider.model_name}")
+                    logger.info(f" Successfully embedded using {self._fallback_provider.model_name}")
                     return all_embeddings
                 except Exception as fallback_err:
-                    logger.error(f"❌ Fallback embedding also failed: {fallback_err}")
+                    logger.error(f" Fallback embedding also failed: {fallback_err}")
                     raise RuntimeError(
                         f"Both Ollama and fallback embedding failed. "
                         f"Ollama: {ollama_err}. "
@@ -486,9 +486,9 @@ class Embedder:
             if settings.EMBEDDING_FALLBACK_ENABLED:
                 try:
                     fallback_provider = OllamaEmbedder()
-                    logger.info(f"✅ Ollama fallback initialized for embeddings ({fallback_provider.model_name})")
+                    logger.info(f" Ollama fallback initialized for embeddings ({fallback_provider.model_name})")
                 except Exception as e:
-                    logger.warning(f"⚠️  Ollama fallback unavailable: {e}. Will proceed without fallback.")
+                    logger.warning(f"  Ollama fallback unavailable: {e}. Will proceed without fallback.")
             
             return OpenAIEmbedder(fallback_provider=fallback_provider)
         elif self.provider_name == "cohere":
