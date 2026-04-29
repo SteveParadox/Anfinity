@@ -399,7 +399,7 @@ export function AIInsightsPanel({ insights, isOpen, onClose }: AIInsightsPanelPr
                   textTransform: 'uppercase', color: TT.inkMid,
                 }}
               >
-                Powered by <span style={{ color: TT.yolk }}>CogniFlow AI</span>
+                Powered by <span style={{ color: TT.yolk }}>Anfinity AI</span>
               </span>
               <span
                 style={{

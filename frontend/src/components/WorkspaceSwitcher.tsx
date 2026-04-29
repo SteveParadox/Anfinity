@@ -6,13 +6,15 @@ interface WorkspaceSwitcherProps {
 }
 
 const TT = {
-  inkBorder: '#252525',
-  inkMuted: '#5A5A5A',
-  inkSubtle: '#888888',
-  snow: '#F5F5F5',
-  yolk: '#F5E642',
-  inkDeep: '#111111',
-  inkRaised: '#1A1A1A',
+  inkBorder: 'var(--theme-border)',
+  inkMuted: 'var(--theme-text-muted)',
+  inkSubtle: 'var(--theme-text-subtle)',
+  snow: 'var(--theme-text)',
+  yolk: 'var(--theme-accent)',
+  inkDeep: 'var(--theme-panel)',
+  inkRaised: 'var(--theme-panel-raised)',
+  accentSoft: 'var(--theme-accent-soft)',
+  accentBorder: 'var(--theme-accent-border)',
   fontMono: "'IBM Plex Mono', monospace",
 };
 
@@ -42,8 +44,8 @@ export function WorkspaceSwitcher({ compact = false }: WorkspaceSwitcherProps) {
           width: compact ? 28 : 30,
           height: compact ? 28 : 30,
           borderRadius: 3,
-          background: 'rgba(245,230,66,0.08)',
-          border: '1px solid rgba(245,230,66,0.18)',
+          background: TT.accentSoft,
+          border: `1px solid ${TT.accentBorder}`,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',

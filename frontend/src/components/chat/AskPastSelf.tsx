@@ -1,8 +1,11 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { ArrowUp, BookOpenText, RotateCcw, Search, Sparkles, Square, X } from 'lucide-react';
 import { useAskPastSelf } from '../../hooks/useAskPastSelf';
 import type { RAGSource } from '../../hooks/useAskPastSelf';
+import { useProductSettings } from '../../hooks/useProductSettings';
+import { DESIGN_TOKENS } from '../../lib/theme';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -14,6 +17,34 @@ interface AskPastSelfProps {
   workspaceId: string;
   onClose?: () => void;
 }
+
+const TT = {
+  canvas: DESIGN_TOKENS.canvas,
+  panel: DESIGN_TOKENS.panel,
+  panelRaised: DESIGN_TOKENS.panelRaised,
+  border: DESIGN_TOKENS.border,
+  borderStrong: DESIGN_TOKENS.borderStrong,
+  text: DESIGN_TOKENS.text,
+  textMuted: DESIGN_TOKENS.textMuted,
+  textSubtle: DESIGN_TOKENS.textSubtle,
+  textInverse: DESIGN_TOKENS.textInverse,
+  accent: DESIGN_TOKENS.accent,
+  accentSoft: DESIGN_TOKENS.accentSoft,
+  accentBorder: DESIGN_TOKENS.accentBorder,
+  success: DESIGN_TOKENS.success,
+  warning: DESIGN_TOKENS.warning,
+  error: DESIGN_TOKENS.error,
+  shadow: DESIGN_TOKENS.shadow,
+  fontDisplay: DESIGN_TOKENS.fontDisplay,
+  fontMono: DESIGN_TOKENS.fontMono,
+  fontBody: DESIGN_TOKENS.fontBody,
+} as const;
+
+const EXAMPLE_QUESTIONS = [
+  'What did I learn about AI architecture?',
+  'Summarize my notes on semantic search',
+  'What are my thoughts on RAG systems?',
+];
 
 function formatDate(dateStr: string | undefined | null): string {
   if (!dateStr) return 'Unknown Date';
@@ -32,6 +63,20 @@ function formatDate(dateStr: string | undefined | null): string {
   }
 }
 
+function sourceSimilarityPercent(source: RAGSource): number {
+  return Math.max(
+    0,
+    Math.min(95, source.similarityPercent ?? Math.round((source.similarity || 0) * 100))
+  );
+}
+
+function isNotEnoughEvidenceMessage(content: string): boolean {
+  const normalized = content.toLowerCase();
+  return normalized.includes("couldn't find enough")
+    || normalized.includes('not enough reliable information')
+    || normalized.includes('not enough in your notes');
+}
+
 export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
   const {
     messages,
@@ -42,8 +87,15 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
     clearChat,
     cancelChat,
   } = useAskPastSelf(workspaceId);
+  const { user: userSettings, workspace: workspaceSettings } = useProductSettings(workspaceId);
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
+  const showSourceCards = Boolean(
+    userSettings?.settings.ai_search.show_source_cards ?? true
+  ) && Boolean(workspaceSettings?.settings.ai_search.source_cards_default ?? true);
+  const showSimilarity = Boolean(userSettings?.settings.ai_search.show_similarity_scores ?? true);
+  const defaultTopK = userSettings?.settings.ai_search.default_top_k ?? 6;
+  const similarityThreshold = workspaceSettings?.settings.ai_search.min_note_similarity ?? 0.46;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -54,7 +106,10 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
 
     const userMessage = input;
     setInput('');
-    await chat(userMessage, workspaceId);
+    await chat(userMessage, workspaceId, {
+      topK: defaultTopK,
+      similarityThreshold,
+    });
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -69,139 +124,492 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
   );
 
   return (
-    <div className='flex h-full flex-col bg-gray-950'>
-      <div className='bg-gradient-to-r from-indigo-600 to-purple-600 p-4 shadow-lg'>
-        <div className='flex items-center justify-between'>
-          <div>
-            <h2 className='text-xl font-bold text-white'>Ask Your Past Self</h2>
-            <p className='mt-1 text-sm text-indigo-100'>
-              Search your knowledge base with grounded AI answers
+    <div
+      style={{
+        display: 'flex',
+        height: '100%',
+        flexDirection: 'column',
+        background: TT.panel,
+        color: TT.text,
+      }}
+    >
+      <div
+        style={{
+          borderBottom: `1px solid ${TT.border}`,
+          background: `linear-gradient(135deg, ${TT.accentSoft} 0%, transparent 65%), ${TT.panel}`,
+          padding: '18px 18px 16px',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+          <div style={{ minWidth: 0 }}>
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 7,
+                marginBottom: 10,
+                border: `1px solid ${TT.accentBorder}`,
+                background: TT.accentSoft,
+                borderRadius: 999,
+                padding: '4px 9px',
+                fontFamily: TT.fontMono,
+                fontSize: 9,
+                letterSpacing: '0.08em',
+                textTransform: 'uppercase',
+                color: TT.accent,
+              }}
+            >
+              <Sparkles size={11} />
+              Grounded chat
+            </div>
+            <h2
+              id="chat-title"
+              style={{
+                margin: 0,
+                fontFamily: TT.fontDisplay,
+                fontSize: 30,
+                letterSpacing: '0.06em',
+                lineHeight: 1,
+                color: TT.text,
+              }}
+            >
+              Ask Your Past Self
+            </h2>
+            <p
+              style={{
+                margin: '8px 0 0',
+                fontFamily: TT.fontBody,
+                fontSize: 12.5,
+                lineHeight: 1.6,
+                color: TT.textMuted,
+                maxWidth: 360,
+              }}
+            >
+              Search your notes with grounded answers, visible evidence, and follow-up prompts that stay anchored to your workspace.
             </p>
           </div>
           {onClose && (
             <button
               onClick={onClose}
-              className='text-white transition hover:text-indigo-100'
-              aria-label='Close chat'
+              aria-label="Close chat"
+              style={{
+                width: 34,
+                height: 34,
+                borderRadius: 3,
+                border: `1px solid ${TT.border}`,
+                background: TT.panelRaised,
+                color: TT.textMuted,
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                transition: 'border-color 0.15s, color 0.15s, background 0.15s',
+                flexShrink: 0,
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = TT.accent;
+                e.currentTarget.style.color = TT.accent;
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = TT.border;
+                e.currentTarget.style.color = TT.textMuted;
+              }}
             >
-              <svg className='h-6 w-6' fill='none' stroke='currentColor' viewBox='0 0 24 24'>
-                <path
-                  strokeLinecap='round'
-                  strokeLinejoin='round'
-                  strokeWidth={2}
-                  d='M6 18L18 6M6 6l12 12'
-                />
-              </svg>
+              <X size={15} />
             </button>
           )}
         </div>
       </div>
 
-      <div className='flex-1 space-y-4 overflow-y-auto bg-gray-950 p-4'>
+      <div
+        style={{
+          flex: 1,
+          overflowY: 'auto',
+          background: `linear-gradient(180deg, transparent 0%, ${TT.canvas} 100%)`,
+          padding: 18,
+        }}
+      >
         {visibleMessages.length === 0 && !loading && (
-          <div className='flex h-full items-center justify-center'>
-            <div className='max-w-md text-center'>
-              <div className='mb-4 text-5xl'>Thoughts</div>
-              <h3 className='mb-2 text-2xl font-bold text-gray-100'>
-                Chat with Your Knowledge Base
+          <div
+            style={{
+              display: 'flex',
+              minHeight: '100%',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <div
+              style={{
+                width: '100%',
+                maxWidth: 420,
+                border: `1px solid ${TT.border}`,
+                background: TT.panelRaised,
+                borderRadius: 6,
+                padding: 22,
+                boxShadow: TT.shadow,
+              }}
+            >
+              <div
+                style={{
+                  display: 'inline-flex',
+                  width: 46,
+                  height: 46,
+                  marginBottom: 14,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  borderRadius: 4,
+                  background: TT.accentSoft,
+                  border: `1px solid ${TT.accentBorder}`,
+                  color: TT.accent,
+                }}
+              >
+                <BookOpenText size={20} />
+              </div>
+              <h3
+                style={{
+                  margin: 0,
+                  fontFamily: TT.fontDisplay,
+                  fontSize: 24,
+                  letterSpacing: '0.06em',
+                  color: TT.text,
+                }}
+              >
+                Search Your Notes
               </h3>
-              <p className='text-gray-400'>
-                Ask questions about your notes and documents. Every answer is grounded in your
-                own stored context.
+              <p
+                style={{
+                  margin: '8px 0 0',
+                  fontFamily: TT.fontBody,
+                  fontSize: 12.5,
+                  lineHeight: 1.7,
+                  color: TT.textMuted,
+                }}
+              >
+                Ask questions your notes can actually support. Replies stay grounded in retrieved note evidence instead of drifting into generic chat.
               </p>
-              <div className='mt-6 border-t border-gray-800 pt-6'>
-                <p className='mb-3 text-sm text-gray-500'>Example questions:</p>
-                <div className='space-y-2'>
-                  {[
-                    'What did I learn about AI architecture?',
-                    'Summarize my notes on semantic search',
-                    'What are my thoughts on RAG systems?',
-                  ].map((example) => (
-                    <button
-                      key={example}
-                      onClick={() => setInput(example)}
-                      className='block w-full rounded-lg bg-gray-800 p-2 text-left text-sm text-gray-300 transition hover:bg-gray-700 hover:text-gray-100'
-                    >
-                      "{example}"
-                    </button>
-                  ))}
+              <div
+                style={{
+                  display: 'grid',
+                  gap: 8,
+                  marginTop: 18,
+                  paddingTop: 16,
+                  borderTop: `1px solid ${TT.border}`,
+                }}
+              >
+                <div
+                  style={{
+                    fontFamily: TT.fontMono,
+                    fontSize: 9.5,
+                    letterSpacing: '0.07em',
+                    textTransform: 'uppercase',
+                    color: TT.textSubtle,
+                  }}
+                >
+                  Example prompts
                 </div>
+                {EXAMPLE_QUESTIONS.map((example) => (
+                  <button
+                    key={example}
+                    onClick={() => setInput(example)}
+                    style={{
+                      width: '100%',
+                      borderRadius: 4,
+                      border: `1px solid ${TT.border}`,
+                      background: TT.panel,
+                      padding: '10px 12px',
+                      textAlign: 'left',
+                      fontFamily: TT.fontBody,
+                      fontSize: 12,
+                      color: TT.textMuted,
+                      cursor: 'pointer',
+                      transition: 'border-color 0.15s, color 0.15s, transform 0.15s',
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = TT.accent;
+                      e.currentTarget.style.color = TT.text;
+                      e.currentTarget.style.transform = 'translateY(-1px)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = TT.border;
+                      e.currentTarget.style.color = TT.textMuted;
+                      e.currentTarget.style.transform = 'translateY(0)';
+                    }}
+                  >
+                    “{example}”
+                  </button>
+                ))}
               </div>
             </div>
           </div>
         )}
 
-        {visibleMessages.map((message: Message, index: number) => (
-          <div
-            key={`${message.role}-${index}`}
-            className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-          >
+        {visibleMessages.map((message: Message, index: number) => {
+          const isUser = message.role === 'user';
+          const needsWarningTone = !isUser && isNotEnoughEvidenceMessage(message.content);
+
+          return (
             <div
-              className={`max-w-2xl rounded-2xl p-4 ${
-                message.role === 'user'
-                  ? 'bg-indigo-600 text-white'
-                  : 'bg-gray-800 text-gray-100'
-              }`}
+              key={`${message.role}-${index}`}
+              style={{
+                display: 'flex',
+                justifyContent: isUser ? 'flex-end' : 'flex-start',
+                marginBottom: 14,
+              }}
             >
-              <p className='whitespace-pre-wrap text-sm leading-relaxed'>{message.content}</p>
-
-              {message.sources && message.sources.length > 0 && (
-                <div className='mt-4 space-y-3 border-t border-gray-700 pt-4'>
-                  <p className='text-xs font-semibold uppercase tracking-wider text-gray-400'>
-                    From your notes
-                  </p>
-
-                  {message.sources.map((source: RAGSource, sourceIndex: number) => (
-                    <div key={sourceIndex} className='space-y-2 rounded-lg bg-gray-700 p-3'>
-                      <div className='flex items-start justify-between gap-2'>
-                        <a
-                          href={`/app/notes/${source.noteId}`}
-                          className='line-clamp-2 text-sm font-medium text-indigo-300 transition hover:text-indigo-200'
-                          title={source.title}
-                        >
-                          {source.title}
-                        </a>
-                        <span className='ml-2 whitespace-nowrap text-xs text-gray-400'>
-                          {formatDate(source.createdAt)}
-                        </span>
-                      </div>
-
-                      <p className='line-clamp-3 text-xs text-gray-400'>{source.excerpt}</p>
-
-                      <div className='space-y-1'>
-                        <div className='h-2 overflow-hidden rounded-full bg-gray-600'>
-                          <div
-                            className='h-2 rounded-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all'
-                            style={{ width: `${Math.round(source.similarity * 100)}%` }}
-                          />
-                        </div>
-                        <p className='text-xs text-gray-500'>
-                          {Math.round(source.similarity * 100)}% relevance match
-                        </p>
-                      </div>
-                    </div>
-                  ))}
+              <div
+                style={{
+                  width: '100%',
+                  maxWidth: 430,
+                  borderRadius: 6,
+                  border: `1px solid ${isUser ? TT.accentBorder : needsWarningTone ? TT.accentBorder : TT.border}`,
+                  background: isUser ? TT.accentSoft : TT.panelRaised,
+                  padding: 14,
+                  boxShadow: isUser ? 'none' : TT.shadow,
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    marginBottom: 8,
+                    fontFamily: TT.fontMono,
+                    fontSize: 9,
+                    letterSpacing: '0.07em',
+                    textTransform: 'uppercase',
+                    color: isUser ? TT.accent : TT.textSubtle,
+                  }}
+                >
+                  {isUser ? <ArrowUp size={11} /> : <Search size={11} />}
+                  {isUser ? 'You asked' : 'Retrieved answer'}
                 </div>
-              )}
+                <p
+                  style={{
+                    margin: 0,
+                    whiteSpace: 'pre-wrap',
+                    fontFamily: TT.fontBody,
+                    fontSize: 13,
+                    lineHeight: 1.7,
+                    color: needsWarningTone ? TT.warning : TT.text,
+                  }}
+                >
+                  {message.content}
+                </p>
+
+                {showSourceCards && message.sources && message.sources.length > 0 && (
+                  <div
+                    style={{
+                      display: 'grid',
+                      gap: 10,
+                      marginTop: 14,
+                      paddingTop: 14,
+                      borderTop: `1px solid ${TT.border}`,
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontFamily: TT.fontMono,
+                        fontSize: 9,
+                        letterSpacing: '0.07em',
+                        textTransform: 'uppercase',
+                        color: TT.textSubtle,
+                      }}
+                    >
+                      Source evidence
+                    </div>
+
+                    {message.sources.map((source: RAGSource, sourceIndex: number) => {
+                      const percent = sourceSimilarityPercent(source);
+                      return (
+                        <div
+                          key={source.sourceId || source.chunkId || sourceIndex}
+                          style={{
+                            borderRadius: 4,
+                            border: `1px solid ${TT.border}`,
+                            background: TT.panel,
+                            padding: 12,
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10, marginBottom: 6 }}>
+                            <a
+                              href={`/app/notes/${source.noteId}`}
+                              title={source.title}
+                              style={{
+                                color: TT.text,
+                                textDecoration: 'none',
+                                fontFamily: TT.fontMono,
+                                fontSize: 11,
+                                lineHeight: 1.5,
+                                flex: 1,
+                              }}
+                            >
+                              {source.title}
+                            </a>
+                            <span
+                              style={{
+                                whiteSpace: 'nowrap',
+                                fontFamily: TT.fontMono,
+                                fontSize: 9,
+                                color: TT.textSubtle,
+                              }}
+                            >
+                              {formatDate(source.createdAt)}
+                            </span>
+                          </div>
+
+                          <p
+                            style={{
+                              margin: 0,
+                              fontFamily: TT.fontBody,
+                              fontSize: 11.5,
+                              lineHeight: 1.6,
+                              color: TT.textMuted,
+                            }}
+                          >
+                            {source.excerpt}
+                          </p>
+
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+                            {source.citation && (
+                              <span
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: 5,
+                                  borderRadius: 999,
+                                  border: `1px solid ${TT.border}`,
+                                  background: TT.panelRaised,
+                                  padding: '3px 8px',
+                                  fontFamily: TT.fontMono,
+                                  fontSize: 8.5,
+                                  letterSpacing: '0.05em',
+                                  textTransform: 'uppercase',
+                                  color: TT.textMuted,
+                                }}
+                              >
+                                <BookOpenText size={10} />
+                                {source.citation}
+                              </span>
+                            )}
+                            {typeof source.chunkIndex === 'number' && (
+                              <span
+                                style={{
+                                  borderRadius: 999,
+                                  border: `1px solid ${TT.border}`,
+                                  background: TT.panelRaised,
+                                  padding: '3px 8px',
+                                  fontFamily: TT.fontMono,
+                                  fontSize: 8.5,
+                                  letterSpacing: '0.05em',
+                                  textTransform: 'uppercase',
+                                  color: TT.textMuted,
+                                }}
+                              >
+                                Chunk {source.chunkIndex + 1}
+                              </span>
+                            )}
+                            {source.supportLevel && (
+                              <span
+                                style={{
+                                  borderRadius: 999,
+                                  border: `1px solid ${source.supportLevel === 'supported' ? TT.accentBorder : TT.borderStrong}`,
+                                  background: source.supportLevel === 'supported' ? TT.accentSoft : TT.panelRaised,
+                                  padding: '3px 8px',
+                                  fontFamily: TT.fontMono,
+                                  fontSize: 8.5,
+                                  letterSpacing: '0.05em',
+                                  textTransform: 'uppercase',
+                                  color: source.supportLevel === 'supported' ? TT.accent : TT.textMuted,
+                                }}
+                              >
+                                {source.supportLevel}
+                              </span>
+                            )}
+                          </div>
+
+                          {showSimilarity && (
+                            <div style={{ marginTop: 10 }}>
+                              <div
+                                style={{
+                                  height: 6,
+                                  overflow: 'hidden',
+                                  borderRadius: 999,
+                                  background: TT.panelRaised,
+                                  border: `1px solid ${TT.border}`,
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    height: '100%',
+                                    width: `${percent}%`,
+                                    background: `linear-gradient(90deg, ${TT.accent} 0%, ${TT.success} 100%)`,
+                                    borderRadius: 999,
+                                    transition: 'width 0.25s ease',
+                                  }}
+                                />
+                              </div>
+                              <div
+                                style={{
+                                  marginTop: 6,
+                                  fontFamily: TT.fontMono,
+                                  fontSize: 9,
+                                  color: TT.textSubtle,
+                                }}
+                              >
+                                {percent}% note evidence match
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
 
         {loading && streamingSources.length > 0 && (
-          <div className='flex justify-start'>
-            <div className='max-w-2xl space-y-3 rounded-2xl bg-gray-800 p-4'>
-              <div className='text-sm font-medium text-gray-400'>
-                Searching your knowledge base...
+          <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 14 }}>
+            <div
+              style={{
+                width: '100%',
+                maxWidth: 430,
+                borderRadius: 6,
+                border: `1px solid ${TT.border}`,
+                background: TT.panelRaised,
+                padding: 14,
+              }}
+            >
+              <div
+                style={{
+                  marginBottom: 10,
+                  fontFamily: TT.fontMono,
+                  fontSize: 10,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase',
+                  color: TT.textSubtle,
+                }}
+              >
+                Searching your notes...
               </div>
 
               {streamingSources.map((source: RAGSource, index: number) => (
-                <div key={index} className='animate-pulse rounded-lg bg-gray-700 p-3 opacity-70'>
-                  <div className='mb-2 flex items-start justify-between gap-2'>
-                    <div className='h-4 w-2/3 rounded bg-gray-600' />
-                    <div className='h-4 w-20 rounded bg-gray-600' />
-                  </div>
-                  <div className='mb-1 h-3 w-full rounded bg-gray-600' />
-                  <div className='h-3 w-4/5 rounded bg-gray-600' />
+                <div
+                  key={source.sourceId || source.chunkId || index}
+                  style={{
+                    borderRadius: 4,
+                    border: `1px solid ${TT.border}`,
+                    background: TT.panel,
+                    padding: 12,
+                    opacity: 0.78,
+                    marginTop: index === 0 ? 0 : 10,
+                  }}
+                >
+                  <div style={{ width: '68%', height: 12, borderRadius: 999, background: TT.borderStrong, marginBottom: 8 }} />
+                  <div style={{ width: '100%', height: 10, borderRadius: 999, background: TT.border, marginBottom: 6 }} />
+                  <div style={{ width: '82%', height: 10, borderRadius: 999, background: TT.border }} />
                 </div>
               ))}
             </div>
@@ -209,29 +617,80 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
         )}
 
         {loading && streamingSources.length === 0 && (
-          <div className='flex justify-start'>
-            <div className='rounded-2xl bg-gray-800 p-4 text-sm text-gray-400 animate-pulse'>
-              Thinking about your knowledge base...
+          <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 14 }}>
+            <div
+              style={{
+                borderRadius: 6,
+                border: `1px solid ${TT.border}`,
+                background: TT.panelRaised,
+                padding: '12px 14px',
+                fontFamily: TT.fontMono,
+                fontSize: 10,
+                letterSpacing: '0.06em',
+                textTransform: 'uppercase',
+                color: TT.textSubtle,
+              }}
+            >
+              Checking your notes...
             </div>
           </div>
         )}
 
         {!loading && followUpQuestions.length > 0 && (
-          <div className='flex justify-start'>
-            <div className='max-w-2xl rounded-2xl bg-gray-800 p-4'>
-              <p className='mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400'>
+          <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 14 }}>
+            <div
+              style={{
+                width: '100%',
+                maxWidth: 430,
+                borderRadius: 6,
+                border: `1px solid ${TT.border}`,
+                background: TT.panelRaised,
+                padding: 14,
+              }}
+            >
+              <div
+                style={{
+                  marginBottom: 10,
+                  fontFamily: TT.fontMono,
+                  fontSize: 9,
+                  letterSpacing: '0.07em',
+                  textTransform: 'uppercase',
+                  color: TT.textSubtle,
+                }}
+              >
                 Suggested follow-ups
-              </p>
-              <div className='flex flex-wrap gap-2'>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                 {followUpQuestions.map((question, index) => (
                   <button
                     key={`${question}-${index}`}
                     onClick={() => {
                       if (!workspaceId) return;
                       setInput('');
-                      void chat(question, workspaceId);
+                      void chat(question, workspaceId, {
+                        topK: defaultTopK,
+                        similarityThreshold,
+                      });
                     }}
-                    className='rounded-full bg-gray-700 px-3 py-2 text-sm text-gray-200 transition hover:bg-gray-600'
+                    style={{
+                      borderRadius: 999,
+                      border: `1px solid ${TT.border}`,
+                      background: TT.panel,
+                      padding: '8px 12px',
+                      fontFamily: TT.fontBody,
+                      fontSize: 11.5,
+                      color: TT.textMuted,
+                      cursor: 'pointer',
+                      transition: 'border-color 0.15s, color 0.15s',
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = TT.accent;
+                      e.currentTarget.style.color = TT.text;
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = TT.border;
+                      e.currentTarget.style.color = TT.textMuted;
+                    }}
                   >
                     {question}
                   </button>
@@ -244,49 +703,102 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
         <div ref={bottomRef} />
       </div>
 
-      <div className='border-t border-gray-800 bg-gray-900 p-4'>
-        <div className='flex gap-2'>
+      <div
+        style={{
+          borderTop: `1px solid ${TT.border}`,
+          background: TT.panel,
+          padding: 16,
+        }}
+      >
+        <div style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
           <textarea
-            className='flex-1 resize-none rounded-xl border border-gray-700 bg-gray-800 px-4 py-3 text-sm text-white outline-none transition hover:border-gray-600 focus:ring-2 focus:ring-indigo-500'
-            placeholder='Ask anything about your past notes... (Shift+Enter for new line)'
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             rows={3}
             disabled={loading}
+            placeholder="Ask about your notes, decisions, research, or past ideas..."
+            style={{
+              flex: 1,
+              resize: 'none',
+              borderRadius: 6,
+              border: `1px solid ${TT.border}`,
+              background: TT.panelRaised,
+              padding: '12px 14px',
+              color: TT.text,
+              outline: 'none',
+              fontFamily: TT.fontBody,
+              fontSize: 13,
+              lineHeight: 1.6,
+              boxSizing: 'border-box',
+            }}
           />
-          <div className='flex flex-col gap-2'>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 112 }}>
             <button
               onClick={loading ? cancelChat : handleSendMessage}
-            disabled={!workspaceId || (!loading && !input.trim())}
-              className='flex h-full items-center gap-2 whitespace-nowrap rounded-xl bg-indigo-600 px-6 py-3 font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50'
+              disabled={!workspaceId || (!loading && !input.trim())}
+              style={{
+                flex: 1,
+                minHeight: 46,
+                borderRadius: 6,
+                border: `1px solid ${loading ? TT.error : TT.accent}`,
+                background: loading ? 'rgba(217,45,32,0.08)' : TT.accent,
+                color: loading ? TT.error : TT.textInverse,
+                cursor: !workspaceId || (!loading && !input.trim()) ? 'not-allowed' : 'pointer',
+                opacity: !workspaceId || (!loading && !input.trim()) ? 0.5 : 1,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 8,
+                fontFamily: TT.fontMono,
+                fontSize: 10,
+                letterSpacing: '0.08em',
+                textTransform: 'uppercase',
+                transition: 'transform 0.15s ease, filter 0.15s ease',
+              }}
+              onMouseEnter={(e) => {
+                if (!e.currentTarget.disabled) {
+                  e.currentTarget.style.transform = 'translateY(-1px)';
+                  e.currentTarget.style.filter = 'brightness(1.03)';
+                }
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.transform = 'translateY(0)';
+                e.currentTarget.style.filter = 'none';
+              }}
             >
-              <span>{loading ? 'Stop' : 'Ask'}</span>
+              {loading ? <Square size={12} /> : <ArrowUp size={12} />}
+              {loading ? 'Stop' : 'Ask'}
             </button>
             {messages.length > 0 && (
               <button
                 onClick={clearChat}
                 disabled={loading}
-                className='rounded-xl bg-gray-700 px-4 py-2 text-sm text-gray-200 transition hover:bg-gray-600 disabled:opacity-50'
-                title='Clear chat history'
+                title="Clear chat history"
+                style={{
+                  minHeight: 38,
+                  borderRadius: 6,
+                  border: `1px solid ${TT.border}`,
+                  background: TT.panelRaised,
+                  color: TT.textMuted,
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                  opacity: loading ? 0.5 : 1,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 7,
+                  fontFamily: TT.fontMono,
+                  fontSize: 9.5,
+                  letterSpacing: '0.07em',
+                  textTransform: 'uppercase',
+                }}
               >
+                <RotateCcw size={11} />
                 Clear
               </button>
             )}
           </div>
         </div>
-
-        {messages.length === 0 && (
-          <div className='mt-3 rounded-lg bg-gray-800 p-3 text-xs text-gray-400'>
-            <p className='mb-1 font-semibold text-gray-300'>Tips:</p>
-            <ul className='list-inside list-disc space-y-1'>
-              <li>Ask complex questions spanning multiple notes</li>
-              <li>Every answer is grounded in your personal knowledge</li>
-              <li>Click on sources to view the original notes</li>
-              <li>Use natural language without special syntax</li>
-            </ul>
-          </div>
-        )}
       </div>
     </div>
   );

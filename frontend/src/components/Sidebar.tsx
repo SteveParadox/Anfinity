@@ -39,21 +39,22 @@ const navigation = [
   { id: 'search',      label: 'AI Search',         icon: Search, ai: true },
   { id: 'thinking-sessions', label: 'Thinking Sessions', icon: Brain, ai: true },
   { id: 'workspaces',  label: 'Workspaces',        icon: Users           },
+  { id: 'settings',    label: 'Settings',          icon: Settings        },
   { id: 'integrations', label: 'Integrations',      icon: PlugZap         },
   { id: 'workflows',   label: 'Workflows',         icon: Zap             },
   { id: 'pricing',     label: 'Pricing',           icon: CreditCard      },
 ];
 
 const TT = {
-  inkBlack:  '#0A0A0A',
-  inkDeep:   '#111111',
-  inkRaised: '#1A1A1A',
-  inkBorder: '#252525',
-  inkMid:    '#3A3A3A',
-  inkMuted:  '#5A5A5A',
-  inkSubtle: '#888888',
-  snow:      '#F5F5F5',
-  yolk:      '#F5E642',
+  inkBlack:  'var(--theme-canvas)',
+  inkDeep:   'var(--theme-panel)',
+  inkRaised: 'var(--theme-panel-raised)',
+  inkBorder: 'var(--theme-border)',
+  inkMid:    'var(--theme-border-strong)',
+  inkMuted:  'var(--theme-text-muted)',
+  inkSubtle: 'var(--theme-text-subtle)',
+  snow:      'var(--theme-text)',
+  yolk:      'var(--theme-accent)',
   yolkBright:'#FFF176',
   fontDisplay: "'Bebas Neue', 'Arial Narrow', sans-serif",
   fontMono:    "'IBM Plex Mono', monospace",
@@ -126,7 +127,7 @@ export function Sidebar({
                 lineHeight: 1,
               }}
             >
-              <span style={{ color: TT.yolk }}>C</span>OGNI
+              <span style={{ color: TT.yolk }}>AN</span>FINITY
             </span>
           )}
         </div>
@@ -402,11 +403,12 @@ export function Sidebar({
             <div style={{ display: 'flex', gap: 2 }}>
               {[
                 { Icon: Settings, title: 'Settings' },
-                { Icon: LogOut,   title: 'Log out'  },
+                { Icon: LogOut,   title: 'Log out' },
               ].map(({ Icon, title }) => (
                 <button
                   key={title}
                   title={title}
+                  onClick={title === 'Settings' ? () => onViewChange('settings') : undefined}
                   style={{
                     background: 'none', border: 'none', cursor: 'pointer',
                     color: TT.inkMuted, padding: 4, borderRadius: 2,

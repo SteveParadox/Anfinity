@@ -12,6 +12,8 @@ type CollaborativeNoteEditorProps = {
   token: string | null;
   user: CollaboratorIdentity;
   editable: boolean;
+  showPresence?: boolean;
+  showCollaboratorCursors?: boolean;
   onPlainTextChange?: (content: string) => void;
 };
 
@@ -22,7 +24,7 @@ function getEditorText(editor: Editor): string {
 function renderRemoteCursor(user: Record<string, unknown>): HTMLElement {
   const cursor = document.createElement("span");
   const label = document.createElement("div");
-  const color = typeof user.color === "string" ? user.color : "#F5E642";
+  const color = typeof user.color === "string" ? user.color : "var(--theme-accent)";
   const name = typeof user.name === "string" ? user.name : "Collaborator";
 
   cursor.className = "anfinity-collaboration-cursor";
@@ -37,7 +39,7 @@ function renderRemoteCursor(user: Record<string, unknown>): HTMLElement {
 }
 
 function renderRemoteSelection(user: Record<string, unknown>) {
-  const color = typeof user.color === "string" ? user.color : "#F5E642";
+  const color = typeof user.color === "string" ? user.color : "var(--theme-accent)";
 
   return {
     class: "anfinity-collaboration-selection",
@@ -73,6 +75,8 @@ export function CollaborativeNoteEditor({
   token,
   user,
   editable,
+  showPresence = true,
+  showCollaboratorCursors = true,
   onPlainTextChange,
 }: CollaborativeNoteEditorProps) {
   const onPlainTextChangeRef = useRef(onPlainTextChange);
@@ -135,12 +139,16 @@ export function CollaborativeNoteEditor({
               Collaboration.configure({
                 document: session.doc,
               }),
-              CollaborationCursor.configure({
-                provider: session.provider,
-                user: localUser,
-                render: renderRemoteCursor,
-                selectionRender: renderRemoteSelection,
-              }),
+              ...(showCollaboratorCursors
+                ? [
+                    CollaborationCursor.configure({
+                      provider: session.provider,
+                      user: localUser,
+                      render: renderRemoteCursor,
+                      selectionRender: renderRemoteSelection,
+                    }),
+                  ]
+                : []),
             ]
           : []),
       ],
@@ -202,6 +210,7 @@ export function CollaborativeNoteEditor({
       localUser.email,
       localUser.name,
       localUser.userId,
+      showCollaboratorCursors,
     ],
   );
 
@@ -224,8 +233,8 @@ export function CollaborativeNoteEditor({
   return (
     <div
       style={{
-        background: "#1A1A1A",
-        border: "1px solid #252525",
+        background: "var(--theme-panel-raised)",
+        border: "1px solid var(--theme-border)",
         borderRadius: 3,
         overflow: "hidden",
       }}
@@ -237,8 +246,8 @@ export function CollaborativeNoteEditor({
           justifyContent: "space-between",
           gap: 12,
           padding: "10px 12px",
-          borderBottom: "1px solid #252525",
-          background: "rgba(245,230,66,0.03)",
+          borderBottom: "1px solid var(--theme-border)",
+          background: "var(--theme-accent-soft)",
           flexWrap: "wrap",
         }}
       >
@@ -252,7 +261,7 @@ export function CollaborativeNoteEditor({
               fontSize: 10,
               letterSpacing: "0.08em",
               textTransform: "uppercase",
-              color: session.lastError ? "#FF4545" : "#888888",
+              color: session.lastError ? "var(--theme-error)" : "var(--theme-text-subtle)",
             }}
           >
             <span
@@ -264,8 +273,8 @@ export function CollaborativeNoteEditor({
                   session.status === "connected" && session.isSynced
                     ? "#34D399"
                     : session.lastError
-                      ? "#FF4545"
-                      : "#F5E642",
+                      ? "var(--theme-error)"
+                      : "var(--theme-accent)",
                 boxShadow:
                   session.status === "connected" && session.isSynced
                     ? "0 0 8px rgba(52,211,153,0.5)"
@@ -277,97 +286,114 @@ export function CollaborativeNoteEditor({
             <span>{statusLabel}</span>
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            {session.collaborators.map((collaborator) => (
-              <div
-                key={collaborator.userId}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 6,
-                  padding: "4px 7px",
-                  borderRadius: 999,
-                  border: "1px solid #252525",
-                  background: "rgba(255,255,255,0.02)",
-                  maxWidth: "100%",
-                }}
-              >
-                <span
-                  style={{
-                    width: 8,
-                    height: 8,
-                    borderRadius: "50%",
-                    background: collaborator.color,
-                    flexShrink: 0,
-                  }}
-                />
-                <span
-                  style={{
-                    fontFamily: "'IBM Plex Mono', monospace",
-                    fontSize: 10,
-                    color: "#F5F5F5",
-                    letterSpacing: "0.03em",
-                  }}
-                >
-                  {collaborator.userId === user.userId ? "You" : collaborator.name}
-                </span>
-                {!collaborator.canUpdate && (
+          {showPresence ? (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                {session.collaborators.map((collaborator) => (
+                  <div
+                    key={collaborator.userId}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "4px 7px",
+                      borderRadius: 999,
+                      border: "1px solid var(--theme-border)",
+                      background: "rgba(255,255,255,0.02)",
+                      maxWidth: "100%",
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: "50%",
+                        background: collaborator.color,
+                        flexShrink: 0,
+                      }}
+                    />
+                    <span
+                      style={{
+                        fontFamily: "'IBM Plex Mono', monospace",
+                        fontSize: 10,
+                        color: "var(--theme-text)",
+                        letterSpacing: "0.03em",
+                      }}
+                    >
+                      {collaborator.userId === user.userId ? "You" : collaborator.name}
+                    </span>
+                    {!collaborator.canUpdate && (
+                      <span
+                        style={{
+                          fontFamily: "'IBM Plex Mono', monospace",
+                          fontSize: 9,
+                          textTransform: "uppercase",
+                          letterSpacing: "0.05em",
+                          color: "var(--theme-text-subtle)",
+                        }}
+                      >
+                        View
+                      </span>
+                    )}
+                    {collaborator.connectionCount > 1 && (
+                      <span
+                        style={{
+                          fontFamily: "'IBM Plex Mono', monospace",
+                          fontSize: 9,
+                          textTransform: "uppercase",
+                          letterSpacing: "0.05em",
+                          color: "var(--theme-text-subtle)",
+                        }}
+                      >
+                        ×{collaborator.connectionCount}
+                      </span>
+                    )}
+                  </div>
+                ))}
+                {session.collaborators.length <= 1 && (
                   <span
                     style={{
                       fontFamily: "'IBM Plex Mono', monospace",
-                      fontSize: 9,
+                      fontSize: 10,
+                      color: "var(--theme-text-subtle)",
+                      letterSpacing: "0.04em",
                       textTransform: "uppercase",
-                      letterSpacing: "0.05em",
-                      color: "#888888",
                     }}
                   >
-                    View
-                  </span>
-                )}
-                {collaborator.connectionCount > 1 && (
-                  <span
-                    style={{
-                      fontFamily: "'IBM Plex Mono', monospace",
-                      fontSize: 9,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.05em",
-                      color: "#888888",
-                    }}
-                  >
-                    ×{collaborator.connectionCount}
+                    Just you in this note
                   </span>
                 )}
               </div>
-            ))}
-            {session.collaborators.length <= 1 && (
-              <span
+
+              <div
                 style={{
+                  minHeight: 16,
                   fontFamily: "'IBM Plex Mono', monospace",
                   fontSize: 10,
-                  color: "#888888",
+                  color: remoteTypingUsers.length > 0 ? "var(--theme-accent)" : "var(--theme-text-muted)",
                   letterSpacing: "0.04em",
                   textTransform: "uppercase",
                 }}
               >
-                Just you in this note
-              </span>
-            )}
-          </div>
-
-          <div
-            style={{
-              minHeight: 16,
-              fontFamily: "'IBM Plex Mono', monospace",
-              fontSize: 10,
-              color: remoteTypingUsers.length > 0 ? "#F5E642" : "#5A5A5A",
-              letterSpacing: "0.04em",
-              textTransform: "uppercase",
-            }}
-          >
-            {remoteTypingUsers.length > 0
-              ? `${remoteTypingUsers.map((collaborator) => collaborator.name).join(", ")} typing`
-              : "No active typing signals"}
-          </div>
+                {remoteTypingUsers.length > 0
+                  ? `${remoteTypingUsers.map((collaborator) => collaborator.name).join(", ")} typing`
+                  : "No active typing signals"}
+              </div>
+            </>
+          ) : (
+            <div
+              style={{
+                minHeight: 16,
+                fontFamily: "'IBM Plex Mono', monospace",
+                fontSize: 10,
+                color: "var(--theme-text-muted)",
+                letterSpacing: "0.04em",
+                textTransform: "uppercase",
+              }}
+            >
+              Presence indicators hidden by your collaboration settings
+            </div>
+          )}
         </div>
         <span
           style={{
@@ -375,7 +401,7 @@ export function CollaborativeNoteEditor({
             fontSize: 10,
             letterSpacing: "0.06em",
             textTransform: "uppercase",
-            color: editable ? "#F5E642" : "#888888",
+            color: editable ? "var(--theme-accent)" : "var(--theme-text-subtle)",
           }}
         >
           {editable ? "Editable" : "Read only"}
@@ -389,7 +415,7 @@ export function CollaborativeNoteEditor({
           style={{
             minHeight: 240,
             padding: "14px 16px",
-            color: "#888888",
+            color: "var(--theme-text-subtle)",
             fontFamily: "'IBM Plex Sans', sans-serif",
             fontSize: 13,
             lineHeight: 1.7,

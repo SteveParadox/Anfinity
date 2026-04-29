@@ -6,6 +6,7 @@ type NoteInvitePanelProps = {
   noteId: string;
   noteTitle: string;
   canManage: boolean;
+  enabled?: boolean;
 };
 
 const TT = {
@@ -37,7 +38,7 @@ function formatInviteStatus(invite: NoteInvite): string {
   return `Expires ${invite.expiresAt.toLocaleString()}`;
 }
 
-export function NoteInvitePanel({ noteId, noteTitle, canManage }: NoteInvitePanelProps) {
+export function NoteInvitePanel({ noteId, noteTitle, canManage, enabled = true }: NoteInvitePanelProps) {
   const [inviteeEmail, setInviteeEmail] = useState('');
   const [role, setRole] = useState<'viewer' | 'editor'>('editor');
   const [invites, setInvites] = useState<NoteInvite[]>([]);
@@ -136,7 +137,7 @@ export function NoteInvitePanel({ noteId, noteTitle, canManage }: NoteInvitePane
     }
   };
 
-  if (!canManage) {
+  if (!canManage || !enabled) {
     return null;
   }
 

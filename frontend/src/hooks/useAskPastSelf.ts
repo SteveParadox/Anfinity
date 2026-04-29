@@ -2,19 +2,29 @@ import React from 'react';
 import { api } from '../lib/api';
 
 export interface RAGSource {
+  sourceId?: string;
   noteId: string;
   title: string;
   excerpt: string;
   createdAt: string;
   similarity: number;
+  similarityPercent?: number;
+  citation?: string;
+  chunkId?: string;
+  chunkIndex?: number;
+  supportLevel?: 'supported' | 'partial';
 }
 
 export interface ChatStreamMessage {
-  type: 'sources' | 'token' | 'done' | 'error';
+  type: 'start' | 'sources' | 'token' | 'done' | 'error';
   sources?: RAGSource[];
   text?: string;
   followUpQuestions?: string[];
   message?: string;
+  confidence?: 'high' | 'medium' | 'low' | 'not_found';
+  answerStatus?: 'supported' | 'partial' | 'refusal';
+  correlationId?: string;
+  status?: string;
 }
 
 export interface ChatMessage {
@@ -37,7 +47,7 @@ type ChatStateMessage = {
   sources?: RAGSource[];
 };
 
-function parseSseEvents(buffer: string): {
+export function parseSseEvents(buffer: string): {
   events: ChatStreamMessage[];
   remainder: string;
 } {
@@ -46,19 +56,30 @@ function parseSseEvents(buffer: string): {
   const remainder = rawEvents.pop() ?? '';
 
   for (const rawEvent of rawEvents) {
-    const data = rawEvent
-      .split('\n')
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trimStart())
-      .join('\n')
-      .trim();
+    let eventType = '';
+    const dataLines: string[] = [];
+
+    for (const line of rawEvent.split('\n')) {
+      if (line.startsWith('event:')) {
+        eventType = line.slice(6).trim();
+      }
+      if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+
+    const data = dataLines.join('\n').trim();
 
     if (!data || data === '[DONE]') {
       continue;
     }
 
     try {
-      events.push(JSON.parse(data) as ChatStreamMessage);
+      const parsed = JSON.parse(data) as ChatStreamMessage;
+      events.push({
+        ...parsed,
+        type: parsed.type || (eventType as ChatStreamMessage['type']),
+      });
     } catch (error) {
       console.error('Failed to parse chat stream event:', data, error);
     }
@@ -153,6 +174,7 @@ export async function askPastSelfSync(
   sources: RAGSource[];
   confidence: 'high' | 'medium' | 'low' | 'not_found';
   followUpQuestions: string[];
+  answerStatus: 'supported' | 'partial' | 'refusal';
 }> {
   const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8080';
   const payload = {
@@ -223,7 +245,7 @@ export function useAskPastSelf(workspaceId?: string) {
   );
 
   const chat = React.useCallback(
-    async (query: string, workspaceId: string) => {
+    async (query: string, workspaceId: string, overrides?: Partial<Pick<AskPastSelfOptions, 'topK' | 'similarityThreshold'>>) => {
       if (loading) {
         return;
       }
@@ -253,12 +275,18 @@ export function useAskPastSelf(workspaceId?: string) {
           query,
           workspaceId,
           history,
+          topK: overrides?.topK,
+          similarityThreshold: overrides?.similarityThreshold,
           signal: controller.signal,
         })) {
           if (chunk.type === 'sources' && chunk.sources) {
             sources = chunk.sources;
             setStreamingSources(sources);
             replaceLastAssistant(assistantContent, sources);
+            continue;
+          }
+
+          if (chunk.type === 'start') {
             continue;
           }
 
