@@ -29,6 +29,14 @@ from app.celery_app import celery_app
 from app.database.session import SyncSessionLocal
 from app.database.models import Note
 from app.services.embeddings import get_embedding_service
+from app.services.note_enrichment_state import (
+    STEP_EMBEDDING,
+    mark_step_completed,
+    mark_step_failed,
+    mark_step_started,
+    monotonic_ms,
+    step_is_completed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +55,6 @@ def _parse_uuid(value: str, field: str) -> UUID | None:
         return None
 
 
-def _queue_connection_suggestions(note_id: str) -> None:
-    """Queue note-connection suggestion refresh without failing the embedding task."""
-    try:
-        from app.tasks.connection_suggestions import generate_connection_suggestions
-        generate_connection_suggestions.delay(note_id)
-    except Exception as exc:
-        logger.warning("Failed to queue connection suggestions for note %s: %s", note_id, exc)
-
-
 # ---------------------------------------------------------------------------
 # Single-note embedding
 # ---------------------------------------------------------------------------
@@ -71,6 +70,8 @@ def generate_note_embedding(
     self,
     note_id: str,
     provider: Optional[str] = None,
+    capture_event_id: Optional[str] = None,
+    correlation_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Generate and store an embedding vector for a single note.
 
@@ -85,6 +86,7 @@ def generate_note_embedding(
     note_uuid = _parse_uuid(note_id, "note_id")
     if note_uuid is None:
         return {"status": "error", "note_id": note_id, "message": "Invalid UUID"}
+    event_uuid = _parse_uuid(capture_event_id, "capture_event_id") if capture_event_id else None
 
     logger.info(
         "Generating embedding for note %s (provider=%s, task=%s)",
@@ -92,12 +94,33 @@ def generate_note_embedding(
     )
 
     db = SyncSessionLocal()
+    started_at = monotonic_ms()
     try:
+        if not provider and step_is_completed(db, note_id=note_uuid, step=STEP_EMBEDDING):
+            return {"status": "skipped", "note_id": note_id, "reason": "Embedding already completed"}
+        mark_step_started(
+            db,
+            note_id=note_uuid,
+            step=STEP_EMBEDDING,
+            capture_event_id=event_uuid,
+            correlation_id=correlation_id,
+            task_id=getattr(self.request, "id", None),
+        )
         note = db.execute(
             select(Note).where(Note.id == note_uuid)
         ).scalar_one_or_none()
 
         if note is None:
+            mark_step_failed(
+                db,
+                note_id=note_uuid,
+                step=STEP_EMBEDDING,
+                error="Note does not exist",
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
             logger.warning("Note not found: %s", note_id)
             return {"status": "not_found", "note_id": note_id, "message": "Note does not exist"}
 
@@ -146,8 +169,21 @@ def generate_note_embedding(
                 exc,
             )
 
+        mark_step_completed(
+            db,
+            note_id=note_uuid,
+            step=STEP_EMBEDDING,
+            metadata={
+                "embedding_dimension": len(embedding_vector),
+                "model_used": actual_model,
+                "provider": embedding_service.provider,
+                "text_length": len(embedding_text),
+            },
+            capture_event_id=event_uuid,
+            correlation_id=correlation_id,
+            started_at_ms=started_at,
+        )
         db.commit()
-        _queue_connection_suggestions(note_id)
 
         logger.info(
             "Embedding stored for note %s (dim=%d, model=%s, task=%s)",
@@ -165,6 +201,19 @@ def generate_note_embedding(
 
     except Exception as exc:
         db.rollback()
+        try:
+            mark_step_failed(
+                db,
+                note_id=note_uuid,
+                step=STEP_EMBEDDING,
+                error=str(exc),
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         logger.error(
             "Failed to generate embedding for note %s (attempt %d): %s",
             note_id, self.request.retries + 1, exc,

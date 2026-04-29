@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 from uuid import UUID
 
+from celery.exceptions import Retry
 from sqlalchemy import select, text
 
 from app.celery_app import celery_app
@@ -18,6 +19,15 @@ from app.database.models import Note, NoteConnectionSuggestion
 from app.database.session import SyncSessionLocal
 from app.services.embeddings import get_embedding_service
 from app.services.graph_service import extract_entities_from_note
+from app.services.note_enrichment_state import (
+    STEP_CONNECTION_SUGGESTIONS,
+    STEP_EMBEDDING,
+    mark_step_completed,
+    mark_step_failed,
+    mark_step_started,
+    monotonic_ms,
+    step_is_completed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,19 +255,66 @@ def generate_connection_suggestions(
     note_id: str,
     threshold: float = 0.55,
     limit: int = 5,
+    capture_event_id: Optional[str] = None,
+    correlation_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Refresh persisted connection suggestions for a note."""
     note_uuid = _parse_uuid(note_id, "note_id")
     if note_uuid is None:
         return {"status": "error", "note_id": note_id, "message": "Invalid UUID"}
+    event_uuid = _parse_uuid(capture_event_id, "capture_event_id") if capture_event_id else None
 
     db = SyncSessionLocal()
+    started_at = monotonic_ms()
     try:
+        if step_is_completed(db, note_id=note_uuid, step=STEP_CONNECTION_SUGGESTIONS):
+            return {"status": "skipped", "note_id": note_id, "reason": "Connection suggestions already completed"}
+        step_row = mark_step_started(
+            db,
+            note_id=note_uuid,
+            step=STEP_CONNECTION_SUGGESTIONS,
+            capture_event_id=event_uuid,
+            correlation_id=correlation_id,
+            task_id=getattr(self.request, "id", None),
+        )
         note = db.execute(select(Note).where(Note.id == note_uuid)).scalar_one_or_none()
         if note is None:
+            mark_step_failed(
+                db,
+                note_id=note_uuid,
+                step=STEP_CONNECTION_SUGGESTIONS,
+                error="Note does not exist",
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
             return {"status": "not_found", "note_id": note_id, "message": "Note does not exist"}
         if note.workspace_id is None:
+            mark_step_completed(
+                db,
+                note_id=note_uuid,
+                step=STEP_CONNECTION_SUGGESTIONS,
+                metadata={"status": "skipped", "message": "Note has no workspace"},
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
             return {"status": "skipped", "note_id": note_id, "message": "Note has no workspace"}
+
+        if capture_event_id and not _parse_embedding_value(note.embedding) and not step_is_completed(
+            db,
+            note_id=note_uuid,
+            step=STEP_EMBEDDING,
+        ):
+            step_row.status = "waiting"
+            step_row.result_metadata = {"waiting_for": STEP_EMBEDDING}
+            db.commit()
+            raise self.retry(
+                exc=RuntimeError("Waiting for note embedding before connection suggestions"),
+                countdown=20 * (2 ** min(self.request.retries, 3)),
+            )
 
         _ensure_note_embedding(db, note)
 
@@ -336,6 +393,23 @@ def generate_connection_suggestions(
             if row.status == "pending" and row.suggested_note_id not in active_candidate_ids:
                 db.delete(row)
 
+        result_metadata = {
+            "pending_suggestions": len(active_candidate_ids),
+            "created": created_count,
+            "updated": updated_count,
+            "skipped_preserved": skipped_count,
+            "threshold": threshold,
+            "limit": limit,
+        }
+        mark_step_completed(
+            db,
+            note_id=note_uuid,
+            step=STEP_CONNECTION_SUGGESTIONS,
+            metadata=result_metadata,
+            capture_event_id=event_uuid,
+            correlation_id=correlation_id,
+            started_at_ms=started_at,
+        )
         db.commit()
         return {
             "status": "success",
@@ -347,7 +421,22 @@ def generate_connection_suggestions(
         }
 
     except Exception as exc:
+        if isinstance(exc, Retry):
+            raise
         db.rollback()
+        try:
+            mark_step_failed(
+                db,
+                note_id=note_uuid,
+                step=STEP_CONNECTION_SUGGESTIONS,
+                error=str(exc),
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         logger.error(
             "Failed to generate connection suggestions for note %s (attempt %d): %s",
             note_id,

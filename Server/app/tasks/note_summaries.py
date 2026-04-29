@@ -33,6 +33,14 @@ from app.celery_app import celery_app
 from app.database.session import SyncSessionLocal
 from app.database.models import Note
 from app.services.llm_service import get_llm_service
+from app.services.note_enrichment_state import (
+    STEP_SUMMARY,
+    mark_step_completed,
+    mark_step_failed,
+    mark_step_started,
+    monotonic_ms,
+    step_is_completed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +61,7 @@ def _parse_uuid(value: str, field: str) -> UUID | None:
     """Return a UUID or ``None`` (logging the problem) if *value* is invalid."""
     try:
         return UUID(value)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         logger.error("Invalid %s UUID: %r", field, value)
         return None
 
@@ -112,6 +120,8 @@ def generate_note_summary(
     note_id: str,
     model: Optional[str] = None,
     force: bool = False,
+    capture_event_id: Optional[str] = None,
+    correlation_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Generate and store an LLM summary for a single note.
 
@@ -126,6 +136,7 @@ def generate_note_summary(
     note_uuid = _parse_uuid(note_id, "note_id")
     if note_uuid is None:
         return {"status": "error", "note_id": note_id, "message": "Invalid UUID"}
+    event_uuid = _parse_uuid(capture_event_id, "capture_event_id") if capture_event_id else None
 
     logger.info(
         "Generating summary for note %s (model=%s, force=%s, task=%s)",
@@ -133,18 +144,53 @@ def generate_note_summary(
     )
 
     db = SyncSessionLocal()
+    started_at = monotonic_ms()
     try:
+        if not force and step_is_completed(db, note_id=note_uuid, step=STEP_SUMMARY):
+            return {"status": "skipped", "note_id": note_id, "reason": "Summary already completed"}
+        mark_step_started(
+            db,
+            note_id=note_uuid,
+            step=STEP_SUMMARY,
+            capture_event_id=event_uuid,
+            correlation_id=correlation_id,
+            task_id=getattr(self.request, "id", None),
+        )
         note = db.execute(
             select(Note).where(Note.id == note_uuid)
         ).scalar_one_or_none()
 
         if note is None:
+            mark_step_failed(
+                db,
+                note_id=note_uuid,
+                step=STEP_SUMMARY,
+                error="Note does not exist",
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
             logger.warning("Note not found: %s", note_id)
             return {"status": "not_found", "note_id": note_id, "message": "Note does not exist"}
 
         content_length = len(note.content)
 
         if content_length < MIN_CONTENT_LENGTH and not force:
+            mark_step_completed(
+                db,
+                note_id=note_uuid,
+                step=STEP_SUMMARY,
+                metadata={
+                    "status": "skipped",
+                    "reason": f"Content length {content_length} chars below minimum {MIN_CONTENT_LENGTH}",
+                    "content_length": content_length,
+                },
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
             logger.info(
                 "Skipping note %s — content too short (%d < %d chars)",
                 note_id, content_length, MIN_CONTENT_LENGTH,
@@ -157,6 +203,20 @@ def generate_note_summary(
             }
 
         if note.summary and not force:
+            mark_step_completed(
+                db,
+                note_id=note_uuid,
+                step=STEP_SUMMARY,
+                metadata={
+                    "status": "skipped",
+                    "reason": "Summary already exists",
+                    "existing_summary_length": len(note.summary),
+                },
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
             logger.info("Skipping note %s — summary already exists", note_id)
             return {
                 "status": "skipped",
@@ -184,6 +244,20 @@ def generate_note_summary(
         note.summary = summary_text
         note.updated_at = datetime.now(timezone.utc)
 
+        mark_step_completed(
+            db,
+            note_id=note_uuid,
+            step=STEP_SUMMARY,
+            metadata={
+                "summary_length": len(summary_text),
+                "tokens_used": llm_response.tokens_used,
+                "model": llm_response.model,
+                "content_length": content_length,
+            },
+            capture_event_id=event_uuid,
+            correlation_id=correlation_id,
+            started_at_ms=started_at,
+        )
         db.commit()
 
         logger.info(
@@ -204,6 +278,19 @@ def generate_note_summary(
 
     except Exception as exc:
         db.rollback()
+        try:
+            mark_step_failed(
+                db,
+                note_id=note_uuid,
+                step=STEP_SUMMARY,
+                error=str(exc),
+                capture_event_id=event_uuid,
+                correlation_id=correlation_id,
+                started_at_ms=started_at,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         logger.error(
             "Failed to generate summary for note %s (attempt %d): %s",
             note_id, self.request.retries + 1, exc,
