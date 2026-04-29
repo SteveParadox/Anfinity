@@ -174,7 +174,7 @@ async def get_thinking_session_for_update(session_id: UUID, db: AsyncSession) ->
     result = await db.execute(
         select(ThinkingSession)
         .where(ThinkingSession.id == session_id)
-        .with_for_update()
+        .with_for_update(of=ThinkingSession)
     )
     session = result.scalar_one_or_none()
     if session is None:
@@ -210,7 +210,7 @@ async def get_thinking_synthesis_run_for_update(
             ThinkingSessionSynthesisRun.id == run_id,
             ThinkingSessionSynthesisRun.session_id == session_id,
         )
-        .with_for_update()
+        .with_for_update(of=ThinkingSessionSynthesisRun)
     )
     run = result.scalar_one_or_none()
     if run is None:

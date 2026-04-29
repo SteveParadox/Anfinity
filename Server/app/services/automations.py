@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import urlparse
@@ -24,6 +25,7 @@ from app.database.models import (
     UserNotificationType,
     Workspace,
 )
+from app.services.note_creation import NoteCapturedEvent, create_note as create_note_service
 from app.services.automation_registry import (
     APPROVAL_PRIORITIES,
     BACKEND_ACTION_TYPES,
@@ -282,29 +284,25 @@ async def _create_note(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unsupported note type")
 
     content = str(config.get("content") or "")
-    note = Note(
-        workspace_id=workspace.id,
-        user_id=actor_id,
-        title=str(config.get("title") or "Untitled automation note"),
-        content=content,
-        tags=_string_list(config.get("tags")),
-        connections=[],
-        note_type=note_type,
-        word_count=len(content.split()),
-    )
-    db.add(note)
-    await db.flush()
-    await log_audit_event(
+    title = str(config.get("title") or "Untitled automation note")
+    idempotency_digest = hashlib.sha256(f"{title}\n{content}".encode("utf-8")).hexdigest()
+    result = await create_note_service(
         db,
-        action=AuditAction.NOTE_CREATED,
-        actor_user_id=actor_id,
-        workspace_id=workspace.id,
-        note_id=note.id,
-        entity_type=EntityType.NOTE,
-        entity_id=note.id,
-        metadata={"source": "automation", "automation_id": automation_id},
+        NoteCapturedEvent(
+            workspace_id=workspace.id,
+            user_id=actor_id,
+            title=title,
+            content=content,
+            tags=_string_list(config.get("tags")),
+            note_type=note_type,
+            capture_source="automation",
+            capture_path="automation.create_note",
+            idempotency_key=f"automation:{automation_id}:{workspace.id}:{actor_id}:{idempotency_digest}",
+            correlation_id=str(context.get("event", {}).get("id") or automation_id),
+            metadata={"automation_id": automation_id},
+        ),
     )
-    return {"note_id": str(note.id)}
+    return {"note_id": str(result.note.id), "created": result.created}
 
 
 async def _update_note(

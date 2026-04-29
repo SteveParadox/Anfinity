@@ -11,7 +11,7 @@ from sqlalchemy import Float, String, cast, func, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Answer, ChunkWeight, Feedback
+from app.database.models import Answer, ChunkWeight, Feedback, SearchFeedback
 from app.database.session import log_session_query_metrics
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,42 @@ class FeedbackHandler:
             unique_pairs.append(pair)
 
         return unique_pairs
+
+    @staticmethod
+    def feedback_signal_from_type(feedback_type: str, rating_value: Optional[int] = None) -> int:
+        """
+        Convert typed semantic-search feedback into a directional signal.
+
+        Returns:
+            1  => positive/correct signal
+            0  => neutral/insufficient signal
+            -1 => negative/incorrect signal
+        """
+        if rating_value is not None:
+            if rating_value > 0:
+                return 1
+            if rating_value < 0:
+                return -1
+            return 0
+
+        normalized = str(feedback_type or "").strip().lower()
+        positive_types = {"correct"}
+        neutral_types = {"partially_correct", "other"}
+        negative_types = {
+            "irrelevant",
+            "missing_expected_result",
+            "wrong_result",
+            "bad_highlight",
+            "low_quality_answer",
+            "hallucinated_or_unsupported",
+        }
+        if normalized in positive_types:
+            return 1
+        if normalized in negative_types:
+            return -1
+        if normalized in neutral_types:
+            return 0
+        return 0
 
     async def process_answer_feedback(
         self,
@@ -247,6 +283,120 @@ class FeedbackHandler:
 
         return chunk_updates
 
+    async def apply_feedback_delta(
+        self,
+        *,
+        workspace_id: UUID,
+        answer_sources: Any,
+        previous_signal: int,
+        new_signal: int,
+        db: AsyncSession,
+    ) -> List[Dict[str, Any]]:
+        """
+        Apply chunk-weight deltas when a user's feedback is created/updated.
+
+        This keeps a single feedback record mutable while preserving aggregate
+        chunk stats and credibility weights.
+        """
+        source_pairs = self._extract_unique_sources(answer_sources)
+        if not source_pairs:
+            return []
+
+        previous_signal = int(max(-1, min(1, previous_signal)))
+        new_signal = int(max(-1, min(1, new_signal)))
+        if previous_signal == new_signal:
+            return []
+
+        positive_delta = int((1 if new_signal > 0 else 0) - (1 if previous_signal > 0 else 0))
+        negative_delta = int((1 if new_signal < 0 else 0) - (1 if previous_signal < 0 else 0))
+        total_delta = int((1 if new_signal != 0 else 0) - (1 if previous_signal != 0 else 0))
+
+        previous_multiplier = self.positive_multiplier if previous_signal > 0 else self.negative_multiplier if previous_signal < 0 else 1.0
+        new_multiplier = self.positive_multiplier if new_signal > 0 else self.negative_multiplier if new_signal < 0 else 1.0
+        multiplier = float(new_multiplier / previous_multiplier) if previous_multiplier else 1.0
+
+        existing_result = await db.execute(
+            select(ChunkWeight).where(
+                ChunkWeight.workspace_id == workspace_id,
+                tuple_(ChunkWeight.chunk_id, cast(ChunkWeight.document_id, String)).in_(source_pairs),
+            )
+        )
+        existing_weights = existing_result.scalars().all()
+        existing_by_pair = {(str(weight.chunk_id), str(weight.document_id)): weight for weight in existing_weights}
+
+        inserted_positive = max(positive_delta, 0)
+        inserted_negative = max(negative_delta, 0)
+        inserted_total = max(total_delta, 0)
+
+        insert_values = [
+            {
+                "chunk_id": chunk_id,
+                "document_id": document_id,
+                "workspace_id": workspace_id,
+                "credibility_score": 1.0,
+                "positive_feedback_count": inserted_positive,
+                "negative_feedback_count": inserted_negative,
+                "total_uses": inserted_total,
+                "accuracy_rate": 1.0 if inserted_positive > 0 and inserted_negative == 0 else 0.0,
+            }
+            for chunk_id, document_id in source_pairs
+        ]
+
+        insert_stmt = pg_insert(ChunkWeight).values(insert_values)
+        new_positive_expr = func.greatest(0, ChunkWeight.positive_feedback_count + positive_delta)
+        new_negative_expr = func.greatest(0, ChunkWeight.negative_feedback_count + negative_delta)
+        new_feedback_total_expr = new_positive_expr + new_negative_expr
+        accuracy_expr = cast(new_positive_expr, Float) / cast(func.nullif(new_feedback_total_expr, 0), Float)
+
+        upsert_stmt = (
+            insert_stmt.on_conflict_do_update(
+                constraint="uq_chunk_weight_scope",
+                set_={
+                    "positive_feedback_count": new_positive_expr,
+                    "negative_feedback_count": new_negative_expr,
+                    "total_uses": func.greatest(0, ChunkWeight.total_uses + total_delta),
+                    "accuracy_rate": func.coalesce(accuracy_expr, 0.0),
+                    "credibility_score": func.least(
+                        self.max_weight,
+                        func.greatest(self.min_weight, ChunkWeight.credibility_score * multiplier),
+                    ),
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+            .returning(
+                ChunkWeight.chunk_id,
+                ChunkWeight.document_id,
+                ChunkWeight.credibility_score,
+                ChunkWeight.accuracy_rate,
+                ChunkWeight.positive_feedback_count,
+                ChunkWeight.negative_feedback_count,
+                ChunkWeight.total_uses,
+            )
+        )
+
+        updated_rows = (await db.execute(upsert_stmt)).all()
+        updates_by_pair = {(str(row.chunk_id), str(row.document_id)): row for row in updated_rows}
+
+        chunk_updates: list[dict[str, Any]] = []
+        for chunk_id, document_id in source_pairs:
+            row = updates_by_pair[(chunk_id, document_id)]
+            existing = existing_by_pair.get((chunk_id, document_id))
+            old_weight = float(existing.credibility_score) if existing is not None else 1.0
+            chunk_updates.append(
+                {
+                    "chunk_id": chunk_id,
+                    "document_id": document_id,
+                    "old_weight": round(old_weight, 3),
+                    "new_weight": round(float(row.credibility_score or 0.0), 3),
+                    "accuracy": round(float(row.accuracy_rate or 0.0), 3),
+                    "positive_count": int(row.positive_feedback_count or 0),
+                    "negative_count": int(row.negative_feedback_count or 0),
+                    "total_uses": int(row.total_uses or 0),
+                }
+            )
+
+        return chunk_updates
+
     async def _calculate_confidence_impact(
         self,
         chunks_updated: List[Dict[str, Any]],
@@ -301,13 +451,43 @@ class FeedbackHandler:
         workspace_id: UUID,
         db: AsyncSession,
     ) -> Dict[str, Any]:
-        result = await db.execute(
+        search_feedback_result = await db.execute(
+            select(SearchFeedback).where(
+                SearchFeedback.workspace_id == workspace_id,
+                SearchFeedback.target_kind == "answer",
+            )
+        )
+        search_feedback_records = search_feedback_result.scalars().all()
+        if search_feedback_records:
+            total = len(search_feedback_records)
+            approved = sum(
+                1
+                for f in search_feedback_records
+                if self.feedback_signal_from_type(f.feedback_type, f.rating_value) > 0
+            )
+            rejected = sum(
+                1
+                for f in search_feedback_records
+                if self.feedback_signal_from_type(f.feedback_type, f.rating_value) < 0
+            )
+            rated_values = [int(f.rating_value) for f in search_feedback_records if f.rating_value is not None]
+            avg_rating = sum(rated_values) / len(rated_values) if rated_values else 0.0
+            return {
+                "total_feedback": total,
+                "approved_count": approved,
+                "rejected_count": rejected,
+                "approval_rate": round(approved / total, 3) if total else 0.0,
+                "rejection_rate": round(rejected / total, 3) if total else 0.0,
+                "average_rating": round(avg_rating, 2),
+            }
+
+        # Legacy fallback for historical deployments that only persisted `feedback`.
+        legacy_result = await db.execute(
             select(Feedback)
             .join(Answer, Feedback.answer_id == Answer.id)
             .where(Answer.workspace_id == workspace_id)
         )
-
-        feedback_records = result.scalars().all()
+        feedback_records = legacy_result.scalars().all()
         if not feedback_records:
             return {
                 "total_feedback": 0,
@@ -322,7 +502,6 @@ class FeedbackHandler:
         approved = sum(1 for f in feedback_records if f.rating >= 4)
         rejected = total - approved
         avg_rating = sum(f.rating for f in feedback_records) / total
-
         return {
             "total_feedback": total,
             "approved_count": approved,

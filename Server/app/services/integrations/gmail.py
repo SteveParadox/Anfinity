@@ -78,6 +78,10 @@ class GmailIntegrationService(BaseIntegrationService):
                     note_type="note",
                     tags=["gmail", "email"],
                     source_url=f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
+                    capture_source="gmail",
+                    capture_path="integration.gmail",
+                    idempotency_key=stable_hash({"connector_id": str(self.connector.id), "gmail_message_id": message_id}),
+                    metadata={"external_type": "gmail_message", "external_id": message_id},
                 )
                 sync_item = await upsert_sync_item(
                     db,

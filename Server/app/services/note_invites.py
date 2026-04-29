@@ -286,7 +286,7 @@ async def create_note_invite(
         pending_query = pending_query.where(NoteInvite.invitee_email == normalized_email)
 
     pending_result = await db.execute(
-        pending_query.order_by(NoteInvite.created_at.desc()).with_for_update()
+        pending_query.order_by(NoteInvite.created_at.desc()).with_for_update(of=NoteInvite)
     )
     existing_invite = pending_result.scalars().first()
     if existing_invite is not None:
@@ -376,7 +376,7 @@ async def accept_note_invite(
     invite_result = await db.execute(
         select(NoteInvite)
         .where(NoteInvite.token_hash == token_hash)
-        .with_for_update()
+        .with_for_update(of=NoteInvite)
     )
     invite = invite_result.scalar_one_or_none()
     if invite is None:
@@ -405,7 +405,7 @@ async def accept_note_invite(
         select(NoteCollaborator).where(
             NoteCollaborator.note_id == note.id,
             NoteCollaborator.user_id == user.id,
-        ).with_for_update()
+        ).with_for_update(of=NoteCollaborator)
     )
     collaborator = collaborator_result.scalar_one_or_none()
 

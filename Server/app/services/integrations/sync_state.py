@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Connector, IntegrationSyncItem, Note
+from app.services.note_creation import NoteCapturedEvent, create_note as create_note_service
 
 
 def stable_hash(payload: Any) -> str:
@@ -149,18 +150,37 @@ async def create_integration_note(
     note_type: str,
     tags: list[str],
     source_url: str | None = None,
+    capture_path: str | None = None,
+    capture_source: str | None = None,
+    idempotency_key: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Note:
-    note = Note(
-        workspace_id=connector.workspace_id,
-        user_id=connector.user_id,
-        title=title[:500] or "Untitled integration note",
-        content=content,
-        note_type=note_type,
-        tags=list(dict.fromkeys(tags)),
-        source_url=source_url,
-        word_count=len(content.split()),
-        ai_generated=0,
+    provider = str(connector.connector_type)
+    resolved_capture_source = capture_source or provider
+    resolved_capture_path = capture_path or "integration.shared"
+    result = await create_note_service(
+        db,
+        NoteCapturedEvent(
+            workspace_id=connector.workspace_id,
+            user_id=connector.user_id,
+            title=title[:500] or "Untitled integration note",
+            content=content,
+            note_type=note_type,
+            tags=list(dict.fromkeys(tags)),
+            source_url=source_url,
+            capture_source=resolved_capture_source,
+            capture_path=resolved_capture_path,
+            idempotency_key=idempotency_key or stable_hash(
+                {
+                    "connector_id": str(connector.id),
+                    "provider": resolved_capture_source,
+                    "title": title,
+                    "content": content,
+                    "source_url": source_url,
+                }
+            ),
+            correlation_id=f"connector:{connector.id}",
+            metadata={"connector_id": str(connector.id), "provider": provider, **dict(metadata or {})},
+        ),
     )
-    db.add(note)
-    await db.flush()
-    return note
+    return result.note

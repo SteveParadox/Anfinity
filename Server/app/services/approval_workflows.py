@@ -29,6 +29,7 @@ from app.database.models import (
     WorkspaceRole,
 )
 from app.services.note_access import ensure_note_permission
+from app.services.settings_preferences import filter_notification_recipients, workspace_feature_enabled
 
 
 def utc_now() -> datetime:
@@ -463,7 +464,7 @@ class ApprovalWorkflowService:
         result = await self.db.execute(
             select(Note)
             .where(Note.id == note_id)
-            .with_for_update()
+            .with_for_update(of=Note)
             .options(selectinload(Note.owner))
         )
         note = result.scalar_one_or_none()
@@ -488,11 +489,21 @@ class ApprovalWorkflowService:
 
     async def _ensure_can_submit(self, note: Note, actor: DBUser) -> None:
         self._require_workspace_note(note)
+        if not await workspace_feature_enabled(self.db, note.workspace_id, "approvals", "enabled"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Approval workflows are disabled for this workspace",
+            )
         await ensure_note_permission(note, actor, self.db, "update")
         await ensure_workspace_permission(note.workspace_id, actor, self.db, "workflows", "create")
 
     async def _ensure_can_review(self, note: Note, actor: DBUser) -> None:
         self._require_workspace_note(note)
+        if not await workspace_feature_enabled(self.db, note.workspace_id, "approvals", "enabled"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Approval workflows are disabled for this workspace",
+            )
         if actor.is_superuser:
             return
         await ensure_workspace_permission(note.workspace_id, actor, self.db, "workflows", "manage")
@@ -583,7 +594,9 @@ class ApprovalWorkflowService:
 
         if notification_type is not None and callable(fanout):
             seen_recipient_ids: set[UUID] = set()
-            for recipient_id in await fanout(note, actor):
+            recipient_ids = set(await fanout(note, actor))
+            recipient_ids = await filter_notification_recipients(self.db, recipient_ids, notification_type)
+            for recipient_id in recipient_ids:
                 if recipient_id is None or recipient_id == actor.id or recipient_id in seen_recipient_ids:
                     continue
                 seen_recipient_ids.add(recipient_id)

@@ -230,15 +230,20 @@ class GraphService:
         search = _normalize_label(filters.get("search") or "")
         min_weight = float(filters.get("min_weight") or 0)
         include_isolated = bool(filters.get("include_isolated", True))
+        node_limit = max(1, min(int(filters.get("node_limit") or 500), 2000))
+        edge_limit = max(0, min(int(filters.get("edge_limit") or 1500), 5000))
 
         node_query = select(GraphNode).where(GraphNode.workspace_id == workspace_id)
         if node_types:
             node_query = node_query.where(GraphNode.node_type.in_(list(node_types)))
         if search:
             node_query = node_query.where(GraphNode.normalized_label.contains(search))
+        node_query = node_query.order_by(GraphNode.weight.desc(), GraphNode.updated_at.desc()).limit(node_limit + 1)
 
         node_result = await db.execute(node_query)
         nodes = list(node_result.scalars().all())
+        node_limited = len(nodes) > node_limit
+        nodes = nodes[:node_limit]
         node_map = {node.id: node for node in nodes}
         if not node_map:
             return {
@@ -251,20 +256,30 @@ class GraphService:
                     "total_clusters": 0,
                     "node_types": {},
                     "edge_types": {},
+                    "limited": False,
+                    "node_limit": node_limit,
+                    "edge_limit": edge_limit,
                 },
             }
 
-        edge_query = select(GraphEdge).where(
-            GraphEdge.workspace_id == workspace_id,
-            GraphEdge.weight >= min_weight,
-            GraphEdge.source_node_id.in_(list(node_map.keys())),
-            GraphEdge.target_node_id.in_(list(node_map.keys())),
-        )
-        if edge_types:
-            edge_query = edge_query.where(GraphEdge.edge_type.in_(list(edge_types)))
+        edge_limited = False
+        if edge_limit == 0:
+            edges = []
+        else:
+            edge_query = select(GraphEdge).where(
+                GraphEdge.workspace_id == workspace_id,
+                GraphEdge.weight >= min_weight,
+                GraphEdge.source_node_id.in_(list(node_map.keys())),
+                GraphEdge.target_node_id.in_(list(node_map.keys())),
+            )
+            if edge_types:
+                edge_query = edge_query.where(GraphEdge.edge_type.in_(list(edge_types)))
+            edge_query = edge_query.order_by(GraphEdge.weight.desc(), GraphEdge.updated_at.desc()).limit(edge_limit + 1)
 
-        edge_result = await db.execute(edge_query)
-        edges = list(edge_result.scalars().all())
+            edge_result = await db.execute(edge_query)
+            edges = list(edge_result.scalars().all())
+            edge_limited = len(edges) > edge_limit
+            edges = edges[:edge_limit]
 
         note_ids_by_node: dict[UUID, set[str]] = defaultdict(set)
         document_ids_by_node: dict[UUID, set[str]] = defaultdict(set)
@@ -328,6 +343,9 @@ class GraphService:
                 "total_clusters": len(cluster_payload["clusters"]),
                 "node_types": dict(node_type_counts),
                 "edge_types": dict(edge_type_counts),
+                "limited": node_limited or edge_limited,
+                "node_limit": node_limit,
+                "edge_limit": edge_limit,
             },
         }
 

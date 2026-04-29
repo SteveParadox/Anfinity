@@ -131,6 +131,10 @@ class CalendarIntegrationService(BaseIntegrationService):
                 note_type="note",
                 tags=["meeting", "calendar"],
                 source_url=meeting.html_link,
+                capture_source="calendar",
+                capture_path="integration.calendar",
+                idempotency_key=stable_hash({"connector_id": str(self.connector.id), "calendar_event_id": meeting.event_id}),
+                metadata={"external_type": "calendar_event", "external_id": meeting.event_id},
             )
             await upsert_sync_item(
                 db,

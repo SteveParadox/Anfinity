@@ -1,4 +1,4 @@
-"""Notion two-way sync with CogniFlowID tracking and block chunking."""
+"""Notion two-way sync with AnfinityID tracking and block chunking."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from app.services.integrations.sync_state import (
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
-COGNIFLOW_ID_PROPERTY = "CogniFlowID"
+ANFINITY_ID_PROPERTY = "AnfinityID"
 NOTION_TEXT_LIMIT = 2000
 
 
@@ -79,7 +79,7 @@ class NotionIntegrationService(BaseIntegrationService):
             page_id = str((existing_item.item_metadata or {}).get("notion_page_id") or existing_item.external_id) if existing_item else ""
             if page_id:
                 await self._replace_page_children(client, page_id=page_id, blocks=blocks)
-                await self._update_page_properties(client, page_id=page_id, title=note.title, cogniflow_id=str(note.id))
+                await self._update_page_properties(client, page_id=page_id, title=note.title, anfinity_id=str(note.id))
                 page = {"id": page_id, "url": (existing_item.item_metadata or {}).get("url")}
             else:
                 page = await self._create_page(client, database_id=database_id, note=note, blocks=blocks)
@@ -92,11 +92,11 @@ class NotionIntegrationService(BaseIntegrationService):
             external_id=page_id,
             sync_direction="push",
             local_note_id=note.id,
-            source_hash=stable_hash({"pushed_cogniflow_id": str(note.id), "title": note.title, "content": note.content}),
+            source_hash=stable_hash({"pushed_anfinity_id": str(note.id), "title": note.title, "content": note.content}),
             metadata={
                 "notion_page_id": page_id,
                 "url": page.get("url"),
-                "cogniflow_id": str(note.id),
+                "anfinity_id": str(note.id),
                 "local_hash": stable_hash({"title": note.title, "content": note.content}),
             },
         )
@@ -175,9 +175,9 @@ class NotionIntegrationService(BaseIntegrationService):
                     skipped += 1
                     continue
 
-                cogniflow_id = extract_cogniflow_id(page)
-                if cogniflow_id:
-                    note = await self._load_note_by_cogniflow_id(db, cogniflow_id)
+                anfinity_id = extract_anfinity_id(page)
+                if anfinity_id:
+                    note = await self._load_note_by_anfinity_id(db, anfinity_id)
                     if note is not None:
                         content = await self._fetch_page_content(client, page_id)
                         incoming_hash = stable_hash({"title": extract_page_title(page), "content": content})
@@ -201,9 +201,9 @@ class NotionIntegrationService(BaseIntegrationService):
                             metadata={
                                 "notion_page_id": page_id,
                                 "url": page.get("url"),
-                                "cogniflow_id": cogniflow_id,
-                                "source": "cogniflow",
-                                "last_sync_origin": "cogniflow" if incoming_hash == local_hash else "notion",
+                                "anfinity_id": anfinity_id,
+                                "source": "anfinity",
+                                "last_sync_origin": "anfinity" if incoming_hash == local_hash else "notion",
                                 "local_hash": stable_hash({"title": note.title, "content": note.content}),
                             },
                         )
@@ -220,6 +220,10 @@ class NotionIntegrationService(BaseIntegrationService):
                     note_type="note",
                     tags=["notion"],
                     source_url=str(page.get("url") or ""),
+                    capture_source="notion",
+                    capture_path="integration.notion",
+                    idempotency_key=stable_hash({"connector_id": str(self.connector.id), "notion_page_id": page_id}),
+                    metadata={"external_type": "notion_page", "external_id": page_id},
                 )
                 await upsert_sync_item(
                     db,
@@ -233,13 +237,13 @@ class NotionIntegrationService(BaseIntegrationService):
                     metadata={
                         "notion_page_id": page_id,
                         "url": page.get("url"),
-                        "cogniflow_id": str(note.id),
+                        "anfinity_id": str(note.id),
                         "source": "notion",
                         "last_sync_origin": "notion",
                         "local_hash": stable_hash({"title": note.title, "content": note.content}),
                     },
                 )
-                await self._set_cogniflow_id_if_possible(client, page_id=page_id, cogniflow_id=str(note.id))
+                await self._set_anfinity_id_if_possible(client, page_id=page_id, anfinity_id=str(note.id))
                 pulled += 1
 
         return {"pulled": pulled, "updated": updated, "pushed": 0, "skipped": skipped}
@@ -267,11 +271,11 @@ class NotionIntegrationService(BaseIntegrationService):
                 await client.delete(f"{NOTION_API_BASE}/blocks/{block_id}", headers=self._headers())
         await self._append_blocks(client, page_id=page_id, blocks=blocks)
 
-    async def _update_page_properties(self, client: httpx.AsyncClient, *, page_id: str, title: str, cogniflow_id: str) -> None:
+    async def _update_page_properties(self, client: httpx.AsyncClient, *, page_id: str, title: str, anfinity_id: str) -> None:
         response = await client.patch(
             f"{NOTION_API_BASE}/pages/{page_id}",
             headers=self._headers(),
-            json={"properties": build_page_properties(title, cogniflow_id)},
+            json={"properties": build_page_properties(title, anfinity_id)},
         )
         if response.status_code >= 400:
             raise RuntimeError(f"Notion page property update failed: {response.text[:300]}")
@@ -313,18 +317,18 @@ class NotionIntegrationService(BaseIntegrationService):
             raise RuntimeError(f"Notion block fetch failed: {data.get('message') or response.text[:300]}")
         return data.get("results", [])
 
-    async def _set_cogniflow_id_if_possible(self, client: httpx.AsyncClient, *, page_id: str, cogniflow_id: str) -> None:
+    async def _set_anfinity_id_if_possible(self, client: httpx.AsyncClient, *, page_id: str, anfinity_id: str) -> None:
         response = await client.patch(
             f"{NOTION_API_BASE}/pages/{page_id}",
             headers=self._headers(),
-            json={"properties": {COGNIFLOW_ID_PROPERTY: {"rich_text": [{"text": {"content": cogniflow_id}}]}}},
+            json={"properties": {ANFINITY_ID_PROPERTY: {"rich_text": [{"text": {"content": anfinity_id}}]}}},
         )
         if response.status_code >= 400:
             return
 
-    async def _load_note_by_cogniflow_id(self, db: AsyncSession, cogniflow_id: str) -> Optional[Note]:
+    async def _load_note_by_anfinity_id(self, db: AsyncSession, anfinity_id: str) -> Optional[Note]:
         try:
-            note_id = UUID(cogniflow_id)
+            note_id = UUID(anfinity_id)
         except ValueError:
             return None
         return (await db.execute(select(Note).where(Note.id == note_id, Note.workspace_id == self.connector.workspace_id))).scalar_one_or_none()
@@ -359,15 +363,15 @@ def content_to_notion_blocks(content: str) -> list[dict[str, Any]]:
     return blocks or content_to_notion_blocks(" ")
 
 
-def build_page_properties(title: str, cogniflow_id: str) -> dict[str, Any]:
+def build_page_properties(title: str, anfinity_id: str) -> dict[str, Any]:
     return {
         "Name": {"title": [{"text": {"content": title[:2000] or "Untitled"}}]},
-        COGNIFLOW_ID_PROPERTY: {"rich_text": [{"text": {"content": cogniflow_id}}]},
+        ANFINITY_ID_PROPERTY: {"rich_text": [{"text": {"content": anfinity_id}}]},
     }
 
 
-def extract_cogniflow_id(page: Mapping[str, Any]) -> Optional[str]:
-    prop = (page.get("properties") or {}).get(COGNIFLOW_ID_PROPERTY) if isinstance(page.get("properties"), Mapping) else None
+def extract_anfinity_id(page: Mapping[str, Any]) -> Optional[str]:
+    prop = (page.get("properties") or {}).get(ANFINITY_ID_PROPERTY) if isinstance(page.get("properties"), Mapping) else None
     if not isinstance(prop, Mapping):
         return None
     rich_text = prop.get("rich_text") or []
@@ -375,10 +379,10 @@ def extract_cogniflow_id(page: Mapping[str, Any]) -> Optional[str]:
         return None
     first = rich_text[0] if isinstance(rich_text[0], Mapping) else {}
     raw_value = str((first.get("plain_text") or ((first.get("text") or {}).get("content") if isinstance(first.get("text"), Mapping) else "")) or "").strip()
-    return normalize_cogniflow_id(raw_value)
+    return normalize_anfinity_id(raw_value)
 
 
-def normalize_cogniflow_id(value: str) -> Optional[str]:
+def normalize_anfinity_id(value: str) -> Optional[str]:
     try:
         return str(UUID(str(value).strip()))
     except (TypeError, ValueError):

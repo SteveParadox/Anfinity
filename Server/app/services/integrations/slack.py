@@ -124,7 +124,7 @@ def message_from_payload(payload: Mapping[str, Any], connector: Connector) -> Sl
     ]
     return SlackMessage(
         channel_id=channel_id,
-        title=str(payload.get("title") or "CogniFlow update"),
+        title=str(payload.get("title") or "Anfinity update"),
         body=str(payload.get("body") or payload.get("message") or ""),
         context=[str(item) for item in payload.get("context", []) or [] if str(item)],
         buttons=buttons,

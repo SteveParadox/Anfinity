@@ -22,6 +22,7 @@ from app.services.integrations.sync_state import (
     mark_connector_sync_success,
     mark_connector_reauthorization_required,
 )
+from app.services.settings_preferences import workspace_feature_enabled
 
 
 async def load_connector(db: AsyncSession, connector_id: UUID) -> Connector:
@@ -35,6 +36,8 @@ async def sync_connector(db: AsyncSession, connector_id: UUID) -> Mapping[str, A
     connector = await load_connector(db, connector_id)
     if not connector.is_active:
         return {"status": "skipped", "reason": "inactive", "connector_id": str(connector.id)}
+    if not await workspace_feature_enabled(db, connector.workspace_id, "integrations", "auto_sync_enabled"):
+        return {"status": "skipped", "reason": "workspace_integration_auto_sync_disabled", "connector_id": str(connector.id)}
 
     await mark_connector_sync_started(db, connector)
     await db.commit()

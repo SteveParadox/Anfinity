@@ -28,6 +28,7 @@ from app.database.models import (
     UserNotificationType,
     WorkspaceMember,
 )
+from app.services.settings_preferences import filter_notification_recipients, workspace_feature_enabled
 
 
 MAX_COMMENT_DEPTH = 4
@@ -397,6 +398,8 @@ async def create_note_comment(
     normalized_body = (body or "").strip()
     if not normalized_body:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Comment body is required")
+    if note.workspace_id and not await workspace_feature_enabled(db, note.workspace_id, "collaboration", "comment_threads_enabled"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Comment threads are disabled for this workspace")
 
     async with begin_nested_if_supported(db):
         parent_comment: Optional[NoteComment] = None
@@ -409,7 +412,7 @@ async def create_note_comment(
                     NoteComment.note_id == note.id,
                     NoteComment.deleted_at.is_(None),
                 )
-                .with_for_update()
+                .with_for_update(of=NoteComment)
             )
             parent_comment = parent_result.scalar_one_or_none()
             if parent_comment is None:
@@ -437,7 +440,10 @@ async def create_note_comment(
         await db.flush()
 
         mentioned_user_ids: set[UUID] = set()
-        mention_tokens = parse_comment_mentions(normalized_body)
+        mentions_enabled = True
+        if note.workspace_id:
+            mentions_enabled = await workspace_feature_enabled(db, note.workspace_id, "collaboration", "mentions_enabled")
+        mention_tokens = parse_comment_mentions(normalized_body) if mentions_enabled else []
         if mention_tokens:
             candidates = await list_note_mention_candidates(db, note)
             resolved_mentions = resolve_mentions(mention_tokens, candidates)
@@ -452,12 +458,17 @@ async def create_note_comment(
                     )
                 )
                 mentioned_user_ids.add(mention.user_id)
+                mention_recipients = await filter_notification_recipients(
+                    db,
+                    {mention.user_id},
+                    UserNotificationType.COMMENT_MENTION,
+                )
                 add_comment_notifications(
                     db,
                     note=note,
                     comment=comment,
                     actor=author,
-                    recipient_ids={mention.user_id},
+                    recipient_ids=mention_recipients,
                     notification_type=UserNotificationType.COMMENT_MENTION,
                     body=normalized_body,
                     payload_extra={"mention_token": mention.token},
@@ -465,6 +476,11 @@ async def create_note_comment(
 
         if parent_comment is None:
             recipient_ids = await list_note_comment_notification_recipient_ids(db, note)
+            recipient_ids = await filter_notification_recipients(
+                db,
+                recipient_ids,
+                UserNotificationType.NOTE_COMMENT,
+            )
             add_comment_notifications(
                 db,
                 note=note,
@@ -476,12 +492,17 @@ async def create_note_comment(
                 skip_user_ids=mentioned_user_ids,
             )
         else:
+            reply_recipients = await filter_notification_recipients(
+                db,
+                {parent_comment.author_user_id},
+                UserNotificationType.COMMENT_REPLY,
+            )
             add_comment_notifications(
                 db,
                 note=note,
                 comment=comment,
                 actor=author,
-                recipient_ids={parent_comment.author_user_id},
+                recipient_ids=reply_recipients,
                 notification_type=UserNotificationType.COMMENT_REPLY,
                 body=normalized_body,
                 parent_comment_id=parent_comment.id,
@@ -618,7 +639,7 @@ async def toggle_comment_reaction(
         await db.execute(
             select(NoteComment.id)
             .where(NoteComment.id == comment.id)
-            .with_for_update()
+            .with_for_update(of=NoteComment)
         )
         result = await db.execute(
             select(NoteCommentReaction)
@@ -667,7 +688,7 @@ async def load_note_comment_thread(
         .order_by(NoteComment.created_at.asc(), NoteComment.id.asc())
     )
     if lock_rows:
-        query = query.with_for_update()
+        query = query.with_for_update(of=NoteComment)
 
     result = await db.execute(query)
     comments = list(result.scalars().all())
@@ -762,7 +783,7 @@ async def mark_notification_read(
             UserNotification.id == notification_id,
             UserNotification.user_id == user_id,
         )
-        .with_for_update()
+        .with_for_update(of=UserNotification)
         .options(
             selectinload(UserNotification.actor),
             selectinload(UserNotification.comment),

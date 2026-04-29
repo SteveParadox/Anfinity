@@ -14,11 +14,11 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 try:
-    from app.database.models import Chunk, Document, Note, SearchLog, SearchQuery
+    from app.database.models import Chunk, Document, Note, SearchQuery
 except ImportError:
     # Some isolated tests stub only the note/search models. Document-chunk
     # hydration is optional and should degrade gracefully in that environment.
-    from app.database.models import Note, SearchLog, SearchQuery
+    from app.database.models import Note, SearchQuery
 
     Chunk = None
     Document = None
@@ -27,6 +27,7 @@ from app.services.postgresql_search import get_postgresql_search_service
 from app.services.rag_retriever import RAGRetriever, RetrievedChunk, get_rag_retriever
 from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
 from app.services.search_highlights import SearchHighlightExtractor, SearchTextChunk, stable_content_fingerprint
+from app.services.search_log_storage import insert_search_log
 try:
     from app.ingestion.source_locations import enrich_citation_metadata, source_location_payload
 except Exception:  # pragma: no cover - isolated tests stub the app package
@@ -280,6 +281,13 @@ class SemanticSearchService:
                 query=query,
                 results=final_results,
                 search_duration_ms=took_ms,
+                retrieval_metadata={
+                    "strategy": strategy,
+                    "top_k": limit,
+                    "filters": filters or {},
+                    "include_postgresql": bool(include_postgresql),
+                    "include_retriever": bool(include_retriever),
+                },
             )
 
         return SemanticSearchExecution(
@@ -1036,6 +1044,7 @@ class SemanticSearchService:
         query: str,
         results: List[SemanticSearchResult],
         search_duration_ms: Optional[int] = None,
+        retrieval_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         try:
             async with db.begin_nested():
@@ -1057,18 +1066,44 @@ class SemanticSearchService:
                 if query_embedding:
                     await self._sync_query_embedding_vector(db, search_query.id, query_embedding)
 
-                search_log = SearchLog(
+                result_snapshot = []
+                for rank, result in enumerate(results):
+                    payload = result.to_dict()
+                    result_snapshot.append(
+                        {
+                            "rank": rank,
+                            "chunk_id": payload.get("chunk_id"),
+                            "document_id": payload.get("document_id"),
+                            "source_kind": payload.get("source_kind"),
+                            "source_type": payload.get("source_type"),
+                            "chunk_index": payload.get("chunk_index"),
+                            "similarity_score": payload.get("similarity_score"),
+                            "final_score": payload.get("final_score"),
+                            "confidence": payload.get("confidence"),
+                            "confidence_score": payload.get("confidence_score"),
+                            "highlights": payload.get("highlights", []),
+                            "matched_chunks": payload.get("matched_chunks", []),
+                        }
+                    )
+
+                search_log = await insert_search_log(
+                    db,
                     user_id=user_id,
                     workspace_id=workspace_id,
                     query_text=query,
                     result_chunk_ids=[str(result.chunk_id) for result in results],
                     result_count=len(results),
+                    result_snapshot=result_snapshot,
                     clicked_count=0,
+                    clicked_chunk_ids=[],
                     search_duration_ms=search_duration_ms,
+                    retrieval_metadata={
+                        **(retrieval_metadata or {}),
+                        "embedding_provider": getattr(self.embedding_service, "provider", None),
+                        "embedding_model": getattr(self.embedding_service, "model", None),
+                    },
                     created_at=datetime.now(timezone.utc),
                 )
-                db.add(search_log)
-                await db.flush()
                 return str(search_log.id)
         except Exception as exc:
             logger.warning("Failed to persist semantic-search analytics: %s", exc)
