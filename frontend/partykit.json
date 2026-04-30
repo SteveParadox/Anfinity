@@ -1,0 +1,8 @@
+{
+  "$schema": "./node_modules/partykit/schema.json",
+  "name": "anfinity-collaboration",
+  "main": "partykit/server.ts",
+  "port": 1999,
+  "persist": ".partykit/state",
+  "compatibilityDate": "2025-03-26"
+}
