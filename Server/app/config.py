@@ -1,7 +1,8 @@
 """Application configuration using Pydantic Settings."""
+import json
 import secrets
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
@@ -107,6 +108,8 @@ def _normalize_secret(value: Optional[str]) -> Optional[str]:
         "set your",
         "changeme",
         "replace-me",
+        "replace-with",
+        "required",
     )
     if any(marker in lowered for marker in placeholder_markers):
         return None
@@ -218,6 +221,7 @@ class Settings(BaseSettings):
     AUTOMATION_WEBHOOK_SECRET: Optional[str] = None
     FRONTEND_URL: str = Field(default="http://localhost:5173")
     INTEGRATIONS_OAUTH_REDIRECT_BASE_URL: Optional[str] = None
+    AUTH_OAUTH_REDIRECT_BASE_URL: Optional[str] = None
     
     # CORS - configure for production
     CORS_ORIGINS: list = Field(default=["http://localhost:3000", "http://localhost:5173"])
@@ -232,12 +236,27 @@ class Settings(BaseSettings):
     
     # Redis
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
+
+    # Celery
+    CELERY_TASK_TIME_LIMIT: int = 3600
+    CELERY_TASK_SOFT_TIME_LIMIT: int = 3300
+    CELERY_TASK_DEFAULT_RETRY_DELAY: int = 60
+    CELERY_RETRY_BASE_SECONDS: int = 60
+    CELERY_RETRY_MAX_SECONDS: int = 900
+    CELERY_RESULT_EXPIRES: int = 86400
+    CELERY_WORKER_POOL: str = Field(default="solo")
+    CELERY_WORKER_PREFETCH_MULTIPLIER: int = 1
+    CELERY_WORKER_MAX_TASKS_PER_CHILD: int = 100
+    CELERY_BROKER_VISIBILITY_TIMEOUT: int = 7200
+    CELERY_BROKER_SOCKET_TIMEOUT: int = 30
+    CELERY_BROKER_SOCKET_CONNECT_TIMEOUT: int = 30
     
     # Qdrant Vector DB
     QDRANT_URL: str = Field(default="http://localhost:6333")
     QDRANT_API_KEY: Optional[str] = None
     QDRANT_COLLECTION_PREFIX: str = "anfinity"
     QDRANT_REQUIRED: bool = Field(default=True)  # Fail-fast if Qdrant unavailable (set to False for development without Qdrant)
+    QDRANT_UPSERT_BATCH_SIZE: int = 256
     
     # S3 Storage
     AWS_ACCESS_KEY_ID: str = Field(default="minioadmin")
@@ -312,6 +331,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     GOOGLE_REDIRECT_PATH: str = "/connectors/oauth/google/callback"
+    GOOGLE_AUTH_REDIRECT_PATH: str = "/auth/google/callback"
     GITHUB_CLIENT_ID: Optional[str] = None
     GITHUB_CLIENT_SECRET: Optional[str] = None
 
@@ -358,6 +378,80 @@ class Settings(BaseSettings):
         env_file = ".env"
         case_sensitive = True
 
+    @field_validator("CORS_ORIGINS", "CORS_METHODS", "CORS_HEADERS", "ALLOWED_FILE_TYPES", mode="before")
+    @classmethod
+    def _parse_env_list(cls, value: Any) -> Any:
+        """Accept JSON arrays or comma-separated strings for list env vars."""
+        if value is None or isinstance(value, list):
+            return value
+        if isinstance(value, (tuple, set)):
+            return list(value)
+        if not isinstance(value, str):
+            return value
+
+        raw_value = value.strip()
+        if not raw_value:
+            return []
+
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+    @field_validator(
+        "ENCRYPTION_KEY",
+        "AUTOMATION_INTERNAL_TOKEN",
+        "AUTOMATION_WEBHOOK_SECRET",
+        "INTEGRATIONS_OAUTH_REDIRECT_BASE_URL",
+        "AUTH_OAUTH_REDIRECT_BASE_URL",
+        "QDRANT_API_KEY",
+        "S3_ENDPOINT_URL",
+        "OPENAI_API_KEY",
+        "OLLAMA_API_KEY",
+        "OLLAMA_FALLBACK_MODEL",
+        "COHERE_API_KEY",
+        "SLACK_CLIENT_ID",
+        "SLACK_CLIENT_SECRET",
+        "NOTION_CLIENT_ID",
+        "NOTION_CLIENT_SECRET",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GITHUB_CLIENT_ID",
+        "GITHUB_CLIENT_SECRET",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_PUBLISHABLE_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        "STRIPE_PRICE_ID_PRO_MONTHLY",
+        "STRIPE_PRICE_ID_PRO_ANNUAL",
+        "STRIPE_PRICE_ID_TEAM_MONTHLY",
+        "STRIPE_PRICE_ID_TEAM_ANNUAL",
+        "STRIPE_PRICE_ID_ENTERPRISE_MONTHLY",
+        "STRIPE_PRICE_ID_ENTERPRISE_ANNUAL",
+        "GRAPH_CLUSTER_SYNC_TOKEN",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_optional_env_value(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        return _normalize_secret(value)
+
+    @field_validator("JWT_SECRET", mode="before")
+    @classmethod
+    def _normalize_jwt_secret(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            return str(value)
+        return _normalize_secret(value) or ""
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def _normalize_debug(cls, value):
@@ -379,6 +473,45 @@ class Settings(BaseSettings):
             if self.ENVIRONMENT == "production":
                 raise ValueError("JWT_SECRET must be set in production")
             self.JWT_SECRET = secrets.token_urlsafe(64)
+
+        if self.ENVIRONMENT == "production":
+            missing_settings: list[str] = []
+            if not _normalize_secret(self.ENCRYPTION_KEY):
+                missing_settings.append("ENCRYPTION_KEY")
+            if not _normalize_secret(self.FRONTEND_URL):
+                missing_settings.append("FRONTEND_URL")
+            if not self.CORS_ORIGINS:
+                missing_settings.append("CORS_ORIGINS")
+            if "*" in self.CORS_ORIGINS:
+                raise ValueError("CORS_ORIGINS must not contain '*' in production")
+            if not _normalize_secret(self.DATABASE_URL):
+                missing_settings.append("DATABASE_URL")
+            if not _normalize_secret(self.REDIS_URL):
+                missing_settings.append("REDIS_URL")
+            if self.QDRANT_REQUIRED and not _normalize_secret(self.QDRANT_URL):
+                missing_settings.append("QDRANT_URL")
+            if not _normalize_secret(self.AWS_ACCESS_KEY_ID):
+                missing_settings.append("AWS_ACCESS_KEY_ID")
+            if not _normalize_secret(self.AWS_SECRET_ACCESS_KEY):
+                missing_settings.append("AWS_SECRET_ACCESS_KEY")
+            if not _normalize_secret(self.S3_BUCKET_NAME):
+                missing_settings.append("S3_BUCKET_NAME")
+
+            needs_openai_key = (
+                self.LLM_PROVIDER == "openai"
+                or self.EMBEDDING_PROVIDER == "openai"
+                or bool(self.EMBEDDING_FALLBACK_ENABLED)
+            )
+            if needs_openai_key and not _normalize_secret(self.OPENAI_API_KEY):
+                missing_settings.append("OPENAI_API_KEY")
+            if self.EMBEDDING_PROVIDER == "cohere" and not _normalize_secret(self.COHERE_API_KEY):
+                missing_settings.append("COHERE_API_KEY")
+
+            if missing_settings:
+                raise ValueError(
+                    "Missing required production settings: "
+                    + ", ".join(dict.fromkeys(missing_settings))
+                )
         
         # Fix common misconfiguration: OLLAMA_BASE_URL pointing to public website
         """

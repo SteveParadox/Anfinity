@@ -38,8 +38,12 @@ celery_app.conf.update(
     
     # Task settings
     task_track_started=True,
-    task_time_limit=3600,
+    task_time_limit=settings.CELERY_TASK_TIME_LIMIT,
+    task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT,
     task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_default_retry_delay=settings.CELERY_TASK_DEFAULT_RETRY_DELAY,
+    result_expires=settings.CELERY_RESULT_EXPIRES,
     
     # Queue and exchange settings (CRITICAL for Redis/Kombu)
     task_default_queue="celery",
@@ -67,19 +71,64 @@ celery_app.conf.update(
             "routing_key": "processing",
             "durable": True,
         },
+        "enrichment": {
+            "exchange": "enrichment",
+            "exchange_type": "direct",
+            "routing_key": "enrichment",
+            "durable": True,
+        },
+        "connectors": {
+            "exchange": "connectors",
+            "exchange_type": "direct",
+            "routing_key": "connectors",
+            "durable": True,
+        },
+        "maintenance": {
+            "exchange": "maintenance",
+            "exchange_type": "direct",
+            "routing_key": "maintenance",
+            "durable": True,
+        },
+    },
+
+    # Route long-running or bursty work away from the default queue so workers
+    # can be scaled independently by workload class.
+    task_routes={
+        "app.tasks.worker.process_document": {"queue": "processing", "routing_key": "processing"},
+        "app.tasks.worker.process_paste_content": {"queue": "processing", "routing_key": "processing"},
+        "app.tasks.worker.process_voice_input": {"queue": "processing", "routing_key": "processing"},
+        "generate_embeddings_document": {"queue": "processing", "routing_key": "processing"},
+        "generate_embeddings_workspace": {"queue": "processing", "routing_key": "processing"},
+        "embed_chunks": {"queue": "processing", "routing_key": "processing"},
+        "generate_note_embedding": {"queue": "enrichment", "routing_key": "enrichment"},
+        "generate_workspace_note_embeddings": {"queue": "enrichment", "routing_key": "enrichment"},
+        "generate_note_summary": {"queue": "enrichment", "routing_key": "enrichment"},
+        "generate_workspace_note_summaries": {"queue": "enrichment", "routing_key": "enrichment"},
+        "run_note_auto_tagging_pipeline": {"queue": "enrichment", "routing_key": "enrichment"},
+        "classify_note_tags": {"queue": "enrichment", "routing_key": "enrichment"},
+        "classify_note_decay": {"queue": "enrichment", "routing_key": "enrichment"},
+        "app.tasks.worker.sync_connector": {"queue": "connectors", "routing_key": "connectors"},
+        "app.tasks.worker.sync_all_connectors": {"queue": "connectors", "routing_key": "connectors"},
+        "app.tasks.dlq.move_to_dlq": {"queue": "maintenance", "routing_key": "maintenance"},
+        "app.tasks.worker.delete_vector_ids": {"queue": "maintenance", "routing_key": "maintenance"},
+        "app.tasks.worker.delete_document_vectors": {"queue": "maintenance", "routing_key": "maintenance"},
     },
     
-    # Worker settings
-    # NOTE: Using 'solo' pool to avoid billiard unpacking errors on Windows
-    # Solo pool is synchronous (single-process) but more stable for this use case
-    worker_pool="solo",
-    worker_prefetch_multiplier=1,
-    worker_max_tasks_per_child=100,
+    # Worker settings. Default to "solo" for local Windows stability; production
+    # deployments should set CELERY_WORKER_POOL to a concurrent pool.
+    worker_pool=settings.CELERY_WORKER_POOL,
+    worker_prefetch_multiplier=settings.CELERY_WORKER_PREFETCH_MULTIPLIER,
+    worker_max_tasks_per_child=settings.CELERY_WORKER_MAX_TASKS_PER_CHILD,
     
     # Broker settings
     broker_connection_retry_on_startup=True,
     broker_connection_retry=True,
     broker_connection_max_retries=10,
+    broker_transport_options={
+        "visibility_timeout": settings.CELERY_BROKER_VISIBILITY_TIMEOUT,
+        "socket_timeout": settings.CELERY_BROKER_SOCKET_TIMEOUT,
+        "socket_connect_timeout": settings.CELERY_BROKER_SOCKET_CONNECT_TIMEOUT,
+    },
     
     # Rate limiting
     worker_disable_rate_limits=False,
