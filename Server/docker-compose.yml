@@ -18,6 +18,7 @@ services:
       COHERE_API_KEY: ${COHERE_API_KEY:-}
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      PORT: 8080
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,7 +66,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./app:/app/app
-    command: celery -A app.tasks.worker worker --loglevel=info --concurrency=4
+    command: python -m celery -A app.celery_app:celery_app worker --loglevel=info --concurrency=4
     networks:
       - anfinity
 
@@ -94,7 +95,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./app:/app/app
-    command: celery -A app.tasks.worker beat --loglevel=info
+    command: python -m celery -A app.celery_app:celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
     networks:
       - anfinity
 

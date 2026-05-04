@@ -1,0 +1,66 @@
+# Fly.io config for the backend half of the pragmatic deployment.
+# Change `app` before first deploy, then run `fly launch --no-deploy` from Server/.
+app = "anfinity-api"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "60s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  release_command = "alembic upgrade head"
+  strategy = "rolling"
+
+[env]
+  ENVIRONMENT = "production"
+  DEBUG = "false"
+  PORT = "8000"
+  CELERY_WORKER_POOL = "prefork"
+  LLM_PROVIDER = "openai"
+  EMBEDDING_PROVIDER = "openai"
+  OPENAI_MODEL = "gpt-4o-mini"
+  OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+  EMBEDDING_DIMENSION = "1536"
+  OLLAMA_ENABLED = "false"
+  S3_ENDPOINT_URL = ""
+
+[processes]
+  app = "uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"
+  worker = "python -m celery -A app.celery_app:celery_app worker --loglevel=info --concurrency=4 --queues=celery,default,processing,enrichment,connectors,maintenance"
+  beat = "python -m celery -A app.celery_app:celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 80
+    hard_limit = 120
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+  processes = ["worker"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["beat"]
