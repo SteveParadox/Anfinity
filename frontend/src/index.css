@@ -974,3 +974,106 @@
 .anfinity-collaboration-selection {
   border-radius: 2px;
 }
+
+.google-auth-btn {
+  width: 100%;
+  height: 46px;
+  border-radius: 3px;
+  background: transparent;
+  border: 1px solid var(--ink-mid);
+  color: var(--snow);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease,
+    transform 0.12s ease;
+}
+
+.google-auth-btn:hover:not(:disabled) {
+  border-color: var(--yolk);
+  background: rgba(var(--accent-rgb), 0.06);
+  color: var(--yolk-bright);
+  transform: translateY(-1px);
+}
+
+.google-auth-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.google-auth-btn:disabled {
+  border-color: var(--ink-border);
+  color: var(--ink-muted);
+  cursor: not-allowed;
+}
+
+.oauth-callback-panel {
+  position: relative;
+  z-index: 10;
+  width: min(420px, calc(100vw - 32px));
+  min-height: 260px;
+  padding: 44px 34px;
+  border: 1px solid var(--ink-border);
+  border-left: 4px solid var(--yolk);
+  border-radius: 4px;
+  background: var(--ink-black);
+  box-shadow:
+    0 0 0 1px rgba(var(--accent-rgb), 0.06),
+    0 28px 70px rgba(0, 0, 0, 0.65);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: var(--snow);
+  text-align: center;
+}
+
+.oauth-callback-panel svg {
+  color: var(--yolk);
+}
+
+.oauth-callback-title {
+  font-family: var(--font-display);
+  font-size: 34px;
+  line-height: 0.95;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.oauth-callback-copy {
+  max-width: 320px;
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.oauth-callback-link {
+  margin-top: 8px;
+  color: var(--yolk);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+  text-transform: uppercase;
+  border-bottom: 1px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.oauth-callback-link:hover {
+  color: var(--yolk-bright);
+  border-bottom-color: var(--yolk-bright);
+}

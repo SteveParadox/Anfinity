@@ -10,14 +10,18 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Loader2, LogIn, AlertCircle } from 'lucide-react';
+import { Loader2, LogIn, AlertCircle, Chrome } from 'lucide-react';
+import { PRODUCT_NAME, PRODUCT_ONE_LINER } from '@/lib/productModel';
 import { cn } from '@/lib/utils';
 
 export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { login, isLoading, error, clearError } = useAuth();
+  const { login, loginWithGoogle, isLoading, error, clearError } = useAuth();
   const redirectTo = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
+  const oauthError = new URLSearchParams(location.search).get('oauth_error');
+  const displayError = error || oauthError;
+  const redirectPath = redirectTo ? `${redirectTo.pathname || ''}${redirectTo.search || ''}` : '/dashboard';
 
   const [formData, setFormData] = useState({
     email: '',
@@ -48,7 +52,14 @@ export function LoginPage() {
     if (!validateForm()) return;
     try {
       await login(formData.email, formData.password);
-      navigate(redirectTo ? `${redirectTo.pathname || ''}${redirectTo.search || ''}` : '/dashboard');
+      navigate(redirectPath);
+    } catch {}
+  };
+
+  const handleGoogleLogin = async () => {
+    clearError();
+    try {
+      await loginWithGoogle(redirectPath);
     } catch {}
   };
 
@@ -77,8 +88,8 @@ export function LoginPage() {
               <div className="brand-logo-mark">
                 <LogIn size={20} color="#fff" strokeWidth={2} />
               </div>
-              <div className="brand-name">Anfinity</div>
-              <div className="brand-tagline">AI-Powered Knowledge<br />Operating System</div>
+              <div className="brand-name">{PRODUCT_NAME}</div>
+              <div className="brand-tagline">AI Knowledge<br />Operating System</div>
             </div>
 
             <div className="brand-features">
@@ -95,20 +106,20 @@ export function LoginPage() {
             </div>
 
             <div className="brand-footer-text">
-              Secure · Private · Enterprise-ready
+              Searchable, cited, permission-aware
             </div>
           </div>
 
           {/* Right form panel */}
           <div className="form-panel">
             <div className="form-heading">Welcome back</div>
-            <div className="form-subheading">Sign in to your workspace to continue</div>
+            <div className="form-subheading">{PRODUCT_ONE_LINER}</div>
 
             {/* Auth error */}
-            {error && (
+            {displayError && (
               <div className="error-alert">
                 <AlertCircle size={15} />
-                <span>{error}</span>
+                <span>{displayError}</span>
               </div>
             )}
 
@@ -183,6 +194,15 @@ export function LoginPage() {
               <span className="divider-text">or</span>
               <div className="divider-line" />
             </div>
+
+            <button type="button" className="google-auth-btn" disabled={isLoading} onClick={handleGoogleLogin}>
+              {isLoading ? (
+                <Loader2 size={15} className="animate-spin" />
+              ) : (
+                <Chrome size={15} />
+              )}
+              Continue with Google
+            </button>
 
             <div className="signup-row">
               Don't have an account?{' '}

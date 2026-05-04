@@ -22,6 +22,7 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { useProductSettings } from '../hooks/useProductSettings';
 import { useTheme } from '../hooks/useTheme';
+import { formatPlanLabel } from '../lib/productModel';
 import type { ProductUserSettings, ProductWorkspaceSettings } from '../lib/api';
 import type { User } from '../types';
 
@@ -553,7 +554,7 @@ export function SettingsView({ user }: SettingsViewProps) {
             <FieldGroup title="Account" description="Your app identity and current plan. Workspace roles still control shared settings.">
               <InfoRow label="Name" value={user.full_name || user.name || 'Unnamed user'} />
               <InfoRow label="Email" value={user.email} />
-              <InfoRow label="Plan" value={user.plan || 'free'} />
+              <InfoRow label="Plan" value={formatPlanLabel(user.plan)} />
             </FieldGroup>
           )}
 

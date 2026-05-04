@@ -22,6 +22,7 @@ import { api, type WorkspaceStatsResponse } from '@/lib/api';
 import { AuthContext } from '@/contexts/AuthContext';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { UsageDashboard } from '@/components/billing/UsageDashboard';
+import { formatPlanLabel } from '@/lib/productModel';
 import type { AIInsight, Note, User } from '@/types';
 
 interface DashboardProps {
@@ -714,7 +715,7 @@ export function Dashboard({
               >
                 <span style={{ color: 'var(--theme-accent)' }}>W</span>elcome, {user?.name ? user.name.split(' ')[0] : 'User'}
               </h1>
-              <MonoChip yellow>{user?.plan ? user.plan.charAt(0).toUpperCase() + user.plan.slice(1) : 'Free'}</MonoChip>
+              <MonoChip yellow>{formatPlanLabel(user?.plan)}</MonoChip>
             </div>
             <div style={{ width: 36, height: 3, background: 'var(--theme-accent)', marginTop: 10 }} />
             <div className="mt-4 flex flex-wrap items-center gap-3">

@@ -297,7 +297,7 @@ export interface BillingPlanLimit {
 }
 
 export interface BillingPlanDefinition {
-  key: string;
+  key: 'free' | 'pro' | 'team' | 'enterprise';
   name: string;
   description: string;
   monthly_price_cents: number;
@@ -313,14 +313,16 @@ export interface BillingPlanDefinition {
     monthly: string | null;
     annual: string | null;
   };
+  supports_team_features?: boolean;
+  supports_admin_features?: boolean;
+  public?: boolean;
+  overage_rules?: Record<string, string>;
 }
 
 export interface BillingSubscription {
-  plan_key: string;
+  plan_key: 'free' | 'pro' | 'team' | 'enterprise';
   billing_interval: 'monthly' | 'annual';
-  status: 'active' | 'trialing' | 'past_due' | 'canceled' | 'incomplete';
-  stripe_customer_id?: string | null;
-  stripe_subscription_id?: string | null;
+  status: 'active' | 'trialing' | 'past_due' | 'canceled' | 'unpaid' | 'incomplete';
   period_start?: string | null;
   period_end?: string | null;
   cancel_at_period_end?: boolean;
@@ -798,6 +800,17 @@ class ApiClient {
     return this.request('/auth/login', {
       method: 'POST',
       body: JSON.stringify(credentials),
+    });
+  }
+
+  async getGoogleAuthUrl(redirectPath?: string): Promise<{ authorization_url: string }> {
+    const queryParams = new URLSearchParams();
+    if (redirectPath) {
+      queryParams.append('redirect_path', redirectPath);
+    }
+    const suffix = queryParams.toString();
+    return this.request(`/auth/google/authorize${suffix ? `?${suffix}` : ''}`, {
+      retries: false,
     });
   }
 

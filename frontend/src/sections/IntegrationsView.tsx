@@ -413,7 +413,6 @@ export function IntegrationsView() {
     <section style={shellStyle}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', marginBottom: 20, flexWrap: 'wrap' }}>
         <div>
-          <p style={eyebrowStyle}>Feature 2</p>
           <h1 style={titleStyle}>Integrations</h1>
           <p style={mutedStyle}>One shared OAuth layer powers Slack, Notion, Gmail, and Calendar syncs, with inline controls for sync, pause, config, and attention triage.</p>
         </div>

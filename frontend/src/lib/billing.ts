@@ -22,6 +22,9 @@ export function formatCurrencyFromCents(cents: number, currency: string = 'USD')
 }
 
 export function getPlanPriceCents(plan: BillingPlanDefinition, interval: BillingInterval): number | null {
+  if (plan.monthly_price_cents === 0 && plan.annual_price_cents === null) {
+    return null;
+  }
   if (interval === 'annual') {
     return plan.annual_per_month_cents ?? plan.monthly_price_cents;
   }
@@ -35,11 +38,13 @@ export function getPlanAnnualSavingsLabel(plan: BillingPlanDefinition, currency:
   return `${formatCurrencyFromCents(plan.annual_savings_cents, currency)} saved yearly`;
 }
 
-export function getUsagePercentage(metric: BillingUsageMetric): number | null {
-  if (metric.limit === null || metric.limit <= 0) {
+export function getUsagePercentage(metric: Partial<BillingUsageMetric> | null | undefined): number | null {
+  const limit = typeof metric?.limit === 'number' ? metric.limit : null;
+  if (limit === null || limit <= 0) {
     return null;
   }
-  const percentage = (metric.current_usage / metric.limit) * 100;
+  const usage = typeof metric?.current_usage === 'number' ? metric.current_usage : 0;
+  const percentage = (usage / limit) * 100;
   return Math.max(0, percentage);
 }
 
@@ -101,6 +106,6 @@ export function parseEntitlementMetadata(error: unknown): EntitlementMetadata | 
   };
 }
 
-export function isPaidSubscription(subscription: BillingSubscription): boolean {
-  return subscription.plan_key !== 'free';
+export function isPaidSubscription(subscription: BillingSubscription | null | undefined): boolean {
+  return Boolean(subscription && subscription.plan_key !== 'free');
 }

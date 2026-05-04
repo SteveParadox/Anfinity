@@ -7,6 +7,7 @@ import { useState } from 'react';
 import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { Loader2, UserPlus, AlertCircle, Check } from 'lucide-react';
+import { PRODUCT_NAME, PRODUCT_ONE_LINER, SIGNUP_VALUE_PROPS } from '@/lib/productModel';
 
 export function RegisterPage() {
   const navigate = useNavigate();
@@ -110,17 +111,12 @@ export function RegisterPage() {
             <div className="brand-logo-mark">
               <UserPlus size={20} color="#fff" strokeWidth={2} />
             </div>
-            <div className="brand-name">Anfinity</div>
-            <div className="brand-tagline">AI-Powered Knowledge<br />Operating System</div>
+            <div className="brand-name">{PRODUCT_NAME}</div>
+            <div className="brand-tagline">AI Knowledge<br />Operating System</div>
           </div>
 
           <div className="brand-features">
-            {[
-              'Semantic search across all your knowledge',
-              'Multi-source document ingestion',
-              'Real-time AI Q&A on your data',
-              'Team collaboration & access controls',
-            ].map((feat, i) => (
+            {SIGNUP_VALUE_PROPS.map((feat, i) => (
               <div className="brand-feature" key={i}>
                 <div className="brand-feature-dot" />
                 <div className="brand-feature-text">{feat}</div>
@@ -129,14 +125,14 @@ export function RegisterPage() {
           </div>
 
           <div className="brand-footer-text">
-            Secure · Private · Enterprise-ready
+            Searchable, cited, permission-aware
           </div>
         </div>
 
         {/* Right form panel */}
         <div className="form-panel" style={{ padding: '44px 48px' }}>
           <div className="form-heading">Create your account</div>
-          <div className="form-subheading">Get started with Anfinity — free forever on the starter plan</div>
+          <div className="form-subheading">{PRODUCT_ONE_LINER}</div>
 
           {/* Auth error */}
           {error && (
@@ -345,7 +341,7 @@ export function RegisterPage() {
       </div>
 
       <div className="page-footer">
-        Join thousands of teams using Anfinity for knowledge management
+        Built for teams turning scattered notes and documents into trusted workspace intelligence
       </div>
     </div>
   );

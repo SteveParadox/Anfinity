@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { Check, Minus } from 'lucide-react';
 import { api, type BillingPlanDefinition, type BillingSubscription } from '@/lib/api';
 import { formatCurrencyFromCents, getPlanAnnualSavingsLabel, getPlanPriceCents, type BillingInterval } from '@/lib/billing';
+import { BILLING_ADD_ONS, PRODUCT_SUBHEADLINE, PRODUCT_TAGLINE, formatPlanLabel } from '@/lib/productModel';
+import type { PlanName } from '@/types';
 
 interface PricingViewProps {
-  currentPlan?: 'free' | 'pro' | 'team' | 'enterprise';
+  currentPlan?: PlanName;
   workspaceId?: string | null;
   isAuthenticated?: boolean;
 }
@@ -161,8 +163,7 @@ export function PricingView({
             PRICING
           </h1>
           <p style={{ margin: '10px auto 0', maxWidth: 680, fontFamily: TT.fontBody, color: TT.inkMuted, lineHeight: 1.7 }}>
-            Centralized plan and entitlement definitions from backend billing APIs.
-            Prices update instantly by interval and comparison rows stay aligned to real limits.
+            {PRODUCT_TAGLINE} {PRODUCT_SUBHEADLINE}
           </p>
         </div>
 
@@ -237,7 +238,7 @@ export function PricingView({
                       </span>
                     ) : null}
                   </div>
-                  {interval === 'annual' && savingsLabel ? (
+                  {price !== null && interval === 'annual' && savingsLabel ? (
                     <div style={{ marginTop: 4, fontFamily: TT.fontMono, fontSize: 9.5, color: TT.yolk }}>{savingsLabel}</div>
                   ) : null}
                 </div>
@@ -246,6 +247,7 @@ export function PricingView({
                   <LimitChip label="Notes" value={planLimitLabel(plan, 'notes_created_monthly')} />
                   <LimitChip label="Searches" value={planLimitLabel(plan, 'semantic_search_runs_monthly')} />
                   <LimitChip label="Sessions" value={planLimitLabel(plan, 'thinking_sessions_created_monthly')} />
+                  <LimitChip label="Automations" value={planLimitLabel(plan, 'automations_created_monthly')} />
                 </div>
 
                 <button
@@ -276,10 +278,31 @@ export function PricingView({
         </div>
 
         <div style={{ marginBottom: 16, display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-          <MetaCard label="Current plan" value={resolvedCurrentPlan.toUpperCase()} />
+          <MetaCard label="Current plan" value={formatPlanLabel(resolvedCurrentPlan)} />
           <MetaCard label="Subscription status" value={subscriptionLoading ? 'Loading…' : statusLabel(subscription)} />
           <MetaCard label="Billing interval" value={subscription?.billing_interval?.toUpperCase() || interval.toUpperCase()} />
         </div>
+
+        <section style={{ background: TT.inkDeep, border: `1px solid ${TT.inkBorder}`, borderRadius: 4, padding: 14, marginBottom: 16 }}>
+          <h2 style={{ margin: 0, fontFamily: TT.fontDisplay, fontSize: 28, letterSpacing: '0.05em', color: TT.snow }}>
+            Usage add-ons
+          </h2>
+          <p style={{ margin: '6px 0 12px', fontFamily: TT.fontBody, fontSize: 12.5, color: TT.inkMuted, lineHeight: 1.6 }}>
+            Add-ons are priced for cost control and expansion. Self-serve checkout appears only after matching Stripe prices are configured.
+          </p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 10 }}>
+            {BILLING_ADD_ONS.map((addOn) => (
+              <div key={addOn.name} style={{ border: `1px solid ${TT.inkBorder}`, background: TT.inkRaised, borderRadius: 3, padding: '10px 12px' }}>
+                <div style={{ fontFamily: TT.fontMono, fontSize: 9.5, color: TT.inkMuted, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                  {addOn.name}
+                </div>
+                <div style={{ marginTop: 6, fontFamily: TT.fontDisplay, fontSize: 22, color: TT.snow, letterSpacing: '0.04em' }}>
+                  {addOn.price}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
 
         {ctaMessage ? (
           <div style={{ marginBottom: 12, border: '1px solid rgba(245,230,66,0.3)', background: 'rgba(245,230,66,0.08)', borderRadius: 3, padding: '10px 12px', color: TT.snow, fontFamily: TT.fontBody, fontSize: 12.5 }}>

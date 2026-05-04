@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useContext, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -14,7 +14,6 @@ import { useProductSettings } from '@/hooks/useProductSettings';
 import { useEntitlementGuard } from '@/hooks/useEntitlementGuard';
 import { getCollaboratorColor } from '@/lib/collaboration/colors';
 import { UpgradePrompt } from '@/components/billing/UpgradePrompt';
-import { CollaborativeNoteEditor } from '@/components/notes/CollaborativeNoteEditor';
 import { OnboardingAcceleratorPanel } from '@/components/notes/OnboardingAcceleratorPanel';
 import { NoteInvitePanel } from '@/components/notes/NoteInvitePanel';
 
@@ -54,6 +53,12 @@ const noteTypeConfig = {
   voice:         { icon: Mic,      color: '#FB923C',    bg: 'rgba(251,146,60,0.07)',      label: 'Voice'     },
   'ai-generated':{ icon: Sparkles, color: TT.yolk,      bg: 'rgba(245,230,66,0.07)',      label: 'AI'        },
 } as const;
+
+const CollaborativeNoteEditor = lazy(() =>
+  import('@/components/notes/CollaborativeNoteEditor').then((module) => ({
+    default: module.CollaborativeNoteEditor,
+  })),
+);
 
 // FIX: safe wrapper — guards against missing/null/invalid dates from the API
 function safeFromNow(date: Date | string | undefined | null): string {
@@ -1904,32 +1909,40 @@ export function NotesView({
             ) : null}
             <div>
               <FieldLabel>Content</FieldLabel>
-              <CollaborativeNoteEditor
-                noteId={editingNote.id}
-                token={collaborationToken}
-                user={{
-                  userId: user?.id || editingNote.userId,
-                  email: user?.email || '',
-                  name: user?.full_name || user?.email || 'Collaborator',
-                  color: getCollaboratorColor(user?.id || editingNote.userId),
-                  canUpdate: Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update')),
-                }}
-                editable={Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update'))}
-                showPresence={showRealtimePresence}
-                showCollaboratorCursors={showCollaboratorCursors}
-                onPlainTextChange={(content) => {
-                  setEditingNote((current) => {
-                    if (!current || current.id !== editingNote.id || current.content === content) {
-                      return current;
-                    }
+              <Suspense
+                fallback={
+                  <div style={{ minHeight: 240, padding: '14px 16px', background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, color: TT.inkMuted, fontFamily: TT.fontMono, fontSize: 10, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+                    Loading editor...
+                  </div>
+                }
+              >
+                <CollaborativeNoteEditor
+                  noteId={editingNote.id}
+                  token={collaborationToken}
+                  user={{
+                    userId: user?.id || editingNote.userId,
+                    email: user?.email || '',
+                    name: user?.full_name || user?.email || 'Collaborator',
+                    color: getCollaboratorColor(user?.id || editingNote.userId),
+                    canUpdate: Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update')),
+                  }}
+                  editable={Boolean(editingNote.workspaceId && hasPermission(editingNote.workspaceId, 'notes', 'update'))}
+                  showPresence={showRealtimePresence}
+                  showCollaboratorCursors={showCollaboratorCursors}
+                  onPlainTextChange={(content) => {
+                    setEditingNote((current) => {
+                      if (!current || current.id !== editingNote.id || current.content === content) {
+                        return current;
+                      }
 
-                    return {
-                      ...current,
-                      content,
-                    };
-                  });
-                }}
-              />
+                      return {
+                        ...current,
+                        content,
+                      };
+                    });
+                  }}
+                />
+              </Suspense>
             </div>
             <div>
               <FieldLabel>Tags</FieldLabel>
