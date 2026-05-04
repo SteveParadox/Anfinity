@@ -7,8 +7,9 @@ import sqlalchemy as sa
 
 from sqlalchemy import (
     Column, String, DateTime, ForeignKey, Integer, Boolean,
-    JSON, Text, Enum, Float, Index, UniqueConstraint
+    JSON, Text, Enum, Float, Index, UniqueConstraint, CheckConstraint
 )
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
@@ -72,27 +73,53 @@ class WorkspaceSection(str, PyEnum):
 class BillingPlan(str, PyEnum):
     """Workspace billing plans."""
 
-    FREE = "free"
-    PRO = "pro"
-    TEAM = "team"
-    ENTERPRISE = "enterprise"
+    free = "free"
+    pro = "pro"
+    team = "team"
+    enterprise = "enterprise"
 
 
 class BillingInterval(str, PyEnum):
     """Subscription cadence."""
 
-    MONTHLY = "monthly"
-    ANNUAL = "annual"
+    monthly = "monthly"
+    annual = "annual"
 
 
 class BillingStatus(str, PyEnum):
     """Workspace subscription lifecycle."""
 
-    ACTIVE = "active"
-    TRIALING = "trialing"
-    PAST_DUE = "past_due"
-    CANCELED = "canceled"
-    INCOMPLETE = "incomplete"
+    active = "active"
+    trialing = "trialing"
+    past_due = "past_due"
+    canceled = "canceled"
+    unpaid = "unpaid"
+    incomplete = "incomplete"
+
+
+billing_plan_enum = SAEnum(
+    BillingPlan,
+    name="billingplan",
+    values_callable=_enum_values,
+    validate_strings=True,
+    native_enum=False,
+)
+
+billing_interval_enum = SAEnum(
+    BillingInterval,
+    name="billinginterval",
+    values_callable=_enum_values,
+    validate_strings=True,
+    native_enum=False,
+)
+
+billing_status_enum = SAEnum(
+    BillingStatus,
+    name="billingstatus",
+    values_callable=_enum_values,
+    validate_strings=True,
+    native_enum=False,
+)
 
 
 class NoteCollaborationRole(str, PyEnum):
@@ -368,9 +395,9 @@ class WorkspaceBillingProfile(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
-    plan = Column(Enum(BillingPlan), nullable=False, default=BillingPlan.FREE, index=True)
-    billing_interval = Column(Enum(BillingInterval), nullable=False, default=BillingInterval.MONTHLY, index=True)
-    status = Column(Enum(BillingStatus), nullable=False, default=BillingStatus.ACTIVE, index=True)
+    plan = Column(billing_plan_enum, nullable=False, default=BillingPlan.free, index=True)
+    billing_interval = Column(billing_interval_enum, nullable=False, default=BillingInterval.monthly, index=True)
+    status = Column(billing_status_enum, nullable=False, default=BillingStatus.active, index=True)
     stripe_customer_id = Column(String(255), nullable=True, index=True)
     stripe_subscription_id = Column(String(255), nullable=True, index=True)
     stripe_price_id = Column(String(255), nullable=True, index=True)
@@ -382,6 +409,21 @@ class WorkspaceBillingProfile(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
 
     workspace = relationship("Workspace", lazy="joined")
+
+    __table_args__ = (
+        CheckConstraint(
+            "plan IN ('free', 'pro', 'team', 'enterprise')",
+            name="ck_workspace_billing_profiles_plan",
+        ),
+        CheckConstraint(
+            "billing_interval IN ('monthly', 'annual')",
+            name="ck_workspace_billing_profiles_billing_interval",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'trialing', 'past_due', 'canceled', 'unpaid', 'incomplete')",
+            name="ck_workspace_billing_profiles_status",
+        ),
+    )
 
 
 class UsageCounter(Base):

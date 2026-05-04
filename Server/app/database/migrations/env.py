@@ -13,6 +13,8 @@ from app.config import settings
 
 def _to_alembic_sync_url(url: str) -> str:
     """Alembic must use a sync driver, even if app runtime uses asyncpg."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
     if url.startswith("postgresql+asyncpg://"):
         return url.replace("postgresql+asyncpg://", "postgresql://", 1)
     return url

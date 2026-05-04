@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 def _to_async_database_url(url: str) -> str:
     """Return an async SQLAlchemy URL for FastAPI request handlers."""
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
     if url.startswith("postgresql+asyncpg://"):
         return url
     if url.startswith("postgresql://"):
@@ -21,6 +23,8 @@ def _to_async_database_url(url: str) -> str:
 
 def _to_sync_database_url(url: str) -> str:
     """Return a sync SQLAlchemy URL for Celery/background workers."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
     if url.startswith("postgresql+asyncpg://"):
         return url.replace("postgresql+asyncpg://", "postgresql://", 1)
     return url

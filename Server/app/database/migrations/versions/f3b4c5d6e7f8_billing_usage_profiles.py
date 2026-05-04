@@ -17,14 +17,47 @@ branch_labels = None
 depends_on = None
 
 
+# Define enums with create_type=False to prevent duplicate creation errors
+billing_plan_enum = postgresql.ENUM(
+    "free",
+    "pro",
+    "team",
+    "enterprise",
+    name="billingplan",
+    create_type=False,
+)
+
+billing_interval_enum = postgresql.ENUM(
+    "monthly",
+    "annual",
+    name="billinginterval",
+    create_type=False,
+)
+
+billing_status_enum = postgresql.ENUM(
+    "active",
+    "trialing",
+    "past_due",
+    "canceled",
+    "incomplete",
+    name="billingstatus",
+    create_type=False,
+)
+
+
 def upgrade() -> None:
+    bind = op.get_bind()
+    billing_plan_enum.create(bind, checkfirst=True)
+    billing_interval_enum.create(bind, checkfirst=True)
+    billing_status_enum.create(bind, checkfirst=True)
+
     op.create_table(
         "workspace_billing_profiles",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("workspace_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("plan", sa.Enum("free", "pro", "team", "enterprise", name="billingplan"), nullable=False, server_default="free"),
-        sa.Column("billing_interval", sa.Enum("monthly", "annual", name="billinginterval"), nullable=False, server_default="monthly"),
-        sa.Column("status", sa.Enum("active", "trialing", "past_due", "canceled", "incomplete", name="billingstatus"), nullable=False, server_default="active"),
+        sa.Column("plan", billing_plan_enum, nullable=False, server_default="free"),
+        sa.Column("billing_interval", billing_interval_enum, nullable=False, server_default="monthly"),
+        sa.Column("status", billing_status_enum, nullable=False, server_default="active"),
         sa.Column("stripe_customer_id", sa.String(length=255), nullable=True),
         sa.Column("stripe_subscription_id", sa.String(length=255), nullable=True),
         sa.Column("stripe_price_id", sa.String(length=255), nullable=True),
@@ -104,6 +137,7 @@ def downgrade() -> None:
     op.drop_index("ix_workspace_billing_profiles_workspace_id", table_name="workspace_billing_profiles")
     op.drop_table("workspace_billing_profiles")
 
-    op.execute("DROP TYPE IF EXISTS billingstatus")
-    op.execute("DROP TYPE IF EXISTS billinginterval")
-    op.execute("DROP TYPE IF EXISTS billingplan")
+    bind = op.get_bind()
+    billing_status_enum.drop(bind, checkfirst=True)
+    billing_interval_enum.drop(bind, checkfirst=True)
+    billing_plan_enum.drop(bind, checkfirst=True)
