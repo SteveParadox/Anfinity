@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { AlertCircle, Loader2 } from 'lucide-react';
+import { PRODUCT_ONE_LINER } from '@/lib/productModel';
 
 export function RegisterForm() {
   const navigate = useNavigate();
@@ -83,7 +84,7 @@ export function RegisterForm() {
       <Card className="w-full max-w-md">
         <CardHeader className="space-y-1">
           <CardTitle className="text-2xl font-bold">Create account</CardTitle>
-          <CardDescription>Join Anfinity and start managing your knowledge</CardDescription>
+          <CardDescription>{PRODUCT_ONE_LINER}</CardDescription>
         </CardHeader>
 
         <CardContent>

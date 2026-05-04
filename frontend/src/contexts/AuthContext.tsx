@@ -5,7 +5,7 @@
 
 import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { api } from '@/lib/api';
-import type { WorkspacePermissions, WorkspacePermissionAction, WorkspacePermissionSection } from '@/types';
+import type { PlanName, WorkspacePermissions, WorkspacePermissionAction, WorkspacePermissionSection } from '@/types';
 
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
 
@@ -25,7 +25,7 @@ export interface User {
   email: string;
   name?: string;
   full_name?: string;
-  plan?: 'free' | 'pro' | 'team' | 'enterprise';
+  plan?: PlanName;
   is_active?: boolean;
   created_at?: string;
 }
@@ -39,6 +39,7 @@ export interface AuthContextType {
   isAuthenticated: boolean;
   error: string | null;
   login: (email: string, password: string) => Promise<void>;
+  loginWithGoogle: (redirectPath?: string) => Promise<void>;
   register: (email: string, password: string, fullName?: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshAuth: () => Promise<void>;
@@ -303,6 +304,21 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
   };
 
+  const loginWithGoogle = async (redirectPath?: string) => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const response = await api.getGoogleAuthUrl(redirectPath);
+      window.location.assign(response.authorization_url);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Google login failed';
+      setError(errorMessage);
+      setIsLoading(false);
+      throw err;
+    }
+  };
+
   const register = async (email: string, password: string, fullName?: string) => {
     setIsLoading(true);
     setError(null);
@@ -407,6 +423,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     isAuthenticated: user !== null,
     error,
     login,
+    loginWithGoogle,
     register,
     logout,
     refreshAuth,

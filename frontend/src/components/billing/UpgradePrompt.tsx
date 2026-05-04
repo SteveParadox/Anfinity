@@ -1,5 +1,6 @@
 import type { CSSProperties } from 'react';
 import type { EntitlementMetadata } from '@/lib/billing';
+import { formatPlanLabel } from '@/lib/productModel';
 
 interface UpgradePromptProps {
   entitlement: EntitlementMetadata;
@@ -55,8 +56,8 @@ export function UpgradePrompt({
       </div>
 
       <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 8 }}>
-        <Metric label="Current plan" value={entitlement.current_plan} />
-        <Metric label="Required plan" value={entitlement.required_plan || 'Higher tier'} />
+        <Metric label="Current plan" value={formatPlanLabel(entitlement.current_plan)} />
+        <Metric label="Required plan" value={entitlement.required_plan ? formatPlanLabel(entitlement.required_plan) : 'Higher tier'} />
         <Metric label="Usage" value={usageDetail} />
       </div>
 

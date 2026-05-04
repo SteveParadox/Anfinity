@@ -18,6 +18,7 @@ import {
   Upload,
   PlugZap,
 } from 'lucide-react';
+import { formatPlanLabel } from '@/lib/productModel';
 import type { User } from '@/types';
 
 interface SidebarProps {
@@ -74,6 +75,7 @@ export function Sidebar({
   const visibleNavigation = availableViews?.length
     ? navigation.filter((item) => availableViews.includes(item.id))
     : navigation;
+  const planLabel = formatPlanLabel(user?.plan);
 
   return (
     <div
@@ -267,8 +269,8 @@ export function Sidebar({
           })}
         </nav>
 
-        {/* ── Pro badge ─────────────────────────────────────────── */}
-        {!collapsed && user?.plan === 'pro' && (
+        {/* Plan badge */}
+        {!collapsed && user && (
           <div
             style={{
               marginTop: 20,
@@ -295,7 +297,7 @@ export function Sidebar({
                   color: TT.snow,
                 }}
               >
-                PRO PLAN
+                {planLabel.toUpperCase()} PLAN
               </span>
             </div>
             <p
@@ -308,7 +310,7 @@ export function Sidebar({
                 marginBottom: 10,
               }}
             >
-              Unlimited notes &amp; all AI features active
+              Workspace limits are enforced from live usage counters.
             </p>
             <button
               onClick={() => onViewChange('pricing')}
@@ -335,7 +337,7 @@ export function Sidebar({
                 (e.currentTarget as HTMLElement).style.color = TT.inkMuted;
               }}
             >
-              Upgrade to Team →
+              {user.plan === 'free' ? 'View plans' : 'Manage plan'}
             </button>
           </div>
         )}

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, type BillingUsageResponse } from '@/lib/api';
+import { ApiError, api, type BillingUsageMetric, type BillingUsageResponse } from '@/lib/api';
 import { formatCurrencyFromCents, getUsageProgressState, getUsagePercentage } from '@/lib/billing';
 
 interface UsageDashboardProps {
@@ -23,6 +23,32 @@ const TT = {
   fontBody: "'IBM Plex Sans', sans-serif",
 };
 
+function billingUsageErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 402) {
+      return 'This workspace has reached a plan limit. Upgrade to continue using this feature.';
+    }
+    if (error.status === 403) {
+      return 'You do not have permission to view workspace billing.';
+    }
+    if (error.status === 409) {
+      return error.message || 'Workspace billing state needs attention.';
+    }
+    if (error.status >= 500) {
+      return 'Billing usage is temporarily unavailable. Try again shortly.';
+    }
+  }
+  return error instanceof Error ? error.message : 'Unable to load usage metrics.';
+}
+
+function metricUsage(metric: Partial<BillingUsageMetric>): number {
+  return typeof metric.current_usage === 'number' ? Math.max(0, metric.current_usage) : 0;
+}
+
+function metricProjection(metric: Partial<BillingUsageMetric>): number {
+  return typeof metric.projected_usage === 'number' ? Math.max(0, metric.projected_usage) : metricUsage(metric);
+}
+
 export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboardProps) {
   const [payload, setPayload] = useState<BillingUsageResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -40,7 +66,8 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
       })
       .catch((err) => {
         if (!active) return;
-        setError(err instanceof Error ? err.message : 'Unable to load usage metrics.');
+        setPayload(null);
+        setError(billingUsageErrorMessage(err));
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -50,9 +77,16 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
     };
   }, [workspaceId]);
 
+  const usageMetrics = payload?.usage_metrics ?? [];
+  const projectedCost = payload?.projected_monthly_cost ?? {
+    base_monthly_cents: 0,
+    projected_overage_cents: 0,
+    projected_total_monthly_cents: 0,
+  };
+
   const periodLabel = useMemo(() => {
-    const first = payload?.usage_metrics?.[0];
-    if (!first) return null;
+    const first = usageMetrics[0];
+    if (!first?.period_start || !first?.period_end) return null;
     try {
       const start = new Date(first.period_start);
       const end = new Date(first.period_end);
@@ -60,7 +94,7 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
     } catch {
       return null;
     }
-  }, [payload]);
+  }, [usageMetrics]);
 
   const handleManageBilling = async () => {
     setOpeningPortal(true);
@@ -69,8 +103,7 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
       const response = await api.createBillingPortalSession(workspaceId);
       window.location.assign(response.url);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unable to open billing portal.';
-      setError(message);
+      setError(billingUsageErrorMessage(err));
       setOpeningPortal(false);
     }
   };
@@ -112,13 +145,13 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
             opacity: openingPortal ? 0.75 : 1,
           }}
         >
-          {openingPortal ? 'Opening…' : 'Manage billing'}
+          {openingPortal ? 'Opening...' : 'Manage billing'}
         </button>
       </div>
 
       {loading ? (
         <div style={{ marginTop: 12, fontFamily: TT.fontMono, fontSize: 11, color: TT.inkMuted }}>
-          Loading usage counters…
+          Loading usage counters...
         </div>
       ) : null}
       {error ? (
@@ -129,20 +162,28 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
 
       {payload ? (
         <>
+          {usageMetrics.length === 0 ? (
+            <div style={{ marginTop: 12, border: `1px solid ${TT.inkBorder}`, background: TT.inkRaised, borderRadius: 3, padding: '10px 12px', color: TT.inkMuted, fontFamily: TT.fontBody, fontSize: 12.5 }}>
+              No usage has been recorded for this billing period.
+            </div>
+          ) : null}
           <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10 }}>
-            {payload.usage_metrics.map((metric) => {
+            {usageMetrics.map((metric) => {
               const percentage = getUsagePercentage(metric);
               const state = getUsageProgressState(percentage);
               const barColor = state === 'red' ? TT.red : state === 'amber' ? TT.amber : TT.green;
               const width = percentage === null ? 100 : Math.min(percentage, 100);
+              const currentUsage = metricUsage(metric);
+              const projectedUsage = metricProjection(metric);
+              const limitLabel = typeof metric.limit === 'number' ? metric.limit.toLocaleString() : 'unlimited';
               return (
                 <article key={metric.metric_key} style={{ background: TT.inkRaised, border: `1px solid ${TT.inkBorder}`, borderRadius: 3, padding: '10px 12px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                     <div style={{ fontFamily: TT.fontMono, fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase', color: TT.inkMuted }}>
-                      {metric.label}
+                      {metric.label || metric.metric_key}
                     </div>
                     <div style={{ fontFamily: TT.fontMono, fontSize: 10, color: TT.snow }}>
-                      {metric.current_usage.toLocaleString()}/{metric.limit === null ? '∞' : metric.limit.toLocaleString()}
+                      {currentUsage.toLocaleString()}/{limitLabel}
                     </div>
                   </div>
                   <div style={{ marginTop: 8, height: 8, borderRadius: 999, background: '#111', border: `1px solid ${TT.inkBorder}`, overflow: 'hidden' }}>
@@ -150,7 +191,7 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
                   </div>
                   <div style={{ marginTop: 7, display: 'flex', justifyContent: 'space-between', gap: 8, fontFamily: TT.fontMono, fontSize: 9.5, color: TT.inkSubtle }}>
                     <span>{percentage === null ? 'Unlimited' : `${percentage.toFixed(1)}% used`}</span>
-                    <span>Projected: {metric.projected_usage.toLocaleString()}</span>
+                    <span>Projected: {projectedUsage.toLocaleString()}</span>
                   </div>
                 </article>
               );
@@ -162,10 +203,10 @@ export function UsageDashboard({ workspaceId, canManageBilling }: UsageDashboard
               Projected monthly cost
             </div>
             <div style={{ fontFamily: TT.fontDisplay, fontSize: 30, color: TT.snow, letterSpacing: '0.04em' }}>
-              {formatCurrencyFromCents(payload.projected_monthly_cost.projected_total_monthly_cents)}
+              {formatCurrencyFromCents(projectedCost.projected_total_monthly_cents)}
             </div>
             <div style={{ fontFamily: TT.fontBody, fontSize: 12.5, color: TT.inkMuted }}>
-              Base {formatCurrencyFromCents(payload.projected_monthly_cost.base_monthly_cents)} + projected overage {formatCurrencyFromCents(payload.projected_monthly_cost.projected_overage_cents)}.
+              Base {formatCurrencyFromCents(projectedCost.base_monthly_cents)} + projected overage {formatCurrencyFromCents(projectedCost.projected_overage_cents)}.
             </div>
           </div>
         </>
