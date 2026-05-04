@@ -1,6 +1,6 @@
-# CogniFlow Backend
+# Anfinity Backend
 
-Production-ready backend for the CogniFlow AI Knowledge Operating System.
+Production-ready backend for the Anfinity AI Knowledge Operating System.
 
 ## Architecture
 
@@ -22,7 +22,7 @@ Production-ready backend for the CogniFlow AI Knowledge Operating System.
 ### 1. Clone and Setup
 
 ```bash
-cd cogniflow-backend
+cd anfinity-backend
 cp .env.example .env
 # Edit .env with your API keys
 ```
@@ -89,12 +89,26 @@ docker-compose exec api alembic upgrade head
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection | `postgresql://postgres:postgres@localhost:5432/cogniflow` |
+| `DATABASE_URL` | PostgreSQL connection | `postgresql://postgres:postgres@localhost:5432/anfinity` |
 | `REDIS_URL` | Redis connection | `redis://localhost:6379/0` |
 | `QDRANT_URL` | Qdrant connection | `http://localhost:6333` |
 | `S3_ENDPOINT_URL` | S3 endpoint | `http://localhost:9000` |
 | `OPENAI_API_KEY` | OpenAI API key | - |
 | `EMBEDDING_PROVIDER` | Embedding provider | `openai` |
+
+## Billing Model
+
+Plan definitions live in `app/services/billing.py` and are served by `GET /billing/plans` for the pricing UI. Server-side entitlement checks use the same catalog, so visible limits and enforced limits stay aligned.
+
+| Plan | Monthly price | Primary fit |
+|------|---------------|-------------|
+| Free | $0 | Solo testers and early adopters |
+| Pro | $12 | Solo power users, researchers, founders |
+| Team | $18/user | Startups, agencies, product teams, research teams |
+| Business | $29/user | Growing teams that need governance and admin controls |
+| Enterprise | Custom | SSO, compliance review, private deployment, custom support |
+
+Configure Stripe price IDs with `STRIPE_PRICE_ID_*` variables before enabling self-serve upgrades.
 
 ## Development
 
@@ -128,6 +142,10 @@ pytest
 
 ## Production Deployment
 
+See [../DEPLOYMENT.md](../DEPLOYMENT.md) for the current production setup:
+Vercel frontend, hosted PartyKit, and Dockerized FastAPI/Celery services backed
+by managed PostgreSQL, Redis, Qdrant, and S3.
+
 ### Environment Variables
 
 ```bash
@@ -140,7 +158,7 @@ QDRANT_URL=<qdrant-url>
 QDRANT_API_KEY=<qdrant-api-key>
 AWS_ACCESS_KEY_ID=<aws-key>
 AWS_SECRET_ACCESS_KEY=<aws-secret>
-S3_BUCKET_NAME=cogniflow-prod
+S3_BUCKET_NAME=anfinity-prod
 OPENAI_API_KEY=<openai-key>
 ```
 
@@ -150,14 +168,14 @@ OPENAI_API_KEY=<openai-key>
 version: '3.8'
 services:
   api:
-    image: cogniflow/api:latest
+    image: anfinity/api:latest
     environment:
       - ENVIRONMENT=production
     deploy:
       replicas: 3
   
   worker:
-    image: cogniflow/api:latest
+    image: anfinity/api:latest
     command: celery -A app.tasks.worker worker --concurrency=8
     deploy:
       replicas: 2
