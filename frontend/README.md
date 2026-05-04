@@ -1,73 +1,46 @@
-# React + TypeScript + Vite
+# Anfinity Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Anfinity is an AI knowledge operating system for teams that need to capture, organize, search, understand, and approve knowledge across notes, documents, and connected tools.
 
-Currently, two official plugins are available:
+Deployment is documented in [../DEPLOYMENT.md](../DEPLOYMENT.md). The production
+frontend is intended to run on Vercel from this `Frontend/` directory, with
+PartyKit deployed separately for collaboration rooms.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+The product is positioned around one sharp workflow:
 
-## React Compiler
+1. Create or join a workspace.
+2. Add notes and upload documents.
+3. Search by meaning.
+4. Ask grounded questions across workspace knowledge.
+5. Review answers with citations, source cards, highlights, and feedback.
+6. Collaborate and approve important knowledge with workspace permissions.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Business Model
 
-## Expanding the ESLint configuration
+The frontend consumes the backend billing catalog at `/billing/plans` so pricing, plan comparison, and entitlement prompts stay aligned with server-side enforcement.
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+Current packaging:
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+| Plan | Price | Intended customer |
+| --- | --- | --- |
+| Free | $0 | Solo testers and early adopters |
+| Pro | $12/month | Solo power users, researchers, founders |
+| Team | $18/user/month | Startups, agencies, product teams, research teams |
+| Business | $29/user/month | Growing teams that need governance and admin controls |
+| Enterprise | Custom | Larger organizations with SSO, compliance, and private deployment needs |
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+Usage add-ons are displayed as expansion packaging only; self-serve checkout should appear after matching Stripe prices and backend fulfillment are configured.
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Development
+
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Verification
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run test:unit
+npm run build
 ```

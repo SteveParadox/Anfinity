@@ -3,7 +3,28 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>CogniFlow - AI Knowledge OS</title>
+    <title>Anfinity - AI Knowledge OS</title>
+    <script>
+      (function() {
+        try {
+          var key = 'anfinity-theme-choice';
+          var rawChoice = localStorage.getItem(key);
+          var choice = rawChoice === 'light' || rawChoice === 'dark' || rawChoice === 'system' ? rawChoice : 'system';
+          var systemTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+          var mode = choice === 'system' ? systemTheme : choice;
+          var root = document.documentElement;
+
+          root.dataset.theme = mode;
+          root.dataset.themeChoice = choice;
+          root.dataset.systemTheme = systemTheme;
+          root.classList.toggle('dark', mode === 'dark');
+          root.classList.toggle('light', mode === 'light');
+          root.style.colorScheme = mode;
+        } catch (_) {
+          // Ignore boot-time theme bootstrap failures and continue with defaults.
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
