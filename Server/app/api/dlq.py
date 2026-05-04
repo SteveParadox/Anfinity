@@ -195,13 +195,11 @@ async def retry_dlq_item(
             detail="Invalid item ID"
         )
     
-    # TODO: Implement retry logic
-    # 1. Fetch the DLQ item
-    # 2. Extract task name and arguments
-    # 3. Enqueue the task again
-    # 4. Update DLQ status to IN_RETRY
-    
-    return {"status": "retry_enqueued", "item_id": item_id}
+    try:
+        return DLQManager.retry_item(item_uuid)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
 
-
-from typing import Optional

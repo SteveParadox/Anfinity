@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from pathlib import Path
+from datetime import datetime
 from typing import Optional, List
 from uuid import UUID
 
@@ -254,9 +255,30 @@ async def upload_document(
     logger.info("🚀 [TASK QUEUE] Queueing process_document task for document %s", document.id)
     try:
         task = process_document.delay(str(document.id))
+        document.source_metadata = {
+            **(document.source_metadata or {}),
+            "ingestion_task_id": str(task.id),
+            "ingestion_queued_at": datetime.utcnow().isoformat(),
+        }
+        await db.commit()
         logger.info("📤 [TASK SENT] process_document task queued successfully - Task ID: %s, Document ID: %s", task.id, document.id)
     except Exception as exc:
         logger.error("❌ [TASK QUEUE ERROR] Failed to queue process_document - Document: %s, Error: %s", document.id, exc, exc_info=True)
+        document.status = DocumentStatus.FAILED
+        document.source_metadata = {
+            **(document.source_metadata or {}),
+            "ingestion_queue_error": str(exc),
+            "ingestion_queue_failed_at": datetime.utcnow().isoformat(),
+        }
+        db.add(
+            IngestionLog(
+                document_id=document.id,
+                status=DocumentStatus.FAILED,
+                stage="queue",
+                error_message="Failed to queue document ingestion task",
+            )
+        )
+        await db.commit()
 
     # Audit log (best-effort — do not let a logging failure abort the upload)
     try:

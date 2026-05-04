@@ -23,6 +23,7 @@ from app.database.models import (
 )
 from app.database.session import get_db
 from app.core.auth import get_current_user, get_workspace_context, WorkspaceRole
+from app.tasks.worker import process_document
 
 logger = logging.getLogger(__name__)
 
@@ -248,12 +249,48 @@ async def retry_ingestion(
     # FIXED: was assigning the raw string "processing" — use the enum so
     # SQLAlchemy validates the value and any listeners fire correctly.
     document.status = DocumentStatus.PROCESSING
+    document.source_metadata = {
+        **(document.source_metadata or {}),
+        "ingestion_retry_requested_at": datetime.utcnow().isoformat(),
+    }
+    await db.commit()
+
+    try:
+        task = process_document.delay(str(document.id))
+    except Exception as exc:
+        document.status = DocumentStatus.FAILED
+        document.source_metadata = {
+            **(document.source_metadata or {}),
+            "ingestion_queue_error": str(exc),
+            "ingestion_queue_failed_at": datetime.utcnow().isoformat(),
+        }
+        db.add(
+            IngestionLog(
+                document_id=document.id,
+                status=DocumentStatus.FAILED,
+                stage="queue",
+                error_message="Failed to queue document ingestion retry",
+            )
+        )
+        await db.commit()
+        logger.error("Failed to queue ingestion retry for document %s: %s", document_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document retry could not be queued. Please try again.",
+        )
+
+    document.source_metadata = {
+        **(document.source_metadata or {}),
+        "ingestion_task_id": str(task.id),
+        "ingestion_retry_queued_at": datetime.utcnow().isoformat(),
+    }
     await db.commit()
 
     return {
         "status": "retry_started",
         "document_id": document_id,
         "new_status": _enum_value(DocumentStatus.PROCESSING),
+        "task_id": str(task.id),
     }
 
 
