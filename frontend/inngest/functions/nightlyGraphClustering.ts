@@ -1,4 +1,4 @@
-import { inngest } from '../client';
+import { inngest } from '../client.js';
 import { clusterGraphNodes } from '@/lib/graphClustering';
 import type { GraphClusterInput } from '@/types';
 
