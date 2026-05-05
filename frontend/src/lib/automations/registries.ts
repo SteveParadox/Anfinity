@@ -7,7 +7,7 @@ import {
   HTTP_METHOD_IDS,
   NOTE_TYPE_IDS,
   TRIGGER_TYPE_IDS,
-} from "./generatedRegistry";
+} from "./generatedRegistry.js";
 
 export {
   ACTION_EXECUTION,
@@ -16,7 +16,7 @@ export {
   HTTP_METHOD_IDS,
   NOTE_TYPE_IDS,
   TRIGGER_TYPE_IDS,
-} from "./generatedRegistry";
+} from "./generatedRegistry.js";
 
 export type AutomationTriggerType = (typeof TRIGGER_TYPE_IDS)[number];
 export type AutomationActionType = (typeof ACTION_TYPE_IDS)[number];
