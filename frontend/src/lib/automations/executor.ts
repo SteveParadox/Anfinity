@@ -1,8 +1,8 @@
-import { ACTION_TYPES, type AutomationActionType } from "./registries";
-import { executeBackendAction } from "./backend";
-import { interpolateConfig } from "./templates";
-import { validateActionConfig, type AutomationAction, type AutomationDefinition } from "./validation";
-import type { AutomationRuntimeContext } from "./runtime";
+import { ACTION_TYPES, type AutomationActionType } from "./registries.js";
+import { executeBackendAction } from "./backend.js";
+import { interpolateConfig } from "./templates.js";
+import { validateActionConfig, type AutomationAction, type AutomationDefinition } from "./validation.js";
+import type { AutomationRuntimeContext } from "./runtime.js";
 
 export interface ExecuteAutomationActionsInput {
   automation: AutomationDefinition;

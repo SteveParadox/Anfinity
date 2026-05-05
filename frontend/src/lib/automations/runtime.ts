@@ -1,10 +1,10 @@
 import { NonRetriableError } from "inngest";
 
-import { evaluateConditions } from "./conditions";
-import { executeAutomationActions, type AutomationExecutionResult } from "./executor";
-import { fetchEnabledAutomations } from "./backend";
-import { triggerTypeFromEventName, type AutomationTriggerType } from "./registries";
-import { parseAutomationDefinition, validateConditionFieldPaths, type AutomationDefinition } from "./validation";
+import { evaluateConditions } from "./conditions.js";
+import { executeAutomationActions, type AutomationExecutionResult } from "./executor.js";
+import { fetchEnabledAutomations } from "./backend.js";
+import { triggerTypeFromEventName, type AutomationTriggerType } from "./registries.js";
+import { parseAutomationDefinition, validateConditionFieldPaths, type AutomationDefinition } from "./validation.js";
 
 export interface AutomationRuntimeContext {
   event: {

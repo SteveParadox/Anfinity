@@ -1,4 +1,4 @@
-import { fieldPathSchema, resolvePath } from "./conditions";
+import { fieldPathSchema, resolvePath } from "./conditions.js";
 
 const TEMPLATE_PATTERN = /\{\{\s*([^{}]+?)\s*\}\}/g;
 
