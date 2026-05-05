@@ -1,4 +1,4 @@
-import type { GraphClusterInputNode } from '../../types/index.js';
+import type { GraphClusterInputNode } from '../types/index.js';
 
 export interface ClusteredGraphMember {
   node_id: string;
