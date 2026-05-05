@@ -9,8 +9,8 @@ export const automationRouter = inngest.createFunction(
     id: "automation-trigger-action-router",
     name: "Automation Trigger and Action Router",
     description: "Routes all supported automation trigger events through condition evaluation and action execution.",
+    triggers: AUTOMATION_EVENT_NAMES.map((event) => ({ event })),
   },
-  AUTOMATION_EVENT_NAMES.map((event) => ({ event })),
   async ({ event, step, logger }) => {
     const context = buildRuntimeContext({
       eventName: event.name,

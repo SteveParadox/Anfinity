@@ -27,9 +27,11 @@ export const nightlyGraphClustering = inngest.createFunction(
   {
     id: 'nightly-graph-clustering',
     name: 'Nightly Graph Clustering',
-  },
-  {
-    cron: '0 2 * * *',
+    triggers: [
+      {
+        cron: '0 2 * * *',
+      },
+    ],
   },
   async ({ step }) => {
     if (!GRAPH_CLUSTER_SYNC_TOKEN) {
