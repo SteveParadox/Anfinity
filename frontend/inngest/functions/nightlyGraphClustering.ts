@@ -1,6 +1,6 @@
 import { inngest } from '../client.js';
 import { clusterGraphNodes } from '../../src/lib/graphClustering.js';
-import type { GraphClusterInput } from '../../src/types/index.js';
+import type { GraphClusterInput, GraphClusterInputNode } from '../../src/types/index.js';
 
 const API_BASE_URL = process.env.API_BASE_URL || process.env.VITE_API_URL || 'http://localhost:8080';
 const GRAPH_CLUSTER_SYNC_TOKEN = process.env.GRAPH_CLUSTER_SYNC_TOKEN || '';
@@ -49,7 +49,9 @@ export const nightlyGraphClustering = inngest.createFunction(
         return apiRequest<GraphClusterInput>(`/knowledge-graph/internal/${workspaceId}/cluster-input`);
       });
 
-      const clustering = clusterGraphNodes(input.nodes || [], {
+      const validNodes = (input.nodes || []).filter((node): node is GraphClusterInputNode => node.id !== undefined && node.id !== null);
+      
+      const clustering = clusterGraphNodes(validNodes, {
         seed: workspaceId,
         minClusterSize: 2,
       });
