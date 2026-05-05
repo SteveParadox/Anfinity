@@ -27,19 +27,19 @@ export const automationRouter = inngest.createFunction(
 
     const result = await step.run("route-automation-event", async () => routeAutomationEvent(context));
 
-    if (result.loadedAutomations > 0 && result.matchedAutomations === 0) {
+    if (result && typeof result === 'object' && 'loadedAutomations' in result && (result as any).loadedAutomations > 0 && (result as any).matchedAutomations === 0) {
       logger.info("Automation event had no condition matches", {
-        triggerType: result.triggerType,
-        workspaceId: result.workspaceId,
-        loadedAutomations: result.loadedAutomations,
+        triggerType: (result as any).triggerType,
+        workspaceId: (result as any).workspaceId,
+        loadedAutomations: (result as any).loadedAutomations,
       });
     }
 
-    const failedAutomations = result.results.filter((automation) => automation.status !== "success");
+    const failedAutomations = (result as any).results?.filter((automation: any) => automation.status !== "success") || [];
     if (failedAutomations.length > 0) {
       logger.warn("Automation actions completed with failures", {
         failedAutomations: failedAutomations.length,
-        matchedAutomations: result.matchedAutomations,
+        matchedAutomations: (result as any).matchedAutomations,
       });
     }
 
