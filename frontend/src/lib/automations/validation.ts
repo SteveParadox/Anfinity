@@ -11,8 +11,8 @@ import {
   noteTypeSchema,
   type AutomationActionType,
   type AutomationTriggerType,
-} from "./registries";
-import { conditionSchema, fieldPathSchema, type Condition } from "./conditions";
+} from "./registries.js";
+import { conditionSchema, fieldPathSchema, type Condition } from "./conditions.js";
 
 const nonEmptyTemplateSchema = z.string().trim().min(1);
 const optionalTemplateSchema = z.string().optional();

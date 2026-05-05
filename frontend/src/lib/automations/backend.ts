@@ -1,6 +1,6 @@
-import type { AutomationActionType, AutomationTriggerType } from "./registries";
-import { parseAutomationDefinition, type AutomationDefinition } from "./validation";
-import type { AutomationRuntimeContext } from "./runtime";
+import type { AutomationActionType, AutomationTriggerType } from "./registries.js";
+import { parseAutomationDefinition, type AutomationDefinition } from "./validation.js";
+import type { AutomationRuntimeContext } from "./runtime.js";
 
 const API_BASE_URL = process.env.API_BASE_URL || process.env.VITE_API_URL || "http://localhost:8000";
 const AUTOMATION_INTERNAL_TOKEN = process.env.AUTOMATION_INTERNAL_TOKEN || "";
