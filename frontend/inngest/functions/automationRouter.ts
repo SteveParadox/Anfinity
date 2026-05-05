@@ -1,8 +1,8 @@
 import { NonRetriableError } from "inngest";
 
 import { inngest } from "../client.js";
-import { AUTOMATION_EVENT_NAMES } from "@/lib/automations/registries";
-import { buildRuntimeContext, routeAutomationEvent, type AutomationEventData } from "@/lib/automations/runtime";
+import { AUTOMATION_EVENT_NAMES } from "../../src/lib/automations/registries.js";
+import { buildRuntimeContext, routeAutomationEvent, type AutomationEventData } from "../../src/lib/automations/runtime.js";
 
 export const automationRouter = inngest.createFunction(
   {

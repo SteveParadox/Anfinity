@@ -1,6 +1,6 @@
 import { inngest } from '../client.js';
-import { clusterGraphNodes } from '@/lib/graphClustering';
-import type { GraphClusterInput } from '@/types';
+import { clusterGraphNodes } from '../../src/lib/graphClustering.js';
+import type { GraphClusterInput } from '../../src/types/index.js';
 
 const API_BASE_URL = process.env.API_BASE_URL || process.env.VITE_API_URL || 'http://localhost:8080';
 const GRAPH_CLUSTER_SYNC_TOKEN = process.env.GRAPH_CLUSTER_SYNC_TOKEN || '';
