@@ -259,11 +259,12 @@ class Settings(BaseSettings):
     QDRANT_UPSERT_BATCH_SIZE: int = 256
     
     # S3 Storage
-    AWS_ACCESS_KEY_ID: str = Field(default="minioadmin")
-    AWS_SECRET_ACCESS_KEY: str = Field(default="minioadmin")
+    AWS_ACCESS_KEY_ID: str = Field(default="")  # Set via env variable
+    AWS_SECRET_ACCESS_KEY: str = Field(default="")  # Set via env variable
     S3_ENDPOINT_URL: Optional[str] = Field(default="http://localhost:9000")
     S3_BUCKET_NAME: str = Field(default="anfinity")
     S3_REGION: str = Field(default="us-east-1")
+    S3_CREATE_BUCKET: Optional[bool] = None
     
     # LLM - Provider Selection (Primary)
     # FIX: Changed default from "openai" to "ollama" (more reliable locally, avoids quota conflicts)

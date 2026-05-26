@@ -30,6 +30,7 @@ class ProductionSettings:
     S3_ENDPOINT_URL: Optional[str] = os.getenv("S3_ENDPOINT_URL")  # None for AWS
     S3_BUCKET_NAME: str = os.getenv("S3_BUCKET_NAME", "anfinity-prod")
     S3_REGION: str = os.getenv("S3_REGION", "us-east-1")
+    S3_CREATE_BUCKET: bool = os.getenv("S3_CREATE_BUCKET", "false").lower() in {"1", "true", "yes", "on"}
     S3_ENABLE_VERSIONING: bool = True
     S3_STORAGE_CLASS: str = "STANDARD_IA"  # Cost optimization
     
