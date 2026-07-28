@@ -8,14 +8,15 @@ Manages tasks that have exhausted all retries. Provides:
 """
 
 import logging
+import uuid
 from datetime import datetime
 from typing import Optional, List
 from uuid import UUID
 from enum import Enum
 
-from sqlalchemy import Column, String, DateTime, Integer, Text, Enum as SQLEnum, select
+from sqlalchemy import Column, String, DateTime, Integer, Text, Enum as SQLEnum
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB
-from app.database.session import SyncSessionLocal, AsyncSessionLocal
+from app.database.session import SyncSessionLocal
 from app.database.models import Base
 from app.celery_app import celery_app
 
@@ -36,7 +37,7 @@ class DeadLetter(Base):
     """Model for storing failed tasks."""
     __tablename__ = "dead_letters"
 
-    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=lambda: UUID(int=0))
+    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     task_name = Column(String(255), nullable=False, index=True)
     task_id = Column(String(255), nullable=False, index=True)
     document_id = Column(PG_UUID(as_uuid=True), nullable=True, index=True)
@@ -67,6 +68,15 @@ class DeadLetter(Base):
 
 class DLQManager:
     """Manages the Dead Letter Queue."""
+
+    TASK_ALIASES = {
+        "process_document": "app.tasks.worker.process_document",
+        "delete_document_vectors": "app.tasks.worker.delete_document_vectors",
+        "sync_connector": "app.tasks.worker.sync_connector",
+        "generate_embeddings_document": "generate_embeddings_document",
+        "generate_note_embedding": "generate_note_embedding",
+        "generate_note_summary": "generate_note_summary",
+    }
 
     @staticmethod
     def add_failed_task(
@@ -199,6 +209,74 @@ class DLQManager:
                 item.resolution_notes = resolution_notes
                 db.commit()
                 logger.info(f"DLQ item {dlq_id} marked as resolved")
+        finally:
+            db.close()
+
+    @staticmethod
+    def get_item(dlq_id: UUID) -> Optional[DeadLetter]:
+        """Load one DLQ item by ID."""
+        db = SyncSessionLocal()
+        try:
+            return db.query(DeadLetter).filter(DeadLetter.id == dlq_id).first()
+        finally:
+            db.close()
+
+    @classmethod
+    def retry_item(cls, dlq_id: UUID) -> dict:
+        """Re-enqueue a DLQ item and mark it as in-retry."""
+        db = SyncSessionLocal()
+        try:
+            item = db.query(DeadLetter).filter(DeadLetter.id == dlq_id).first()
+            if item is None:
+                raise ValueError("DLQ item not found")
+
+            status_value = item.status.value if isinstance(item.status, DLQStatus) else str(item.status)
+            blocked_statuses = {
+                DLQStatus.IN_RETRY.value,
+                DLQStatus.RESOLVED.value,
+                DLQStatus.ARCHIVED.value,
+                DLQStatus.POISONED.value,
+            }
+            if status_value in blocked_statuses:
+                raise ValueError(f"DLQ item cannot be retried from status '{status_value}'")
+
+            task_name = cls.TASK_ALIASES.get(item.task_name, item.task_name)
+            args = item.args or []
+            kwargs = item.kwargs or {}
+            if isinstance(args, dict):
+                args = args.get("args", [])
+            if not isinstance(args, list):
+                args = list(args) if isinstance(args, tuple) else []
+            if not isinstance(kwargs, dict):
+                kwargs = {}
+
+            if not args:
+                if task_name == "app.tasks.worker.process_document" and item.document_id:
+                    args = [str(item.document_id)]
+                elif task_name == "app.tasks.worker.delete_document_vectors" and item.document_id and item.workspace_id:
+                    args = [str(item.document_id), str(item.workspace_id)]
+                elif task_name == "generate_embeddings_document" and item.document_id and item.workspace_id:
+                    args = [str(item.document_id), str(item.workspace_id)]
+
+            if not args and not kwargs:
+                raise ValueError("DLQ item has no retryable task arguments")
+
+            async_result = celery_app.send_task(task_name, args=args, kwargs=kwargs)
+            item.status = DLQStatus.IN_RETRY
+            item.retry_count = int(item.retry_count or 0) + 1
+            item.reviewed_at = item.reviewed_at or datetime.utcnow()
+            item.admin_notes = ((item.admin_notes or "") + f"\nRetry task queued: {async_result.id}").strip()
+            db.commit()
+            return {
+                "status": "retry_enqueued",
+                "item_id": str(item.id),
+                "task_name": task_name,
+                "task_id": str(async_result.id),
+                "retry_count": item.retry_count,
+            }
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 

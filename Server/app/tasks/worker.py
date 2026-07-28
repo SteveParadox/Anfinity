@@ -7,7 +7,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import Iterable, List, Optional, Sequence, TypeVar
 from uuid import UUID
 
 from celery.signals import task_postrun, task_prerun
@@ -39,6 +39,11 @@ from app.services.vector_db import get_vector_db_client
 from app.storage.s3 import s3_client
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+VECTOR_UPSERT_BATCH_SIZE = max(1, int(getattr(settings, "QDRANT_UPSERT_BATCH_SIZE", 256) or 256))
+TASK_RETRY_BASE_SECONDS = max(1, int(getattr(settings, "CELERY_RETRY_BASE_SECONDS", 60) or 60))
+TASK_RETRY_MAX_SECONDS = max(TASK_RETRY_BASE_SECONDS, int(getattr(settings, "CELERY_RETRY_MAX_SECONDS", 900) or 900))
 
 # ---------------------------------------------------------------------------
 # Signal handlers
@@ -170,6 +175,22 @@ def _fail_document_without_retry(
 def _normalize_vector_ids(vector_ids: List[str]) -> list[str]:
     """Normalize vector IDs for delete operations while preserving order."""
     return list(dict.fromkeys(str(vector_id) for vector_id in vector_ids if vector_id))
+
+
+def _batched(items: Sequence[T], batch_size: int) -> Iterable[Sequence[T]]:
+    """Yield bounded slices for provider/vector operations."""
+    safe_batch_size = max(1, int(batch_size or 1))
+    for index in range(0, len(items), safe_batch_size):
+        yield items[index : index + safe_batch_size]
+
+
+def _parse_task_uuid(value: str, field: str = "id") -> UUID | None:
+    """Parse task UUID input without converting bad client input into retries."""
+    try:
+        return UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        logger.error("Invalid %s UUID supplied to worker task: %r", field, value)
+        return None
 
 
 def _schedule_deferred_vector_cleanup(
@@ -386,19 +407,28 @@ def _index_vectors(
         for i, (vid, vec) in enumerate(zip(vector_ids, embeddings))
     ]
 
-    # ── FIX: Enhanced upsert failure diagnostics ────────────────────────────────
-    if not vector_db.upsert_vectors(collection_name, points):
-        # If upsert still fails after automatic recovery, provide diagnostics
+    upserted_vector_ids: list[str] = []
+    for point_batch in _batched(points, VECTOR_UPSERT_BATCH_SIZE):
+        batch_points = list(point_batch)
+        batch_ids = [str(point["id"]) for point in batch_points]
+        if vector_db.upsert_vectors(collection_name, batch_points):
+            upserted_vector_ids.extend(batch_ids)
+            continue
+
+        if upserted_vector_ids:
+            _cleanup_vector_ids(
+                collection_name,
+                upserted_vector_ids,
+                reason=(
+                    "Rolling back partially upserted vectors after batch upsert "
+                    f"failure for document {document_id}"
+                ),
+            )
         error_msg = (
-            f"❌ Vector DB upsert failed even after automatic recovery:\n"
-            f"   Collection:   {collection_name}\n"
-            f"   Model:        {actual_model}\n"
-            f"   Dimension:    {actual_dim}D\n"
-            f"   Document:     {document_id}\n"
-            f"\n"
-            f"ACTION: Task will retry in 60 seconds\n"
-            f"NOTE: System attempted automatic dimension mismatch recovery\n"
-            f"      If this persists, check Qdrant connection and logs\n"
+            f"Vector DB upsert failed after automatic recovery: "
+            f"collection={collection_name} model={actual_model} "
+            f"dimension={actual_dim} document={document_id} "
+            f"batch_size={len(batch_ids)}"
         )
         logger.error(error_msg)
         raise RuntimeError(error_msg)
@@ -432,8 +462,9 @@ def _index_vectors(
 
 
 def _retry_countdown(retries: int) -> int:
-    """Exponential back-off: 60 s, 120 s, 240 s, …"""
-    return 60 * (2 ** retries)
+    """Capped exponential backoff for retryable background failures."""
+    safe_retries = max(0, int(retries or 0))
+    return min(TASK_RETRY_MAX_SECONDS, TASK_RETRY_BASE_SECONDS * (2 ** safe_retries))
 
 
 def _get_chunks_needing_embedding(db, document_uuid: UUID) -> list:
@@ -471,7 +502,9 @@ def process_document(self, document_id: str) -> dict:
     """
     logger.info("📋 [TASK START] process_document - Task ID: %s - Document: %s", self.request.id, document_id)
     
-    document_uuid = UUID(document_id)
+    document_uuid = _parse_task_uuid(document_id, "document_id")
+    if document_uuid is None:
+        return {"status": "failed", "document_id": document_id, "error": "Invalid document ID", "retryable": False}
     start_time = time.time()
 
     with get_db_session() as db:
@@ -738,29 +771,53 @@ def process_document(self, document_id: str) -> dict:
             
             # Rollback any pending transactions to clear the session state
             db.rollback()
+            error_msg = str(exc)
+            will_retry = self.request.retries < self.max_retries
 
             if document is not None:
-                document.status = DocumentStatus.FAILED
+                document.status = DocumentStatus.PROCESSING if will_retry else DocumentStatus.FAILED
                 db.commit()
-                logger.debug("💾 [DB UPDATE] Document status set to FAILED - Document: %s", document_id)
+                logger.debug("💾 [DB UPDATE] Document status set after task failure - Document: %s, Retry: %s", document_id, will_retry)
 
-            error_msg = str(exc)
             if document is not None:
                 _log_ingestion_event(
-                    db, document_uuid, DocumentStatus.FAILED,
-                    stage="error", error_message=error_msg,
+                    db,
+                    document_uuid,
+                    DocumentStatus.PROCESSING if will_retry else DocumentStatus.FAILED,
+                    stage="retry_scheduled" if will_retry else "error",
+                    error_message=error_msg,
                 )
-            if workspace_id:
+            if workspace_id and not will_retry:
                 broadcast_ingestion_failed_sync(workspace_id, document_id, error_message=error_msg)
 
             logger.error("❌ Document %s processing failed: %s", document_id, error_msg, exc_info=True)
 
-            if self.request.retries < self.max_retries:
+            if will_retry:
                 countdown = _retry_countdown(self.request.retries)
                 logger.warning(
                     "⏳ [RETRY SCHEDULED] Attempt %d/%d for document %s in %d seconds - Task ID: %s - Error: %s",
                     self.request.retries + 1, self.max_retries, document_id, countdown, self.request.id, error_msg,
                 )
+                if workspace_id:
+                    try:
+                        broadcast_stage_update_sync(
+                            workspace_id,
+                            document_id,
+                            "retry",
+                            "scheduled",
+                            progress={
+                                "attempt": self.request.retries + 1,
+                                "max_retries": self.max_retries,
+                                "retry_in_seconds": countdown,
+                                "error": error_msg,
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to broadcast retry schedule for document %s",
+                            document_id,
+                            exc_info=True,
+                        )
                 raise self.retry(exc=exc, countdown=countdown)
 
             logger.error("❌ [MAX RETRIES EXCEEDED] Document %s failed after %d retries - Task ID: %s", document_id, self.max_retries, self.request.id)
@@ -907,7 +964,9 @@ def process_paste_content(
         extract_entities,
     )
 
-    document_uuid = UUID(document_id)
+    document_uuid = _parse_task_uuid(document_id, "document_id")
+    if document_uuid is None:
+        return {"status": "failed", "document_id": document_id, "error": "Invalid document ID", "retryable": False}
     start_time = time.time()
 
     with get_db_session() as db:
@@ -1080,7 +1139,9 @@ def process_voice_input(
     except ImportError:
         OpenAI = None  # type: ignore[assignment,misc]
 
-    document_uuid = UUID(document_id)
+    document_uuid = _parse_task_uuid(document_id, "document_id")
+    if document_uuid is None:
+        return {"status": "failed", "document_id": document_id, "error": "Invalid document ID", "retryable": False}
     start_time = time.time()
 
     with get_db_session() as db:
@@ -1264,7 +1325,9 @@ def process_auto_tagging(
         extract_entities as extract_ents,
     )
 
-    document_uuid = UUID(document_id)
+    document_uuid = _parse_task_uuid(document_id, "document_id")
+    if document_uuid is None:
+        return {"status": "failed", "document_id": document_id, "error": "Invalid document ID", "retryable": False}
     start_time = time.time()
 
     with get_db_session() as db:
