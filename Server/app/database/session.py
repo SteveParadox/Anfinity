@@ -1,5 +1,7 @@
 """Database session management."""
 import logging
+import ssl
+import ssl
 from typing import Any, AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, sessionmaker
@@ -8,6 +10,22 @@ from sqlalchemy import create_engine, event, text
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+CERT_PATH = PROJECT_ROOT / "certs" / "global-bundle.pem"
+
+ssl_context = ssl.create_default_context(cafile=str(CERT_PATH))
+
+ssl_context.check_hostname = True
+ssl_context.verify_mode = ssl.CERT_REQUIRED
+
+
+SSL_CONNECT_ARGS = {
+    "sslmode": "verify-full",
+    "sslrootcert": str(CERT_PATH),
+}
 
 
 def _to_async_database_url(url: str) -> str:
@@ -39,8 +57,9 @@ async_engine = create_async_engine(
     pool_size=settings.DATABASE_POOL_SIZE,
     max_overflow=settings.DATABASE_MAX_OVERFLOW,
     pool_pre_ping=True,
-    pool_reset_on_return=None,  # FIX: Skip ROLLBACK on connection return (improves performance)
+    pool_reset_on_return=None,
     echo=settings.DEBUG,
+    connect_args={"ssl": ssl_context},
 )
 
 # Async session factory
@@ -59,8 +78,9 @@ sync_engine = create_engine(
     pool_size=10,
     max_overflow=5,
     pool_pre_ping=True,
-    pool_reset_on_return=None,  # FIX: Skip ROLLBACK on connection return (improves performance)
+    pool_reset_on_return=None,
     echo=settings.DEBUG,
+    connect_args=SSL_CONNECT_ARGS,
 )
 
 # Sync session factory for background tasks
