@@ -1,11 +1,10 @@
 import os
-import uvicorn
 import sys
 from pathlib import Path
 
-# Ensure the project root (parent of the `app` package) is on sys.path so
-# imports like `from app.config import ...` in `main.py` resolve when
-# running this file directly.
+import uvicorn
+
+# Ensure the project root is on sys.path
 project_root = Path(__file__).resolve().parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
@@ -20,24 +19,27 @@ def _get_bool_env(name: str, default: bool = False) -> bool:
 
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 8001))
-    log_level = os.getenv("LOG_LEVEL", "info")
+    port = int(os.getenv("PORT", "8000"))
+    log_level = os.getenv("LOG_LEVEL", "info").lower()
     reload = _get_bool_env("RELOAD", False)
     access_log = _get_bool_env("ACCESS_LOG", True)
 
     workers_env = os.getenv("WORKERS")
     workers = int(workers_env) if workers_env and workers_env.isdigit() else None
 
-    uvicorn_kwargs = dict(
-        app="app.main:app",
-        host=host,
-        port=port,
-        log_level=log_level,
-        reload=reload,
-        access_log=access_log,
-    )
+    uvicorn_kwargs = {
+        "app": "app.main:app",
+        "host": host,
+        "port": port,
+        "log_level": log_level,
+        "reload": reload,
+        "access_log": access_log,
+        "proxy_headers": True,
+        "forwarded_allow_ips": "*",
+    }
 
-    if workers:
+    # Uvicorn does not allow reload and workers together
+    if workers and not reload:
         uvicorn_kwargs["workers"] = workers
 
     uvicorn.run(**uvicorn_kwargs)
