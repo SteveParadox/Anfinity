@@ -3,6 +3,7 @@ import logging
 import ssl
 from pathlib import Path
 from typing import Any, AsyncGenerator
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine, event, text
@@ -31,11 +32,13 @@ def _to_async_database_url(url: str) -> str:
     """Return an async SQLAlchemy URL for FastAPI request handlers."""
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
-    if url.startswith("postgresql+asyncpg://"):
-        return url
     if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    parsed = urlparse(url)
+    query = [(k, v) for k, v in parse_qsl(parsed.query) if k != "sslmode"]
+
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def _to_sync_database_url(url: str) -> str:
