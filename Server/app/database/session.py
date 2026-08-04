@@ -1,7 +1,7 @@
 """Database session management."""
 import logging
 import ssl
-import ssl
+from pathlib import Path
 from typing import Any, AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, sessionmaker
@@ -11,21 +11,20 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-from pathlib import Path
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CERT_PATH = PROJECT_ROOT / "certs" / "global-bundle.pem"
 
-ssl_context = ssl.create_default_context(cafile=str(CERT_PATH))
-
-ssl_context.check_hostname = True
-ssl_context.verify_mode = ssl.CERT_REQUIRED
-
-
-SSL_CONNECT_ARGS = {
-    "sslmode": "verify-full",
-    "sslrootcert": str(CERT_PATH),
-}
+if CERT_PATH.exists():
+    ssl_context = ssl.create_default_context(cafile=str(CERT_PATH))
+    SSL_CONNECT_ARGS = {
+        "sslmode": "verify-full",
+        "sslrootcert": str(CERT_PATH),
+    }
+else:
+    ssl_context = ssl.create_default_context()
+    SSL_CONNECT_ARGS = {
+        "sslmode": "require",
+    }
 
 
 def _to_async_database_url(url: str) -> str:
