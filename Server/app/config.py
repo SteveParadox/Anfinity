@@ -224,10 +224,16 @@ class Settings(BaseSettings):
     AUTH_OAUTH_REDIRECT_BASE_URL: Optional[str] = None
     
     # CORS - configure for production
-    CORS_ORIGINS: list = Field(default=["http://localhost:3000", "http://localhost:5173"])
+    CORS_ORIGINS: list[str] = Field(
+        default=["http://localhost:3000", "http://localhost:5173"]
+    )
     CORS_CREDENTIALS: bool = True
-    CORS_METHODS: list = Field(default=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
-    CORS_HEADERS: list = Field(default=["*"])
+    CORS_METHODS: list[str] = Field(
+        default=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    )
+    CORS_HEADERS: list[str] = Field(
+        default=["*"]
+    )
     
     # Database
     DATABASE_URL: str = Field(default="postgresql://postgres:postgres@localhost:5432/anfinity")
@@ -367,13 +373,15 @@ class Settings(BaseSettings):
     
     # File Upload
     MAX_FILE_SIZE_MB: int = 50
-    ALLOWED_FILE_TYPES: list = Field(default=[
-        "application/pdf",
-        "text/plain",
-        "text/markdown",
-        "text/x-markdown",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ])
+    ALLOWED_FILE_TYPES: list[str] = Field(
+        default=[
+            "application/pdf",
+            "text/plain",
+            "text/markdown",
+            "text/x-markdown",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ]
+    )
     
     class Config:
         env_file = ".env"
