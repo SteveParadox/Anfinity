@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app \
-    PORT=8000
+    PORT=8000 \
+    PGSSLROOTCERT=/app/certs/global-bundle.pem
 
 WORKDIR /app
 
