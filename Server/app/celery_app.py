@@ -21,8 +21,7 @@ from app.config import settings
 celery_app = Celery(
     "app",
     broker=settings.REDIS_URL,
-    # Use 'rpc' backend which is designed for this use case
-    backend="rpc://",
+    backend=settings.REDIS_URL.replace("/0", "/1"),
 )
 
 # Configuration
