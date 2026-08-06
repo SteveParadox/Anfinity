@@ -54,31 +54,29 @@ class EmbeddingProvider(ABC):
         }
 
 
-class OpenAIEmbedder(EmbeddingProvider):
-    """OpenAI embedding provider (lazy imports, safe retries with fallback)."""
+class OpenAICompatibleEmbedder(EmbeddingProvider):
+    """OpenAI-compatible embedding provider (supports OpenAI, Jina, DeepInfra, etc.)."""
 
     def __init__(self, model: Optional[str] = None, fallback_provider: Optional[EmbeddingProvider] = None):
         try:
             from openai import OpenAI
         except Exception as e:
-            raise ImportError("openai package is required for OpenAIEmbedder: pip install openai") from e
+            raise ImportError("openai package is required for OpenAICompatibleEmbedder: pip install openai") from e
 
-        self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        self._model = model or settings.OPENAI_EMBEDDING_MODEL
-        self._dimension = self._get_dimension()
+        # Use generic EMBEDDING_* settings so this client can target OpenAI-compatible APIs (Jina, DeepInfra, ...)
+        self.client = OpenAI(
+            api_key=settings.EMBEDDING_API_KEY,
+            base_url=settings.EMBEDDING_BASE_URL,
+        )
+        self._model = model or settings.EMBEDDING_MODEL
+        self._dimension = None
         self._fallback_provider = fallback_provider
         self._fallback_max_retries = settings.EMBEDDING_FALLBACK_MAX_RETRIES
         
         # Track which provider actually succeeded (for accurate model_name/dimension reporting)
         self._actual_provider_used = "openai"  # Default, updated if fallback succeeds
 
-    def _get_dimension(self) -> int:
-        dimensions = {
-            "text-embedding-ada-002": 1536,
-            "text-embedding-3-small": 1536,
-            "text-embedding-3-large": 3072,
-        }
-        return dimensions.get(self._model, 1536)
+    # Dimension is determined dynamically after the first successful embedding request.
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         """Embed texts with OpenAI, fall back to Ollama on quota/rate limit errors."""
@@ -102,6 +100,13 @@ class OpenAIEmbedder(EmbeddingProvider):
                     batch_embeddings = [item.embedding for item in response.data]
                     if len(batch_embeddings) != len(batch):
                         raise ValueError("OpenAI returned unexpected number of embeddings")
+
+                    # Set dynamic embedding dimension on first successful response
+                    if self._dimension is None and batch_embeddings:
+                        try:
+                            self._dimension = len(batch_embeddings[0])
+                        except Exception:
+                            self._dimension = 0
 
                     all_embeddings.extend(batch_embeddings)
                     embedding_failed = False
@@ -190,7 +195,7 @@ class OpenAIEmbedder(EmbeddingProvider):
         # Return dimension of the provider that actually succeeded
         if self._actual_provider_used == "fallback" and self._fallback_provider:
             return self._fallback_provider.dimension
-        return self._dimension
+        return int(self._dimension or 0)
 
     @property
     def model_name(self) -> str:
@@ -475,6 +480,11 @@ class Embedder:
         # and OpenAI as FALLBACK (when Ollama unavailable)
         if self.provider_name == "ollama":
             if not settings.OLLAMA_ENABLED:
+                if settings.EMBEDDING_FALLBACK_ENABLED and settings.EMBEDDING_API_KEY:
+                    logger.warning(
+                        "EMBEDDING_PROVIDER is 'ollama' but OLLAMA_ENABLED=False. Falling back to OpenAICompatibleEmbedder."
+                    )
+                    return OpenAICompatibleEmbedder()
                 raise RuntimeError(
                     "EMBEDDING_PROVIDER is 'ollama' but OLLAMA_ENABLED=False"
                 )
@@ -483,12 +493,12 @@ class Embedder:
             fallback_provider = None
             if (
                 settings.EMBEDDING_FALLBACK_ENABLED
-                and settings.OPENAI_API_KEY
+                and settings.EMBEDDING_API_KEY
             ):
                 try:
-                    fallback_provider = OpenAIEmbedder()
+                    fallback_provider = OpenAICompatibleEmbedder()
                     logger.info(
-                        " OpenAI fallback initialized for embeddings (%s)",
+                        " OpenAI-compatible fallback initialized for embeddings (%s)",
                         fallback_provider.model_name,
                     )
                 except Exception as e:
@@ -497,7 +507,7 @@ class Embedder:
             return OllamaEmbedder(fallback_provider=fallback_provider)
         
         # Original providers still available if explicitly configured
-        elif self.provider_name == "openai":
+        elif self.provider_name in ("openai", "jina", "api"):
             fallback_provider = None
 
             if (
@@ -517,7 +527,7 @@ class Embedder:
                         e,
                     )
 
-            return OpenAIEmbedder(fallback_provider=fallback_provider)
+            return OpenAICompatibleEmbedder(fallback_provider=fallback_provider)
         elif self.provider_name == "cohere":
             return CohereEmbedder()
         elif self.provider_name == "bge":

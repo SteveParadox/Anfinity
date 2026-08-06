@@ -1,6 +1,7 @@
 """Application configuration using Pydantic Settings."""
 import json
 import secrets
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -307,9 +308,20 @@ class Settings(BaseSettings):
     GRAPH_CLUSTER_SYNC_TOKEN: Optional[str] = None
     
     # Embeddings
-    # FIX: Changed default from "openai" to "ollama" (more reliable locally, avoids quota conflicts)
-    EMBEDDING_PROVIDER: str = Field(default="ollama")  # ollama (primary), openai/cohere/bge (fallback)
+    # Default embedding provider (can be 'ollama', 'openai', 'cohere', 'bge', or 'jina')
+    EMBEDDING_PROVIDER: str = Field(default="jina")  # jina (primary), openai/cohere/bge (fallback)
+    # Backwards-compatible OpenAI model name used when OpenAI-compatible provider is selected
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    # Generic embedding settings for OpenAI-compatible providers (Jina, DeepInfra, etc.)
+    EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
+    EMBEDDING_BASE_URL: str = os.getenv(
+        "EMBEDDING_BASE_URL",
+        "https://api.jina.ai/v1",
+    )
+    EMBEDDING_MODEL: str = os.getenv(
+        "EMBEDDING_MODEL",
+        "jina-embeddings-v3",
+    )
     COHERE_API_KEY: Optional[str] = None
     COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"
     BGE_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
