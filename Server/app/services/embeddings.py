@@ -118,7 +118,10 @@ class EmbeddingService:
                 self._use_tiktoken = False
 
         if self.provider == "openai" and HAS_OPENAI:
-            self.client = OpenAI(api_key=runtime.openai.api_key)
+            client_kwargs = {"api_key": runtime.openai.api_key}
+            if getattr(runtime.openai, "base_url", None):
+                client_kwargs["base_url"] = runtime.openai.base_url
+            self.client = OpenAI(**client_kwargs)
             self.model = runtime.openai.embedding_model
             self.dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(self.model, 1536)
 

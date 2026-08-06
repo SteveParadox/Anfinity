@@ -924,7 +924,14 @@ class GraphService:
         try:
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, timeout=float(settings.OPENAI_TIMEOUT))
+            client_kwargs = {
+                "api_key": settings.OPENAI_API_KEY,
+                "timeout": float(settings.OPENAI_TIMEOUT),
+            }
+            if getattr(settings, "OPENAI_BASE_URL", None):
+                client_kwargs["base_url"] = settings.OPENAI_BASE_URL
+
+            client = AsyncOpenAI(**client_kwargs)
             prompt = (
                 "Generate a compact cluster label and description for a knowledge graph cluster.\n"
                 "Return strict JSON with keys label and description.\n"

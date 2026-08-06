@@ -261,11 +261,19 @@ class LLMService:
 
         self._openai_sync = None
         api_key = openai_api_key or runtime.openai.api_key
+        api_base_url = runtime.openai.base_url
         if api_key:
             try:
                 from openai import OpenAI
 
-                self._openai_sync = OpenAI(api_key=api_key, timeout=self._openai_timeout)
+                openai_kwargs = {
+                    "api_key": api_key,
+                    "timeout": self._openai_timeout,
+                }
+                if api_base_url:
+                    openai_kwargs["base_url"] = api_base_url
+
+                self._openai_sync = OpenAI(**openai_kwargs)
                 logger.info("OpenAI sync client initialised: %s", self.openai_model)
             except ImportError:
                 logger.error("openai package not installed")
@@ -349,7 +357,14 @@ class LLMService:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not configured")
 
-        client = AsyncOpenAI(api_key=api_key, timeout=runtime.openai.timeout)
+        client_kwargs = {
+            "api_key": api_key,
+            "timeout": runtime.openai.timeout,
+        }
+        if getattr(runtime.openai, "base_url", None):
+            client_kwargs["base_url"] = runtime.openai.base_url
+
+        client = AsyncOpenAI(**client_kwargs)
         response = await client.chat.completions.create(
             model=self.openai_model,
             messages=messages,
@@ -383,7 +398,14 @@ class LLMService:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not configured")
 
-        client = AsyncOpenAI(api_key=api_key, timeout=runtime.openai.timeout)
+        client_kwargs = {
+            "api_key": api_key,
+            "timeout": runtime.openai.timeout,
+        }
+        if getattr(runtime.openai, "base_url", None):
+            client_kwargs["base_url"] = runtime.openai.base_url
+
+        client = AsyncOpenAI(**client_kwargs)
         resolved_model = model or self.openai_model
         resolved_max_tokens = max_tokens if max_tokens is not None else runtime.llm.max_tokens
         response = await client.chat.completions.create(
