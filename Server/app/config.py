@@ -282,7 +282,7 @@ class Settings(BaseSettings):
     OPENAI_TIMEOUT: int = 30  # seconds
     
     # LLM - Ollama (Primary)
-    OLLAMA_ENABLED: bool = Field(default=True)  # Enable Ollama
+    OLLAMA_ENABLED: bool = Field(default=False)  # Enable Ollama
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434")  # Ollama server URL
     OLLAMA_API_KEY: Optional[str] = None
     OLLAMA_MODEL: str = Field(default=_DEFAULT_OLLAMA_LLM_MODEL)
