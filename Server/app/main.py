@@ -29,6 +29,13 @@ async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     # Startup
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION} in {settings.ENVIRONMENT} mode")
+    logger.info(
+        "ENV=%s LLM_PROVIDER=%s EMBEDDING_PROVIDER=%s OLLAMA_ENABLED=%s",
+        settings.ENVIRONMENT,
+        settings.LLM_PROVIDER,
+        settings.EMBEDDING_PROVIDER,
+        settings.OLLAMA_ENABLED,
+    )
     
     # Initialize database
     await init_db()
@@ -43,7 +50,7 @@ async def lifespan(app: FastAPI):
     if settings.OLLAMA_ENABLED:
         try:
             import httpx
-            logger.info(f"🚀 Preloading Ollama model '{settings.OLLAMA_MODEL}' from {settings.OLLAMA_BASE_URL}...")
+            logger.info(f" Preloading Ollama model '{settings.OLLAMA_MODEL}' from {settings.OLLAMA_BASE_URL}...")
             preload_start = time.time()
             # FIX: Use OLLAMA_TIMEOUT (150s) instead of hardcoded 60s to allow cold start
             async with httpx.AsyncClient(
@@ -61,20 +68,20 @@ async def lifespan(app: FastAPI):
                     )
                     preload_time = (time.time() - preload_start) * 1000
                     if response.status_code == 200:
-                        logger.info(f"✅ Ollama model '{settings.OLLAMA_MODEL}' preloaded and ready ({preload_time:.0f}ms)")
+                        logger.info(f" Ollama model '{settings.OLLAMA_MODEL}' preloaded and ready ({preload_time:.0f}ms)")
                     else:
                         # Check if model not found (404) vs other errors
                         if response.status_code == 404:
-                            logger.warning(f"⚠️  Ollama model '{settings.OLLAMA_MODEL}' not found. Available models can be checked with 'ollama list'")
+                            logger.warning(f"  Ollama model '{settings.OLLAMA_MODEL}' not found. Available models can be checked with 'ollama list'")
                         else:
-                            logger.warning(f"⚠️  Ollama preload returned status {response.status_code} after {preload_time:.0f}ms: {response.text[:200]}")
+                            logger.warning(f"  Ollama preload returned status {response.status_code} after {preload_time:.0f}ms: {response.text[:200]}")
                 except httpx.TimeoutException as te:
                     preload_time = (time.time() - preload_start) * 1000
-                    logger.warning(f"⚠️  Ollama preload timed out after {preload_time:.0f}ms. Check if Ollama is running: 'ollama serve'")
+                    logger.warning(f"  Ollama preload timed out after {preload_time:.0f}ms. Check if Ollama is running: 'ollama serve'")
                 except httpx.ConnectError as ce:
-                    logger.warning(f"⚠️  Cannot connect to Ollama at {settings.OLLAMA_BASE_URL}. Start Ollama with: 'ollama serve'")
+                    logger.warning(f"  Cannot connect to Ollama at {settings.OLLAMA_BASE_URL}. Start Ollama with: 'ollama serve'")
         except Exception as e:
-            logger.warning(f"⚠️  Ollama preload failed (non-critical, requests will trigger lazy load): {type(e).__name__}: {e}")
+            logger.warning(f"  Ollama preload failed (non-critical, requests will trigger lazy load): {type(e).__name__}: {e}")
     
     yield
     
