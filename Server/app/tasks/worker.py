@@ -1186,7 +1186,10 @@ def process_voice_input(
             logger.info("🔄 [STAGE 2] Whisper Transcription - Language: %s", language)
             t0 = time.time()
             logger.debug("🔐 [OPENAI] Creating OpenAI client for Whisper API")
-            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            client_kwargs = {"api_key": settings.OPENAI_API_KEY}
+            if getattr(settings, "OPENAI_BASE_URL", None):
+                client_kwargs["base_url"] = settings.OPENAI_BASE_URL
+            client = OpenAI(**client_kwargs)
 
             # Use a context-managed temp file to ensure cleanup even on error.
             logger.debug("📝 [TEMP FILE] Creating temporary audio file")

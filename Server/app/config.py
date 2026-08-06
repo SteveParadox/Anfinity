@@ -36,6 +36,7 @@ class OllamaRuntimeConfig:
 @dataclass(frozen=True)
 class OpenAIRuntimeConfig:
     api_key: Optional[str]
+    base_url: Optional[str]
     llm_model: str
     embedding_model: str
     timeout: int
@@ -135,7 +136,7 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
     )
     embedding_provider = _normalize_provider(
         getattr(source, "EMBEDDING_PROVIDER", "ollama"),
-        allowed={"ollama", "openai", "cohere", "bge"},
+        allowed={"ollama", "openai", "cohere", "bge", "jina", "api"},
         default="ollama",
     )
     ollama_base_url = _normalize_ollama_base_url(getattr(source, "OLLAMA_BASE_URL", _DEFAULT_OLLAMA_BASE_URL))
@@ -172,6 +173,7 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
     )
     openai = OpenAIRuntimeConfig(
         api_key=_normalize_secret(getattr(source, "OPENAI_API_KEY", None)),
+        base_url=getattr(source, "OPENAI_BASE_URL", None) or None,
         llm_model=openai_llm_model,
         embedding_model=openai_embedding_model,
         timeout=int(getattr(source, "OPENAI_TIMEOUT", 30) or 30),
@@ -279,6 +281,7 @@ class Settings(BaseSettings):
     
     # LLM - OpenAI
     OPENAI_API_KEY: Optional[str] = None
+    OPENAI_BASE_URL: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_TIMEOUT: int = 30  # seconds
     
@@ -322,6 +325,9 @@ class Settings(BaseSettings):
         "EMBEDDING_MODEL",
         "jina-embeddings-v3",
     )
+    # Jina-specific settings (optional)
+    JINA_API_KEY: Optional[str] = None
+    JINA_EMBEDDING_MODEL: str = "jina-embeddings-v4"
     COHERE_API_KEY: Optional[str] = None
     COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"
     BGE_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"

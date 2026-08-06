@@ -319,7 +319,14 @@ async def _generate_with_openai(messages: List[dict]) -> str:
     """
     from openai import AsyncOpenAI  # async client — no run_in_executor needed
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, timeout=30.0)
+    client_kwargs = {
+        "api_key": settings.OPENAI_API_KEY,
+        "timeout": 30.0,
+    }
+    if getattr(settings, "OPENAI_BASE_URL", None):
+        client_kwargs["base_url"] = settings.OPENAI_BASE_URL
+
+    client = AsyncOpenAI(**client_kwargs)
     response = await client.chat.completions.create(
         model=settings.OPENAI_MODEL,
         messages=messages,

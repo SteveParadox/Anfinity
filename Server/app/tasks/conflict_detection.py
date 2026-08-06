@@ -27,7 +27,10 @@ def get_openai_client():
     if _openai_client is None:
         try:
             from openai import OpenAI
-            _openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            client_kwargs = {"api_key": settings.OPENAI_API_KEY}
+            if getattr(settings, "OPENAI_BASE_URL", None):
+                client_kwargs["base_url"] = settings.OPENAI_BASE_URL
+            _openai_client = OpenAI(**client_kwargs)
         except ImportError:
             logger.warning("OpenAI library not installed — conflict detection disabled.")
         except Exception as exc:

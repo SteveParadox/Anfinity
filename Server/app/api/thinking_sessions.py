@@ -391,10 +391,14 @@ async def stream_thinking_session_synthesis_endpoint(
             detail="OpenAI API key is not configured for synthesis",
         )
 
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        timeout=float(settings.THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS),
-    )
+    client_kwargs = {
+        "api_key": settings.OPENAI_API_KEY,
+        "timeout": float(settings.THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS),
+    }
+    if getattr(settings, "OPENAI_BASE_URL", None):
+        client_kwargs["base_url"] = settings.OPENAI_BASE_URL
+
+    client = AsyncOpenAI(**client_kwargs)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         full_output_parts: list[str] = []
