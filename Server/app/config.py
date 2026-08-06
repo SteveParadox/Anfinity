@@ -282,7 +282,7 @@ class Settings(BaseSettings):
     OPENAI_TIMEOUT: int = 30  # seconds
     
     # LLM - Ollama (Primary)
-    OLLAMA_ENABLED: bool = Field(default=False)  # Enable Ollama
+    OLLAMA_ENABLED: bool = Field(default=True)  # Enable Ollama
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434")  # Ollama server URL
     OLLAMA_API_KEY: Optional[str] = None
     OLLAMA_MODEL: str = Field(default=_DEFAULT_OLLAMA_LLM_MODEL)
@@ -482,6 +482,13 @@ class Settings(BaseSettings):
             if self.ENVIRONMENT == "production":
                 raise ValueError("JWT_SECRET must be set in production")
             self.JWT_SECRET = secrets.token_urlsafe(64)
+
+        if self.ENVIRONMENT == "production":
+            # Never use Ollama in production unless explicitly allowed
+            self.OLLAMA_ENABLED = False
+            self.LLM_PROVIDER = "openai"
+            self.EMBEDDING_PROVIDER = "openai"
+            self.LLM_USE_FALLBACK = False
 
         if self.ENVIRONMENT == "production":
             missing_settings: list[str] = []
