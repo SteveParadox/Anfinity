@@ -304,22 +304,9 @@ class OllamaEmbedder(EmbeddingProvider):
         self._fallback_provider = fallback_provider
         self._actual_provider_used = "ollama"  # Track which provider was actually used
         self._embedding_service = None
-        
+        self._health_checked = False
+
         logger.info(f"🔧 OllamaEmbedder initializing with base_url={self._base_url}, model={self._model}")
-        
-        # Verify Ollama server is accessible
-        try:
-            response = self._requests.get(
-                f"{self._base_url}/api/tags",
-                timeout=5,
-                headers=get_ollama_request_headers(include_content_type=False),
-            )
-            response.raise_for_status()
-            logger.info(f" Ollama server is accessible at {self._base_url}")
-        except Exception as e:
-            error_msg = f"Cannot connect to Ollama server at {self._base_url}: {e}"
-            logger.error(error_msg)
-            raise ConnectionError(error_msg) from e
 
     def _normalise_embeddings_payload(self, data: Dict[str, Any], expected: int) -> List[List[float]]:
         embeddings = data.get("embeddings")
@@ -331,10 +318,29 @@ class OllamaEmbedder(EmbeddingProvider):
             )
         return embeddings
 
+    def _check_health(self):
+        if self._health_checked:
+            return
+
+        try:
+            response = self._session.get(
+                f"{self._base_url}/api/tags",
+                timeout=5,
+                headers=get_ollama_request_headers(include_content_type=False),
+            )
+            response.raise_for_status()
+            self._health_checked = True
+            logger.info("Ollama server is accessible at %s", self._base_url)
+
+        except Exception:
+            raise
+
     def embed(self, texts: List[str]) -> List[List[float]]:
         """Embed texts using Ollama, with OpenAI fallback if available."""
         if not texts:
             return []
+
+        self._check_health()
 
         try:
             if self._embedding_service is None:
@@ -468,28 +474,49 @@ class Embedder:
         # FIX: Use Ollama as PRIMARY provider (more reliable locally)
         # and OpenAI as FALLBACK (when Ollama unavailable)
         if self.provider_name == "ollama":
-            # Ollama is primary - create OpenAI fallback if enabled
+            if not settings.OLLAMA_ENABLED:
+                raise RuntimeError(
+                    "EMBEDDING_PROVIDER is 'ollama' but OLLAMA_ENABLED=False"
+                )
+
+            # Ollama is primary - create OpenAI fallback only when OpenAI is configured
             fallback_provider = None
-            if settings.EMBEDDING_FALLBACK_ENABLED:
+            if (
+                settings.EMBEDDING_FALLBACK_ENABLED
+                and settings.OPENAI_API_KEY
+            ):
                 try:
                     fallback_provider = OpenAIEmbedder()
-                    logger.info(f" OpenAI fallback initialized for embeddings ({fallback_provider.model_name})")
+                    logger.info(
+                        " OpenAI fallback initialized for embeddings (%s)",
+                        fallback_provider.model_name,
+                    )
                 except Exception as e:
                     logger.warning(f" OpenAI fallback unavailable: {e}. Will proceed without fallback.")
-            
+
             return OllamaEmbedder(fallback_provider=fallback_provider)
         
         # Original providers still available if explicitly configured
         elif self.provider_name == "openai":
-            # Create fallback provider if enabled
             fallback_provider = None
-            if settings.EMBEDDING_FALLBACK_ENABLED:
+
+            if (
+                settings.EMBEDDING_FALLBACK_ENABLED
+                and settings.OLLAMA_ENABLED
+                and settings.ENVIRONMENT != "production"
+            ):
                 try:
                     fallback_provider = OllamaEmbedder()
-                    logger.info(f" Ollama fallback initialized for embeddings ({fallback_provider.model_name})")
+                    logger.info(
+                        "Ollama fallback initialized for embeddings (%s)",
+                        fallback_provider.model_name,
+                    )
                 except Exception as e:
-                    logger.warning(f"  Ollama fallback unavailable: {e}. Will proceed without fallback.")
-            
+                    logger.warning(
+                        "Ollama fallback unavailable: %s. Continuing without fallback.",
+                        e,
+                    )
+
             return OpenAIEmbedder(fallback_provider=fallback_provider)
         elif self.provider_name == "cohere":
             return CohereEmbedder()
