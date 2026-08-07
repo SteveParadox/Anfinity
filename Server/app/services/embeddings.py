@@ -13,6 +13,9 @@ _OPENAI_EMBEDDING_DIMENSIONS = {
     "text-embedding-ada-002": 1536,
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,
+
+    # Jina
+    "jina-embeddings-v4": 2048,
 }
 
 try:
@@ -50,10 +53,16 @@ def _ai_runtime():
             self.__dict__.update(kwargs)
 
     return _Namespace(
-        openai=_Namespace(
-            api_key=getattr(settings, "OPENAI_API_KEY", None),
-            embedding_model=getattr(settings, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
-        ),
+       openai=_Namespace(
+                api_key=getattr(settings, "EMBEDDING_API_KEY", None)
+                    or getattr(settings, "OPENAI_API_KEY", None),
+
+                base_url=getattr(settings, "EMBEDDING_BASE_URL", None)
+                    or getattr(settings, "OPENAI_BASE_URL", None),
+
+                embedding_model=getattr(settings, "EMBEDDING_MODEL", None)
+                    or getattr(settings, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+            ),
         ollama=_Namespace(
             base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
             api_key=getattr(settings, "OLLAMA_API_KEY", None),
