@@ -171,11 +171,24 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         ),
         max_concurrent_requests=int(getattr(source, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2),
     )
+    # Use embedding-specific env vars when present so embedding calls can
+    # be routed to OpenAI-compatible providers (e.g. Jina) separately from
+    # general OpenAI LLM configuration.
     openai = OpenAIRuntimeConfig(
-        api_key=_normalize_secret(getattr(source, "OPENAI_API_KEY", None)),
-        base_url=getattr(source, "OPENAI_BASE_URL", None) or None,
+        api_key=(
+            _normalize_secret(getattr(source, "EMBEDDING_API_KEY", None))
+            or _normalize_secret(getattr(source, "OPENAI_API_KEY", None))
+        ),
+        base_url=(
+            getattr(source, "EMBEDDING_BASE_URL", None)
+            or getattr(source, "OPENAI_BASE_URL", None)
+            or None
+        ),
         llm_model=openai_llm_model,
-        embedding_model=openai_embedding_model,
+        embedding_model=(
+            getattr(source, "EMBEDDING_MODEL", None)
+            or openai_embedding_model
+        ),
         timeout=int(getattr(source, "OPENAI_TIMEOUT", 30) or 30),
     )
     embeddings = EmbeddingRuntimeConfig(
