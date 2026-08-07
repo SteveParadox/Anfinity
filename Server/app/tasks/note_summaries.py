@@ -225,11 +225,7 @@ def generate_note_summary(
                 "existing_summary_length": len(note.summary),
             }
 
-        llm_service = get_llm_service(
-            model=model,
-            primary_provider="ollama",
-            use_fallback=False,
-        )
+        llm_service = get_llm_service(model=model)
         prompt = _build_summary_prompt(content_length)
 
         llm_response = llm_service.generate_answer(
