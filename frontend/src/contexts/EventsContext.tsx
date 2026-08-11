@@ -5,8 +5,11 @@
 
 import React, {
   createContext,
+  useCallback,
   useContext,
   useEffect,
+  useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -26,6 +29,7 @@ interface EventsContextType {
 }
 
 const EventsContext = createContext<EventsContextType | undefined>(undefined);
+const EVENT_TYPE_SEPARATOR = '\u001f';
 
 interface EventsProviderProps {
   children: ReactNode;
@@ -56,6 +60,8 @@ export function EventsProvider({
   const [lastEvent, setLastEvent] = useState<Event | null>(null);
 
   useEffect(() => {
+    let disposed = false;
+
     if (!workspaceId) {
       console.warn(
         'EventsProvider: workspaceId not provided, events disabled'
@@ -103,6 +109,11 @@ export function EventsProvider({
             console.error('❌ [EVENTS ERROR] Event streaming error:', err);
           },
         });
+        if (disposed) {
+          newClient.disconnect();
+          return;
+        }
+
         activeClient = newClient;
 
         // Listen to all events and track the last one
@@ -118,8 +129,16 @@ export function EventsProvider({
         // Connect
         console.debug('🔌 [CONNECT] Attempting WebSocket connection');
         await newClient.connect();
+        if (disposed) {
+          newClient.disconnect();
+          return;
+        }
         console.log('✅ [EVENTS INIT SUCCESS] EventClient initialized and connected');
       } catch (err) {
+        if (disposed) {
+          return;
+        }
+
         const error = err instanceof Error ? err : new Error(String(err));
         console.error('❌ [EVENTS INIT FAILED] Failed to initialize EventClient:', error);
         setError(error);
@@ -130,6 +149,7 @@ export function EventsProvider({
     initializeClient();
 
     return () => {
+      disposed = true;
       // Cleanup on unmount
       activeClient?.disconnect();
       resetEventClient();

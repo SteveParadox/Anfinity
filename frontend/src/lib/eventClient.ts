@@ -63,6 +63,7 @@ export class EventClient {
   private reconnectTimer?: NodeJS.Timeout;
   private config: Partial<EventClientConfig>;
   private shouldReconnect: boolean = true;
+  private connectingPromise: Promise<void> | null = null;
 
   constructor(config: EventClientConfig) {
     this.workspaceId = config.workspaceId;
@@ -84,14 +85,25 @@ export class EventClient {
       return;
     }
 
+    if (this.connectingPromise) {
+      return this.connectingPromise;
+    }
+
     this.shouldReconnect = true;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
 
     try {
       if (this.method === 'websocket') {
-        await this.connectWebSocket();
+        this.connectingPromise = this.connectWebSocket();
       } else {
-        await this.connectSSE();
+        this.connectingPromise = this.connectSSE();
       }
+
+      await this.connectingPromise;
 
       this.reconnectAttempts = 0;
       this.config.onConnected?.();
@@ -103,6 +115,8 @@ export class EventClient {
       if (this.shouldReconnect && !isTerminalConnectionError(err)) {
         this.scheduleReconnect();
       }
+    } finally {
+      this.connectingPromise = null;
     }
   }
 
@@ -249,6 +263,7 @@ export class EventClient {
   disconnect(): void {
     this.shouldReconnect = false;
     this.connected = false;
+    this.connectingPromise = null;
     this.stopHeartbeat();
 
     if (this.ws) {
@@ -263,6 +278,7 @@ export class EventClient {
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
     }
 
     console.log('Event client disconnected');
