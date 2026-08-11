@@ -32,7 +32,6 @@ interface EventsContextType extends EventsClientContextType {
 }
 
 const EventsContext = createContext<EventsClientContextType | undefined>(undefined);
-const EVENT_TYPE_SEPARATOR = '\u001f';
 const DOCUMENT_PROGRESS_EVENT_TYPES = [
   EventType.DOCUMENT_STARTED,
   EventType.STAGE_STARTED,
@@ -235,10 +234,9 @@ export function useEventListener(
   callback: (event: Event) => void
 ) {
   const { client } = useEventClientContext();
-  const eventTypeKey: string = Array.isArray(eventType) ? eventType.join(EVENT_TYPE_SEPARATOR) : eventType;
-  const eventTypes = useMemo(
-    () => eventTypeKey.split(EVENT_TYPE_SEPARATOR) as EventType[],
-    [eventTypeKey],
+  const eventTypes = useMemo<EventType[]>(
+    () => (Array.isArray(eventType) ? [...eventType] : [eventType]),
+    [eventType],
   );
 
   useEffect(() => {
