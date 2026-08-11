@@ -124,9 +124,27 @@ function useWindowWidth(): number {
   const [width, setWidth] = useState(() => window.innerWidth);
 
   useEffect(() => {
-    const handleResize = () => setWidth(window.innerWidth);
+    let frameId: number | null = null;
+
+    const handleResize = () => {
+      if (frameId !== null) return;
+
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        setWidth((currentWidth) => {
+          const nextWidth = window.innerWidth;
+          return currentWidth === nextWidth ? currentWidth : nextWidth;
+        });
+      });
+    };
+
     window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    return () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      window.removeEventListener('resize', handleResize);
+    };
   }, []);
 
   return width;

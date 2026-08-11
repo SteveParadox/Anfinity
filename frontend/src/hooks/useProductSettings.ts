@@ -33,7 +33,7 @@ function settingsError(error: unknown): string {
 // Exponential backoff retry logic for transient failures
 async function withRetry<T>(
   fn: () => Promise<T>,
-  maxRetries: number = 3,
+  maxRetries: number = 1,
   initialDelayMs: number = 1000
 ): Promise<T> {
   let lastError: any;

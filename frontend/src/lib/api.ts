@@ -51,6 +51,7 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
 const API_TIMEOUT = parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'); // 30 seconds
 const MAX_RETRIES = parseInt(import.meta.env.VITE_API_MAX_RETRIES || '3');
 const RETRY_DELAY = parseInt(import.meta.env.VITE_API_RETRY_DELAY || '1000'); // ms
+const DEFAULT_GET_CACHE_TTL = parseInt(import.meta.env.VITE_API_GET_CACHE_TTL || '5000');
 
 function transformNoteInviteFromAPI(invite: any): NoteInvite {
   return {
@@ -512,6 +513,8 @@ class ApiClient {
   private token: string | null;
   private logger: RequestLogger;
   private abortControllers: Map<string, AbortController> = new Map();
+  private inFlightGets: Map<string, Promise<unknown>> = new Map();
+  private responseCache: Map<string, { value: unknown; expiresAt: number }> = new Map();
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
@@ -525,6 +528,7 @@ class ApiClient {
   setToken(token: string): void {
     this.token = token;
     localStorage.setItem('token', token);
+    this.clearRequestCache();
   }
 
   /**
@@ -533,6 +537,7 @@ class ApiClient {
   clearToken(): void {
     this.token = null;
     localStorage.removeItem('token');
+    this.clearRequestCache();
   }
 
   /**
@@ -554,6 +559,11 @@ class ApiClient {
    */
   getLogs() {
     return this.logger.getLogs();
+  }
+
+  private clearRequestCache(): void {
+    this.inFlightGets.clear();
+    this.responseCache.clear();
   }
 
   private mergeAbortSignals(
@@ -646,22 +656,39 @@ class ApiClient {
    */
   private async request<T>(
     endpoint: string,
-    options: RequestInit & { timeout?: number; retries?: boolean } = {}
+    options: RequestInit & { timeout?: number; retries?: boolean; cacheTtl?: number } = {}
   ): Promise<T> {
     const startTime = performance.now();
     const {
       timeout = API_TIMEOUT,
       retries = true,
+      cacheTtl,
       signal: externalSignal,
       ...fetchOptions
     } = options;
 
+    const method = fetchOptions.method || 'GET';
+    const requestKey = `${method} ${endpoint}`;
+    const canShareGet = method === 'GET' && !externalSignal && !fetchOptions.body;
+    const resolvedCacheTtl = cacheTtl ?? (canShareGet ? DEFAULT_GET_CACHE_TTL : 0);
+
+    if (canShareGet) {
+      const cached = this.responseCache.get(requestKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return cached.value as T;
+      }
+
+      const inFlight = this.inFlightGets.get(requestKey);
+      if (inFlight) {
+        return inFlight as Promise<T>;
+      }
+    }
+
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), timeout);
-    const requestKey = `${options.method || 'GET'} ${endpoint}`;
     const { signal: requestSignal, cleanup: cleanupRequestSignal } = this.mergeAbortSignals(abortController, externalSignal);
 
-    try {
+    const executeRequest = async (): Promise<T> => {
       this.abortControllers.set(requestKey, abortController);
 
       const headers: Record<string, string> = {};
@@ -692,34 +719,52 @@ class ApiClient {
 
       const result = retries ? await this.retryRequest(fetcher, endpoint) : await fetcher();
       const duration = performance.now() - startTime;
-      this.logger.log(options.method || 'GET', endpoint, 200, duration);
+      this.logger.log(method, endpoint, 200, duration);
+
+      if (canShareGet && resolvedCacheTtl > 0) {
+        this.responseCache.set(requestKey, {
+          value: result,
+          expiresAt: Date.now() + resolvedCacheTtl,
+        });
+      } else if (method !== 'GET') {
+        this.responseCache.clear();
+      }
 
       return result;
-    } catch (error) {
+    };
+
+    const promise = executeRequest().catch((error) => {
       clearTimeout(timeoutId);
       const duration = performance.now() - startTime;
 
       if (error instanceof Error && error.name === 'AbortError') {
         const timeoutError = new ServerError(`Request timeout after ${timeout}ms`);
-        this.logger.log(options.method || 'GET', endpoint, undefined, duration, timeoutError.message);
+        this.logger.log(method, endpoint, undefined, duration, timeoutError.message);
         throw timeoutError;
       }
 
       if (error instanceof ApiError) {
-        this.logger.log(options.method || 'GET', endpoint, error.status, duration, error.message);
+        this.logger.log(method, endpoint, error.status, duration, error.message);
         throw error;
       }
 
       const genericError = new ServerError(
         error instanceof Error ? error.message : 'Unknown error'
       );
-      this.logger.log(options.method || 'GET', endpoint, 500, duration, genericError.message);
+      this.logger.log(method, endpoint, 500, duration, genericError.message);
       throw genericError;
-    } finally {
+    }).finally(() => {
       cleanupRequestSignal();
       clearTimeout(timeoutId);
       this.abortControllers.delete(requestKey);
+      this.inFlightGets.delete(requestKey);
+    });
+
+    if (canShareGet) {
+      this.inFlightGets.set(requestKey, promise);
     }
+
+    return promise;
   }
 
   /**

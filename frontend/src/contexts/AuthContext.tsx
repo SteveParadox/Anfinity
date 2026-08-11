@@ -3,7 +3,7 @@
  * Provides user info, tokens, workspaces, and auth methods globally
  */
 
-import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react';
 import { api } from '@/lib/api';
 import type { PlanName, WorkspacePermissions, WorkspacePermissionAction, WorkspacePermissionSection } from '@/types';
 
@@ -120,11 +120,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const tokenRefreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const currentWorkspaceIdRef = useRef<string | null>(null);
 
   const clearWorkspaceState = useCallback(() => {
     setWorkspaces([]);
     setPermissionsByWorkspace({});
     setCurrentWorkspaceId(null);
+    currentWorkspaceIdRef.current = null;
     localStorage.removeItem('currentWorkspaceId');
   }, []);
 
@@ -170,7 +172,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const savedWorkspaceId = localStorage.getItem('currentWorkspaceId');
     const candidates = [
       preferredWorkspaceId,
-      currentWorkspaceId,
+      currentWorkspaceIdRef.current,
       savedWorkspaceId,
       nextWorkspaces[0]?.id ?? null,
     ];
@@ -181,6 +183,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     setWorkspaces(nextWorkspaces);
     setCurrentWorkspaceId(resolvedWorkspaceId);
+    currentWorkspaceIdRef.current = resolvedWorkspaceId;
 
     if (resolvedWorkspaceId) {
       localStorage.setItem('currentWorkspaceId', resolvedWorkspaceId);
@@ -189,7 +192,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
 
     return resolvedWorkspaceId;
-  }, [currentWorkspaceId]);
+  }, []);
 
   const applyAuthPayload = useCallback(async (
     response: TokenResponse,
@@ -213,9 +216,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
 
     if (options?.fallbackToList) {
-      const listedWorkspaces = normalizeWorkspaces(await api.listWorkspaces());
+      const [listedWorkspaces] = await Promise.all([
+        api.listWorkspaces().then(normalizeWorkspaces),
+        loadWorkspacePermissions(),
+      ]);
       reconcileWorkspaceSelection(listedWorkspaces, options?.preferredWorkspaceId);
-      await loadWorkspacePermissions();
       return;
     }
 
@@ -224,10 +229,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const loadWorkspaces = useCallback(async () => {
     try {
-      const response = await api.listWorkspaces();
+      const [response] = await Promise.all([
+        api.listWorkspaces(),
+        loadWorkspacePermissions(),
+      ]);
       const nextWorkspaces = normalizeWorkspaces(response);
       reconcileWorkspaceSelection(nextWorkspaces);
-      await loadWorkspacePermissions();
     } catch (err) {
       console.error('Failed to load workspaces:', err);
     }
@@ -246,7 +253,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
         const response = await api.refresh();
         await applyAuthPayload(response, {
-          preferredWorkspaceId: currentWorkspaceId,
+          preferredWorkspaceId: currentWorkspaceIdRef.current,
           fallbackToList: true,
         });
       } catch (err) {
@@ -256,7 +263,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         clearWorkspaceState();
       }
     }, 12 * 60 * 60 * 1000);
-  }, [applyAuthPayload, clearWorkspaceState, currentWorkspaceId]);
+  }, [applyAuthPayload, clearWorkspaceState]);
 
   useEffect(() => {
     const initializeAuth = async () => {
@@ -287,7 +294,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     };
   }, [applyAuthPayload, clearWorkspaceState, setupTokenRefresh]);
 
-  const login = async (email: string, password: string) => {
+  const login = useCallback(async (email: string, password: string) => {
     setIsLoading(true);
     setError(null);
 
@@ -302,9 +309,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [applyAuthPayload, setupTokenRefresh]);
 
-  const loginWithGoogle = async (redirectPath?: string) => {
+  const loginWithGoogle = useCallback(async (redirectPath?: string) => {
     setIsLoading(true);
     setError(null);
 
@@ -317,9 +324,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setIsLoading(false);
       throw err;
     }
-  };
+  }, []);
 
-  const register = async (email: string, password: string, fullName?: string) => {
+  const register = useCallback(async (email: string, password: string, fullName?: string) => {
     setIsLoading(true);
     setError(null);
 
@@ -338,9 +345,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [applyAuthPayload, setupTokenRefresh]);
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
     setIsLoading(true);
     setError(null);
 
@@ -360,7 +367,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [clearWorkspaceState]);
 
   const setCurrentWorkspace = useCallback((workspaceId: string) => {
     if (!workspaces.some((workspace) => workspace.id === workspaceId)) {
@@ -369,6 +376,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
 
     setCurrentWorkspaceId(workspaceId);
+    currentWorkspaceIdRef.current = workspaceId;
     localStorage.setItem('currentWorkspaceId', workspaceId);
   }, [workspaces]);
 
@@ -397,11 +405,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
     return Boolean(DEFAULT_PERMISSION_MATRIX[workspace.role]?.[section]?.[action]);
   }, [permissionsByWorkspace, workspaces]);
 
-  const refreshAuth = async () => {
+  const refreshAuth = useCallback(async () => {
     try {
       const response = await api.refresh();
       await applyAuthPayload(response, {
-        preferredWorkspaceId: currentWorkspaceId,
+        preferredWorkspaceId: currentWorkspaceIdRef.current,
         fallbackToList: true,
       });
     } catch (err) {
@@ -410,11 +418,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
       clearWorkspaceState();
       throw err;
     }
-  };
+  }, [applyAuthPayload, clearWorkspaceState]);
 
-  const clearError = () => setError(null);
+  const clearError = useCallback(() => setError(null), []);
 
-  const value: AuthContextType = {
+  const value = useMemo<AuthContextType>(() => ({
     user,
     workspaces,
     permissionsByWorkspace,
@@ -432,7 +440,24 @@ export function AuthProvider({ children }: AuthProviderProps) {
     clearError,
     hasRole,
     hasPermission,
-  };
+  }), [
+    user,
+    workspaces,
+    permissionsByWorkspace,
+    currentWorkspaceId,
+    isLoading,
+    error,
+    login,
+    loginWithGoogle,
+    register,
+    logout,
+    refreshAuth,
+    loadWorkspaces,
+    setCurrentWorkspace,
+    clearError,
+    hasRole,
+    hasPermission,
+  ]);
 
   return (
     <AuthContext.Provider value={value}>

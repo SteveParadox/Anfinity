@@ -4,7 +4,7 @@
  */
 
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense } from 'react';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { EventsProvider } from '@/contexts/EventsContext';
 import { PrivateRoute } from '@/components/PrivateRoute';
@@ -47,21 +47,7 @@ function RouteLoadingFallback() {
  */
 function InnerRouter() {
   const { user, currentWorkspaceId } = useAuth();
-  const [token, setToken] = useState<string | undefined>();
-
-  // Get token from API module
-  useEffect(() => {
-    const authToken = api.getToken();
-    console.debug(' [TOKEN UPDATE] Token fetched from API:', authToken ? '****' : 'undefined');
-    console.debug(' [WORKSPACE ID] Current workspace:', currentWorkspaceId);
-    if (authToken) {
-      setToken(authToken);
-      console.log(' [TOKEN SET] Token successfully set for WebSocket:', authToken ? '****' : 'undefined');
-    } else {
-      console.warn(' [TOKEN MISSING] No token available for WebSocket connection');
-      setToken(undefined);
-    }
-  }, [user, currentWorkspaceId]);
+  const token = user ? api.getToken() ?? undefined : undefined;
 
   return (
     <EventsProvider workspaceId={currentWorkspaceId || undefined} token={token}>
