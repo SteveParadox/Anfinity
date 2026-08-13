@@ -145,7 +145,16 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         getattr(source, "OLLAMA_EMBEDDING_MODEL", _DEFAULT_OLLAMA_EMBEDDING_MODEL)
         or _DEFAULT_OLLAMA_EMBEDDING_MODEL
     )
-    openai_llm_model = getattr(source, "OPENAI_MODEL", _DEFAULT_OPENAI_MODEL) or _DEFAULT_OPENAI_MODEL
+    openai_base_url = (
+        getattr(source, "OPENAI_BASE_URL", None)
+        or None
+    )
+
+    openai_llm_model = (
+        getattr(source, "OPENAI_LLM_MODEL", None)
+        or getattr(source, "OPENAI_MODEL", None)
+        or _DEFAULT_OPENAI_MODEL
+    )
     openai_embedding_model = (
         getattr(source, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
         or "text-embedding-3-small"
@@ -176,14 +185,10 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
     # general OpenAI LLM configuration.
     openai = OpenAIRuntimeConfig(
         api_key=(
-            _normalize_secret(getattr(source, "EMBEDDING_API_KEY", None))
-            or _normalize_secret(getattr(source, "OPENAI_API_KEY", None))
+            _normalize_secret(getattr(source, "OPENAI_API_KEY", None))
+            or _normalize_secret(getattr(source, "EMBEDDING_API_KEY", None))
         ),
-        base_url=(
-            getattr(source, "EMBEDDING_BASE_URL", None)
-            or getattr(source, "OPENAI_BASE_URL", None)
-            or None
-        ),
+        base_url=openai_base_url,
         llm_model=openai_llm_model,
         embedding_model=(
             getattr(source, "EMBEDDING_MODEL", None)
@@ -295,6 +300,7 @@ class Settings(BaseSettings):
     # LLM - OpenAI
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_BASE_URL: Optional[str] = None
+    OPENAI_LLM_MODEL: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_TIMEOUT: int = 30  # seconds
     
