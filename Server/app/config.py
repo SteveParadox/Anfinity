@@ -145,8 +145,12 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         getattr(source, "OLLAMA_EMBEDDING_MODEL", _DEFAULT_OLLAMA_EMBEDDING_MODEL)
         or _DEFAULT_OLLAMA_EMBEDDING_MODEL
     )
+    # Prefer an embedding-specific base URL when present so embedding calls
+    # can be routed to OpenAI-compatible providers (e.g. Jina) separately
+    # from general OpenAI LLM configuration.
     openai_base_url = (
-        getattr(source, "OPENAI_BASE_URL", None)
+        getattr(source, "EMBEDDING_BASE_URL", None)
+        or getattr(source, "OPENAI_BASE_URL", None)
         or None
     )
 
