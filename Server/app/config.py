@@ -155,10 +155,20 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         or getattr(source, "OPENAI_MODEL", None)
         or _DEFAULT_OPENAI_MODEL
     )
-    openai_embedding_model = (
-        getattr(source, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        or "text-embedding-3-small"
-    )
+    # Determine OpenAI embedding model in a safe, provider-aware way.
+    raw_embedding_model = getattr(source, "EMBEDDING_MODEL", None)
+    openai_embedding_model = getattr(source, "EMBEDDING_MODEL", None) or "text-embedding-3-small"
+
+    # If the runtime embedding provider is OpenAI, prefer an OpenAI-compatible
+    # embedding model. If a generic EMBEDDING_MODEL is set (for example to a
+    # Jina provider model like "jina-embeddings-v4"), ignore it for OpenAI and
+    # fall back to the explicit OpenAI embedding model or a safe default.
+    if embedding_provider == "openai":
+        if raw_embedding_model:
+            lowered = str(raw_embedding_model).lower()
+            # Treat obvious Jina models as incompatible with OpenAI
+            if not (lowered.startswith("jina-") or "jina-embeddings" in lowered):
+                openai_embedding_model = raw_embedding_model
 
     ollama = OllamaRuntimeConfig(
         enabled=bool(getattr(source, "OLLAMA_ENABLED", True)),
