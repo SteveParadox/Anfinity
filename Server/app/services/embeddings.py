@@ -44,9 +44,19 @@ class _PreparedOllamaInput:
     segments: List[str]
 
 def _ai_runtime():
+    # Prefer a centralized runtime builder if available in app_config so
+    # embedding-related decisions (model vs. provider) are consistent.
     getter = getattr(app_config, "get_ai_runtime_config", None)
     if callable(getter):
         return getter()
+
+    builder = getattr(app_config, "build_ai_runtime_config", None)
+    if callable(builder):
+        try:
+            return builder(getattr(app_config, "settings", None) or app_config)
+        except Exception:
+            # Fall back to the local construction below on any error.
+            pass
 
     class _Namespace:
         def __init__(self, **kwargs):
@@ -61,7 +71,7 @@ def _ai_runtime():
                     or getattr(settings, "OPENAI_BASE_URL", None),
 
                 embedding_model=getattr(settings, "EMBEDDING_MODEL", None)
-                    or getattr(settings, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+                    or getattr(settings, "EMBEDDING_MODEL", "text-embedding-3-small"),
             ),
         ollama=_Namespace(
             base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
