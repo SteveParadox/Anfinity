@@ -132,7 +132,10 @@ class EmbeddingService:
                 client_kwargs["base_url"] = runtime.openai.base_url
             self.client = OpenAI(**client_kwargs)
             self.model = runtime.openai.embedding_model
-            self.dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(self.model, 1536)
+            self.dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(
+                self.model,
+                runtime.embeddings.dimension,
+            )
 
         elif self.provider == "cohere" and HAS_COHERE:
             self.client = cohere.Client(api_key=runtime.embeddings.cohere_api_key)
@@ -691,7 +694,7 @@ class EmbeddingService:
     # BONUS: safety / sanity check
     # ------------------------------------------------------------------
 
-    EXPECTED_DIMS = {768, 1024, 1536}
+    EXPECTED_DIMS = {768, 1024, 1536, 2048}
 
     def is_valid_embedding(self, vec):
         if not isinstance(vec, list):
