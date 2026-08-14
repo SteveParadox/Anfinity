@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Optional, Sequence
 from uuid import UUID
 
+from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -142,11 +143,39 @@ NOTE_CONTRIBUTIONS_LATEST_RAW_SQL = text(
 )
 
 
+def _is_undefined_table_error(exc: Exception) -> bool:
+    original = getattr(exc, "orig", None)
+    candidates = [exc, original, getattr(original, "__cause__", None)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if sqlstate == "42P01":
+            return True
+        lowered = str(candidate).lower()
+        if "undefinedtableerror" in lowered or "relation \"note_contributions\" does not exist" in lowered:
+            return True
+        if "relation \"audit_log\" does not exist" in lowered:
+            return True
+    return False
+
+
+async def _execute_optional_relation_query(db: AsyncSession, statement: Any, params: dict[str, Any]):
+    try:
+        async with db.begin_nested():
+            return await db.execute(statement, params)
+    except (ProgrammingError, DBAPIError) as exc:
+        if _is_undefined_table_error(exc):
+            logger.warning("Skipping note contribution query because a migration-backed relation is missing: %s", exc)
+            return None
+        raise
+
+
 async def list_note_contributions(db: AsyncSession, note_id: UUID) -> list[NoteContributionSummary]:
     """Read note contributions from the materialized view, with raw fallback."""
 
-    result = await db.execute(NOTE_CONTRIBUTIONS_SELECT_SQL, {"note_id": note_id})
-    rows = result.fetchall()
+    result = await _execute_optional_relation_query(db, NOTE_CONTRIBUTIONS_SELECT_SQL, {"note_id": note_id})
+    rows = result.fetchall() if result is not None else []
     latest_mv_at = None
     if rows:
         summaries = [_row_to_summary(row) for row in rows]
@@ -157,12 +186,17 @@ async def list_note_contributions(db: AsyncSession, note_id: UUID) -> list[NoteC
     else:
         summaries = []
 
-    latest_raw_result = await db.execute(NOTE_CONTRIBUTIONS_LATEST_RAW_SQL, {"note_id": note_id})
+    latest_raw_result = await _execute_optional_relation_query(db, NOTE_CONTRIBUTIONS_LATEST_RAW_SQL, {"note_id": note_id})
+    if latest_raw_result is None:
+        return summaries
+
     latest_raw_at = latest_raw_result.scalar_one_or_none()
     if summaries and (latest_raw_at is None or latest_mv_at == latest_raw_at):
         return summaries
 
-    fallback = await db.execute(NOTE_CONTRIBUTIONS_FALLBACK_SQL, {"note_id": note_id})
+    fallback = await _execute_optional_relation_query(db, NOTE_CONTRIBUTIONS_FALLBACK_SQL, {"note_id": note_id})
+    if fallback is None:
+        return summaries
     return [_row_to_summary(row) for row in fallback.fetchall()]
 
 
