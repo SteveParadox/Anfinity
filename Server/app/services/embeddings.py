@@ -137,21 +137,11 @@ class EmbeddingService:
                 self._use_tiktoken = False
 
         if self.provider == "openai" and HAS_OPENAI:
-            runtime_base_url = getattr(runtime.openai, "base_url", None)
-            runtime_api_key = getattr(runtime.openai, "api_key", None)
-            runtime_model = getattr(runtime.openai, "embedding_model", None)
-
-            if runtime_base_url and (not runtime_api_key or not runtime_model):
-                raise ValueError(
-                    "EMBEDDING_BASE_URL is configured but EMBEDDING_API_KEY and EMBEDDING_MODEL must both be set. "
-                    "The embedding endpoint requires matching credentials and model configuration."
-                )
-
-            client_kwargs = {"api_key": runtime_api_key}
-            if runtime_base_url:
-                client_kwargs["base_url"] = runtime_base_url
+            client_kwargs = {"api_key": runtime.openai.api_key}
+            if getattr(runtime.openai, "base_url", None):
+                client_kwargs["base_url"] = runtime.openai.base_url
             self.client = OpenAI(**client_kwargs)
-            self.model = runtime_model
+            self.model = runtime.openai.embedding_model
             self.dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(
                 self.model,
                 runtime.embeddings.dimension,
