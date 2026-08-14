@@ -22,7 +22,7 @@ down_revision = '002_semantic_phase1'
 branch_labels = None
 depends_on = None
 
-EMBEDDING_DIM = 1536
+EMBEDDING_DIM = 2048
 
 
 def upgrade() -> None:
