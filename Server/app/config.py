@@ -118,6 +118,28 @@ def _normalize_secret(value: Optional[str]) -> Optional[str]:
     return secret
 
 
+def _validate_embedding_endpoint_config(source: object) -> None:
+    """Require explicit embedding credentials when a custom embedding endpoint is used."""
+    base_url = getattr(source, "EMBEDDING_BASE_URL", None)
+    if not base_url:
+        return
+
+    api_key = _normalize_secret(getattr(source, "EMBEDDING_API_KEY", None))
+    model = (getattr(source, "EMBEDDING_MODEL", None) or "").strip()
+
+    if not api_key:
+        raise ValueError(
+            "EMBEDDING_BASE_URL is configured but EMBEDDING_API_KEY is missing. "
+            "Provide the matching API key for the embedding endpoint."
+        )
+
+    if not model:
+        raise ValueError(
+            "EMBEDDING_BASE_URL is configured but EMBEDDING_MODEL is missing. "
+            "Provide the model name for the embedding endpoint."
+        )
+
+
 def _build_ollama_headers(api_key: Optional[str], *, include_content_type: bool = True) -> dict[str, str]:
     headers: dict[str, str] = {}
     if include_content_type:
@@ -129,6 +151,8 @@ def _build_ollama_headers(api_key: Optional[str], *, include_content_type: bool 
 
 def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
     """Build a normalized AI runtime view from a settings-like object."""
+    _validate_embedding_endpoint_config(source)
+
     llm_provider = _normalize_provider(
         getattr(source, "LLM_PROVIDER", "ollama"),
         allowed={"ollama", "openai"},
