@@ -8,7 +8,6 @@ from alembic import context
 
 # Import models for autogenerate
 from app.database.models import Base
-from app.database.session import SSL_CONNECT_ARGS
 from app.config import settings
 
 
@@ -77,7 +76,6 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
-        connect_args=SSL_CONNECT_ARGS,
     )
 
     with connectable.connect() as connection:
