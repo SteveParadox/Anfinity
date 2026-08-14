@@ -1,7 +1,6 @@
 """Application configuration using Pydantic Settings."""
 import json
 import secrets
-import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -38,6 +37,8 @@ class OpenAIRuntimeConfig:
     api_key: Optional[str]
     base_url: Optional[str]
     llm_model: str
+    embedding_api_key: Optional[str]
+    embedding_base_url: Optional[str]
     embedding_model: str
     timeout: int
 
@@ -118,6 +119,47 @@ def _normalize_secret(value: Optional[str]) -> Optional[str]:
     return secret
 
 
+def _normalize_optional_string(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_ollama_headers(api_key: Optional[str], *, include_content_type: bool = True) -> dict[str, str]:
     headers: dict[str, str] = {}
     if include_content_type:
@@ -145,9 +187,16 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         getattr(source, "OLLAMA_EMBEDDING_MODEL", _DEFAULT_OLLAMA_EMBEDDING_MODEL)
         or _DEFAULT_OLLAMA_EMBEDDING_MODEL
     )
-    openai_base_url = (
-        getattr(source, "OPENAI_BASE_URL", None)
-        or None
+    openai_api_key = _normalize_secret(getattr(source, "OPENAI_API_KEY", None))
+    openai_base_url = _normalize_optional_string(getattr(source, "OPENAI_BASE_URL", None))
+    embedding_api_key = (
+        _normalize_secret(getattr(source, "EMBEDDING_API_KEY", None))
+        or _normalize_secret(getattr(source, "JINA_API_KEY", None))
+        or openai_api_key
+    )
+    embedding_base_url = (
+        _normalize_optional_string(getattr(source, "EMBEDDING_BASE_URL", None))
+        or openai_base_url
     )
 
     openai_llm_model = (
@@ -155,72 +204,66 @@ def build_ai_runtime_config(source: object) -> AIRuntimeConfig:
         or getattr(source, "OPENAI_MODEL", None)
         or _DEFAULT_OPENAI_MODEL
     )
-    # Determine OpenAI embedding model in a safe, provider-aware way.
-    raw_embedding_model = getattr(source, "EMBEDDING_MODEL", None)
-    openai_embedding_model = getattr(source, "EMBEDDING_MODEL", None) or "text-embedding-3-small"
-
-    # If the runtime embedding provider is OpenAI, prefer an OpenAI-compatible
-    # embedding model. If a generic EMBEDDING_MODEL is set (for example to a
-    # Jina provider model like "jina-embeddings-v4"), ignore it for OpenAI and
-    # fall back to the explicit OpenAI embedding model or a safe default.
-    if embedding_provider == "openai":
-        if raw_embedding_model:
-            lowered = str(raw_embedding_model).lower()
-            # Treat obvious Jina models as incompatible with OpenAI
-            if not (lowered.startswith("jina-") or "jina-embeddings" in lowered):
-                openai_embedding_model = raw_embedding_model
+    embedding_model = (
+        getattr(source, "EMBEDDING_MODEL", None)
+        or (
+            getattr(source, "JINA_EMBEDDING_MODEL", None)
+            if embedding_provider == "jina"
+            else None
+        )
+        or getattr(source, "OPENAI_EMBEDDING_MODEL", None)
+        or "text-embedding-3-small"
+    )
 
     ollama = OllamaRuntimeConfig(
-        enabled=bool(getattr(source, "OLLAMA_ENABLED", True)),
+        enabled=_coerce_bool(getattr(source, "OLLAMA_ENABLED", True), True),
         base_url=ollama_base_url,
         api_key=_normalize_secret(getattr(source, "OLLAMA_API_KEY", None)),
         llm_model=ollama_llm_model,
         fallback_model=getattr(source, "OLLAMA_FALLBACK_MODEL", None) or None,
         embedding_model=ollama_embedding_model,
-        timeout=int(getattr(source, "OLLAMA_TIMEOUT", 150) or 150),
-        connect_timeout=int(getattr(source, "OLLAMA_CONNECT_TIMEOUT", 10) or 10),
-        read_timeout=int(
-            getattr(source, "OLLAMA_READ_TIMEOUT", getattr(source, "OLLAMA_TIMEOUT", 150)) or 150
+        timeout=_coerce_int(getattr(source, "OLLAMA_TIMEOUT", 150), 150),
+        connect_timeout=_coerce_int(getattr(source, "OLLAMA_CONNECT_TIMEOUT", 10), 10),
+        read_timeout=_coerce_int(
+            getattr(source, "OLLAMA_READ_TIMEOUT", getattr(source, "OLLAMA_TIMEOUT", 150)),
+            150,
         ),
-        write_timeout=int(getattr(source, "OLLAMA_WRITE_TIMEOUT", 30) or 30),
-        pool_timeout=int(getattr(source, "OLLAMA_POOL_TIMEOUT", 30) or 30),
-        embedding_timeout=int(getattr(source, "OLLAMA_EMBED_TIMEOUT", getattr(source, "OLLAMA_TIMEOUT", 150)) or 150),
-        embedding_batch_size=int(
-            getattr(source, "OLLAMA_EMBED_BATCH_SIZE", getattr(source, "EMBEDDING_BATCH_SIZE", 32)) or 32
+        write_timeout=_coerce_int(getattr(source, "OLLAMA_WRITE_TIMEOUT", 30), 30),
+        pool_timeout=_coerce_int(getattr(source, "OLLAMA_POOL_TIMEOUT", 30), 30),
+        embedding_timeout=_coerce_int(
+            getattr(source, "OLLAMA_EMBED_TIMEOUT", getattr(source, "OLLAMA_TIMEOUT", 150)),
+            150,
         ),
-        max_concurrent_requests=int(getattr(source, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2) or 2),
+        embedding_batch_size=_coerce_int(
+            getattr(source, "OLLAMA_EMBED_BATCH_SIZE", getattr(source, "EMBEDDING_BATCH_SIZE", 32)),
+            32,
+        ),
+        max_concurrent_requests=_coerce_int(getattr(source, "OLLAMA_MAX_CONCURRENT_REQUESTS", 2), 2),
     )
-    # Use embedding-specific env vars when present so embedding calls can
-    # be routed to OpenAI-compatible providers (e.g. Jina) separately from
-    # general OpenAI LLM configuration.
     openai = OpenAIRuntimeConfig(
-        api_key=(
-            _normalize_secret(getattr(source, "OPENAI_API_KEY", None))
-            or _normalize_secret(getattr(source, "EMBEDDING_API_KEY", None))
-        ),
+        api_key=openai_api_key,
         base_url=openai_base_url,
         llm_model=openai_llm_model,
-        embedding_model=(
-            getattr(source, "EMBEDDING_MODEL", None)
-            or openai_embedding_model
-        ),
-        timeout=int(getattr(source, "OPENAI_TIMEOUT", 30) or 30),
+        embedding_api_key=embedding_api_key,
+        embedding_base_url=embedding_base_url,
+        embedding_model=embedding_model,
+        timeout=_coerce_int(getattr(source, "OPENAI_TIMEOUT", 30), 30),
     )
     embeddings = EmbeddingRuntimeConfig(
         provider=embedding_provider,
-        dimension=int(getattr(source, "EMBEDDING_DIMENSION", 768) or 768),
-        batch_size=int(getattr(source, "EMBEDDING_BATCH_SIZE", 32) or 32),
-        fallback_enabled=bool(getattr(source, "EMBEDDING_FALLBACK_ENABLED", True)),
-        fallback_max_retries=int(getattr(source, "EMBEDDING_FALLBACK_MAX_RETRIES", 2) or 2),
+        dimension=_coerce_int(getattr(source, "EMBEDDING_DIMENSION", 2048), 2048),
+        batch_size=_coerce_int(getattr(source, "EMBEDDING_BATCH_SIZE", 100), 100),
+        fallback_enabled=_coerce_bool(getattr(source, "EMBEDDING_FALLBACK_ENABLED", False), False),
+        fallback_max_retries=_coerce_int(getattr(source, "EMBEDDING_FALLBACK_MAX_RETRIES", 2), 2),
         cohere_api_key=_normalize_secret(getattr(source, "COHERE_API_KEY", None)),
         cohere_model=getattr(source, "COHERE_EMBEDDING_MODEL", "embed-english-v3.0") or "embed-english-v3.0",
         bge_model=getattr(source, "BGE_MODEL_NAME", "BAAI/bge-small-en-v1.5") or "BAAI/bge-small-en-v1.5",
     )
     llm = LLMRuntimeConfig(
         provider=llm_provider,
-        use_fallback=bool(getattr(source, "LLM_USE_FALLBACK", True)),
-        temperature=float(getattr(source, "LLM_TEMPERATURE", 0.3) or 0.3),
-        max_tokens=int(getattr(source, "LLM_MAX_TOKENS", 1000) or 1000),
+        use_fallback=_coerce_bool(getattr(source, "LLM_USE_FALLBACK", True), True),
+        temperature=_coerce_float(getattr(source, "LLM_TEMPERATURE", 0.3), 0.3),
+        max_tokens=_coerce_int(getattr(source, "LLM_MAX_TOKENS", 1000), 1000),
         openai_model=openai_llm_model,
         ollama_model=ollama_llm_model,
     )
@@ -340,31 +383,25 @@ class Settings(BaseSettings):
     GRAPH_CLUSTER_SYNC_TOKEN: Optional[str] = None
     
     # Embeddings
-    # Default embedding provider (can be 'ollama', 'openai', 'cohere', 'bge', or 'jina')
-    EMBEDDING_PROVIDER: str = Field(default="jina")  # jina (primary), openai/cohere/bge (fallback)
-    # Backwards-compatible OpenAI model name used when OpenAI-compatible provider is selected
+    # Default embedding provider (can be 'ollama', 'openai', 'cohere', 'bge', 'jina', or 'api')
+    EMBEDDING_PROVIDER: str = Field(default="jina")
+    # Native OpenAI model name used only when EMBEDDING_* does not specify an OpenAI-compatible model.
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     # Generic embedding settings for OpenAI-compatible providers (Jina, DeepInfra, etc.)
-    EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
-    EMBEDDING_BASE_URL: str = os.getenv(
-        "EMBEDDING_BASE_URL",
-        "https://api.jina.ai/v1",
-    )
-    EMBEDDING_MODEL: str = os.getenv(
-        "EMBEDDING_MODEL",
-        "jina-embeddings-v3",
-    )
+    EMBEDDING_API_KEY: Optional[str] = None
+    EMBEDDING_BASE_URL: Optional[str] = Field(default="https://api.jina.ai/v1")
+    EMBEDDING_MODEL: str = Field(default="jina-embeddings-v4")
     # Jina-specific settings (optional)
     JINA_API_KEY: Optional[str] = None
     JINA_EMBEDDING_MODEL: str = "jina-embeddings-v4"
     COHERE_API_KEY: Optional[str] = None
     COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"
     BGE_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
-    EMBEDDING_DIMENSION: int = 768  # Ollama default: nomic-embed-text is 768D
-    EMBEDDING_BATCH_SIZE: int = 32  # Optimal for nomic-embed-text via Ollama (balances GPU util. & memory)
+    EMBEDDING_DIMENSION: int = 2048  # Jina embeddings v4 default dimension; use 768 for nomic-embed-text
+    EMBEDDING_BATCH_SIZE: int = 100
     
-    # Embedding Fallback (Ollama -> OpenAI)
-    EMBEDDING_FALLBACK_ENABLED: bool = Field(default=True)  # Enable fallback to OpenAI if Ollama fails
+    # Cross-provider fallback is opt-in because vector dimensions must match existing collections.
+    EMBEDDING_FALLBACK_ENABLED: bool = Field(default=False)
     EMBEDDING_FALLBACK_MAX_RETRIES: int = Field(default=2)  # Max retries before fallback
     OLLAMA_EMBEDDING_MODEL: str = Field(default="nomic-embed-text")  # Ollama embedding model
     
@@ -470,6 +507,9 @@ class Settings(BaseSettings):
         "OPENAI_API_KEY",
         "OLLAMA_API_KEY",
         "OLLAMA_FALLBACK_MODEL",
+        "EMBEDDING_API_KEY",
+        "EMBEDDING_BASE_URL",
+        "JINA_API_KEY",
         "COHERE_API_KEY",
         "SLACK_CLIENT_ID",
         "SLACK_CLIENT_SECRET",
@@ -531,10 +571,11 @@ class Settings(BaseSettings):
             self.JWT_SECRET = secrets.token_urlsafe(64)
 
         if self.ENVIRONMENT == "production":
-            # Never use Ollama in production unless explicitly allowed
+            # Never use Ollama in production unless explicitly allowed.
             self.OLLAMA_ENABLED = False
             self.LLM_PROVIDER = "openai"
-            self.EMBEDDING_PROVIDER = "openai"
+            if str(self.EMBEDDING_PROVIDER or "").lower() == "ollama":
+                self.EMBEDDING_PROVIDER = "openai"
             self.LLM_USE_FALLBACK = False
 
         if self.ENVIRONMENT == "production":
@@ -560,13 +601,16 @@ class Settings(BaseSettings):
             if not _normalize_secret(self.S3_BUCKET_NAME):
                 missing_settings.append("S3_BUCKET_NAME")
 
-            needs_openai_key = (
-                self.LLM_PROVIDER == "openai"
-                or self.EMBEDDING_PROVIDER == "openai"
-                or bool(self.EMBEDDING_FALLBACK_ENABLED)
-            )
-            if needs_openai_key and not _normalize_secret(self.OPENAI_API_KEY):
+            if self.LLM_PROVIDER == "openai" and not _normalize_secret(self.OPENAI_API_KEY):
                 missing_settings.append("OPENAI_API_KEY")
+            if str(self.EMBEDDING_PROVIDER or "").lower() in {"openai", "jina", "api"}:
+                has_embedding_key = (
+                    _normalize_secret(self.EMBEDDING_API_KEY)
+                    or _normalize_secret(self.JINA_API_KEY)
+                    or _normalize_secret(self.OPENAI_API_KEY)
+                )
+                if not has_embedding_key:
+                    missing_settings.append("EMBEDDING_API_KEY")
             if self.EMBEDDING_PROVIDER == "cohere" and not _normalize_secret(self.COHERE_API_KEY):
                 missing_settings.append("COHERE_API_KEY")
 

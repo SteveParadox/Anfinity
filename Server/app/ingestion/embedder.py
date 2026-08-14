@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 import time
 
-from app.config import get_ollama_request_headers, settings
+from app.config import get_ai_runtime_config, get_ollama_request_headers, settings
 
 logger = logging.getLogger(__name__)
 
@@ -63,15 +63,16 @@ class OpenAICompatibleEmbedder(EmbeddingProvider):
         except Exception as e:
             raise ImportError("openai package is required for OpenAICompatibleEmbedder: pip install openai") from e
 
+        runtime = get_ai_runtime_config()
         # Use generic EMBEDDING_* settings so this client can target OpenAI-compatible APIs (Jina, DeepInfra, ...)
         self.client = OpenAI(
-            api_key=settings.EMBEDDING_API_KEY,
-            base_url=settings.EMBEDDING_BASE_URL,
+            api_key=runtime.openai.embedding_api_key,
+            base_url=runtime.openai.embedding_base_url,
         )
-        self._model = model or settings.EMBEDDING_MODEL
+        self._model = model or runtime.openai.embedding_model
         self._dimension = None
         self._fallback_provider = fallback_provider
-        self._fallback_max_retries = settings.EMBEDDING_FALLBACK_MAX_RETRIES
+        self._fallback_max_retries = runtime.embeddings.fallback_max_retries
         
         # Track which provider actually succeeded (for accurate model_name/dimension reporting)
         self._actual_provider_used = "openai"  # Default, updated if fallback succeeds
@@ -80,7 +81,7 @@ class OpenAICompatibleEmbedder(EmbeddingProvider):
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         """Embed texts with OpenAI, fall back to Ollama on quota/rate limit errors."""
-        batch_size = settings.EMBEDDING_BATCH_SIZE
+        batch_size = get_ai_runtime_config().embeddings.batch_size
         all_embeddings: List[List[float]] = []
 
         for i in range(0, len(texts), batch_size):
@@ -453,7 +454,7 @@ class Embedder:
     """Main embedder class with hybrid caching and provider selection."""
     
     def __init__(self, provider: Optional[str] = None):
-        self.provider_name = provider or settings.EMBEDDING_PROVIDER
+        self.provider_name = str(provider or settings.EMBEDDING_PROVIDER or "ollama").lower()
         self._provider = self._create_provider()
         
         # Use hybrid cache (L1 in-memory + L2 Redis)
@@ -478,9 +479,11 @@ class Embedder:
         """
         # FIX: Use Ollama as PRIMARY provider (more reliable locally)
         # and OpenAI as FALLBACK (when Ollama unavailable)
+        runtime = get_ai_runtime_config()
+
         if self.provider_name == "ollama":
             if not settings.OLLAMA_ENABLED:
-                if settings.EMBEDDING_FALLBACK_ENABLED and settings.EMBEDDING_API_KEY:
+                if runtime.embeddings.fallback_enabled and runtime.openai.embedding_api_key:
                     logger.warning(
                         "EMBEDDING_PROVIDER is 'ollama' but OLLAMA_ENABLED=False. Falling back to OpenAICompatibleEmbedder."
                     )
@@ -492,8 +495,8 @@ class Embedder:
             # Ollama is primary - create OpenAI fallback only when OpenAI is configured
             fallback_provider = None
             if (
-                settings.EMBEDDING_FALLBACK_ENABLED
-                and settings.EMBEDDING_API_KEY
+                runtime.embeddings.fallback_enabled
+                and runtime.openai.embedding_api_key
             ):
                 try:
                     fallback_provider = OpenAICompatibleEmbedder()
@@ -511,7 +514,7 @@ class Embedder:
             fallback_provider = None
 
             if (
-                settings.EMBEDDING_FALLBACK_ENABLED
+                runtime.embeddings.fallback_enabled
                 and settings.OLLAMA_ENABLED
                 and settings.ENVIRONMENT != "production"
             ):

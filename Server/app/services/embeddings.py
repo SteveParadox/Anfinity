@@ -17,6 +17,11 @@ _OPENAI_EMBEDDING_DIMENSIONS = {
     # Jina
     "jina-embeddings-v4": 2048,
 }
+_OPENAI_COMPATIBLE_PROVIDERS = {"openai", "jina", "api"}
+_OLLAMA_EMBEDDING_DIMENSIONS = {
+    "nomic-embed-text": 768,
+    "mxbai-embed-large": 1024,
+}
 
 try:
     from openai import OpenAI
@@ -64,14 +69,15 @@ def _ai_runtime():
 
     return _Namespace(
        openai=_Namespace(
-                api_key=getattr(settings, "EMBEDDING_API_KEY", None)
+                api_key=getattr(settings, "OPENAI_API_KEY", None),
+                base_url=getattr(settings, "OPENAI_BASE_URL", None),
+                embedding_api_key=getattr(settings, "EMBEDDING_API_KEY", None)
+                    or getattr(settings, "JINA_API_KEY", None)
                     or getattr(settings, "OPENAI_API_KEY", None),
-
-                base_url=getattr(settings, "EMBEDDING_BASE_URL", None)
+                embedding_base_url=getattr(settings, "EMBEDDING_BASE_URL", None)
                     or getattr(settings, "OPENAI_BASE_URL", None),
-
                 embedding_model=getattr(settings, "EMBEDDING_MODEL", None)
-                    or getattr(settings, "EMBEDDING_MODEL", "text-embedding-3-small"),
+                    or getattr(settings, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
             ),
         ollama=_Namespace(
             base_url=getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434"),
@@ -83,10 +89,22 @@ def _ai_runtime():
         embeddings=_Namespace(
             provider=str(getattr(settings, "EMBEDDING_PROVIDER", "ollama") or "ollama").lower(),
             dimension=int(getattr(settings, "EMBEDDING_DIMENSION", 768) or 768),
+            fallback_enabled=bool(getattr(settings, "EMBEDDING_FALLBACK_ENABLED", False)),
             cohere_api_key=getattr(settings, "COHERE_API_KEY", None),
             cohere_model=getattr(settings, "COHERE_EMBEDDING_MODEL", "embed-english-v3.0"),
         ),
     )
+
+
+def _expected_ollama_dimension(model_name: Optional[str], configured_dimension: int) -> int:
+    normalized = str(model_name or "").strip().lower()
+    if normalized in _OLLAMA_EMBEDDING_DIMENSIONS:
+        return _OLLAMA_EMBEDDING_DIMENSIONS[normalized]
+    if "nomic-embed" in normalized:
+        return 768
+    if "mxbai-embed-large" in normalized:
+        return 1024
+    return int(configured_dimension or 768)
 
 
 class EmbeddingService:
@@ -136,10 +154,10 @@ class EmbeddingService:
                 self._tokenizer = None
                 self._use_tiktoken = False
 
-        if self.provider == "openai" and HAS_OPENAI:
-            client_kwargs = {"api_key": runtime.openai.api_key}
-            if getattr(runtime.openai, "base_url", None):
-                client_kwargs["base_url"] = runtime.openai.base_url
+        if self.provider in _OPENAI_COMPATIBLE_PROVIDERS and HAS_OPENAI:
+            client_kwargs = {"api_key": runtime.openai.embedding_api_key}
+            if getattr(runtime.openai, "embedding_base_url", None):
+                client_kwargs["base_url"] = runtime.openai.embedding_base_url
             self.client = OpenAI(**client_kwargs)
             self.model = runtime.openai.embedding_model
             self.dimension = _OPENAI_EMBEDDING_DIMENSIONS.get(
@@ -163,12 +181,14 @@ class EmbeddingService:
             # STEP 1: surface the problem immediately at construction time.
             raise ValueError(
                 f"Embedding provider '{self.provider}' is not available.  "
-                "Install 'openai', 'cohere', or run Ollama locally and set "
-                "provider='ollama'."
+                "Install 'openai' for OpenAI-compatible providers, install "
+                "'cohere', or run Ollama locally and set provider='ollama'."
             )
 
     def _get_cache(self):
         """Lazily create the shared embeddings cache."""
+        if self._cache is False:
+            return None
         if self._cache is not None:
             return self._cache
 
@@ -816,7 +836,7 @@ class EmbeddingService:
         return self.embed_text(text)
 
     def _embed_batch_uncached(self, texts: List[str]) -> List[List[float]]:
-        if self.provider == "openai" and self.client:
+        if self.provider in _OPENAI_COMPATIBLE_PROVIDERS and self.client:
             response = self.client.embeddings.create(
                 model=self.model,
                 input=texts,
@@ -891,8 +911,12 @@ class EmbeddingService:
                         cache.set(text, self.get_model_name(), embedding)
 
         except Exception as primary_err:
-            if self.provider != "ollama":
-                ollama_dimension = _ai_runtime().embeddings.dimension
+            runtime = _ai_runtime()
+            if self.provider != "ollama" and runtime.embeddings.fallback_enabled:
+                ollama_dimension = _expected_ollama_dimension(
+                    runtime.ollama.embedding_model,
+                    runtime.embeddings.dimension,
+                )
                 if ollama_dimension != self.dimension:
                     logger.error(
                         "Cannot fall back to Ollama: dimension mismatch. "
@@ -933,6 +957,11 @@ class EmbeddingService:
                         f"Primary error: {primary_err}. "
                         f"Ollama error: {ollama_err}"
                     ) from ollama_err
+            elif self.provider != "ollama":
+                raise RuntimeError(
+                    f"Embedding generation failed with provider '{self.provider}' "
+                    f"and fallback is disabled: {primary_err}"
+                ) from primary_err
             else:
                 raise RuntimeError(
                     f"Embedding generation failed: {primary_err}"
