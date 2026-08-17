@@ -328,8 +328,8 @@ class OnboardingAcceleratorService:
     ) -> None:
         self.llm_service = llm_service or get_llm_service(
             openai_model=settings.ONBOARDING_ACCELERATOR_MODEL,
-            primary_provider="openai",
-            use_fallback=False,
+            primary_provider=settings.ai_runtime.llm.provider,
+            use_fallback=settings.ai_runtime.llm.use_fallback,
         )
         self.semantic_search_service = get_semantic_search_service()
         self.postgresql_search_service = get_postgresql_search_service()
@@ -590,7 +590,7 @@ class OnboardingAcceleratorService:
             "6. Glossary terms should come from the note content when possible.\n"
             "7. If evidence is weak, say so in the summary and use fewer, more cautious objectives."
         )
-        return await self.llm_service.async_openai_json(
+        return await self.llm_service.async_json_object(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=settings.ONBOARDING_ACCELERATOR_MODEL,

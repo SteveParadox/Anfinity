@@ -119,7 +119,7 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(default=10, ge=1, le=20)
     include_sources: bool = True
-    model: str = Field(default=settings.OLLAMA_MODEL)
+    model: Optional[str] = None
 
 
 class Source(BaseModel):
@@ -553,7 +553,12 @@ async def query(
         confidence = float(rag_result.confidence or 0.0)
         answer_text = NO_EVIDENCE_MESSAGE
         tokens_used = 0
-        model_used = query_request.model or settings.OLLAMA_MODEL
+        configured_model = (
+            settings.ai_runtime.llm.openai_model
+            if settings.ai_runtime.llm.provider == "openai"
+            else settings.ai_runtime.llm.ollama_model
+        )
+        model_used = query_request.model or configured_model
         sources, _ = await _hydrate_sources(db, rag_result.chunks, query_request.include_sources)
         evidence_summary: Dict[str, float] = {}
         reliable_evidence = False

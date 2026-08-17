@@ -627,7 +627,11 @@ async def generate_answer(
             answer_text=NO_EVIDENCE_MESSAGE,
             confidence_score=0.0,
             sources=[],
-            model_used=request.model or settings.OLLAMA_MODEL,
+            model_used=request.model or (
+                settings.ai_runtime.llm.openai_model
+                if settings.ai_runtime.llm.provider == "openai"
+                else settings.ai_runtime.llm.ollama_model
+            ),
             tokens_used=0,
         )
         db.add(answer)
@@ -715,7 +719,11 @@ async def generate_answer(
         answer_text=generated_answer.answer_text,
         confidence_score=float(generated_answer.confidence_score),
         sources=sources_for_audit,
-        model_used=generated_answer.model_used or request.model or settings.OLLAMA_MODEL,
+        model_used=generated_answer.model_used or request.model or (
+            settings.ai_runtime.llm.openai_model
+            if settings.ai_runtime.llm.provider == "openai"
+            else settings.ai_runtime.llm.ollama_model
+        ),
         tokens_used=int(generated_answer.tokens_used or 0),
     )
     db.add(answer)

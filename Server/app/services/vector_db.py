@@ -119,6 +119,7 @@ class VectorDBClient:
         self.client: Optional["QdrantClient"] = None
         self.is_connected: bool = False
         self._last_connect_attempt: float = 0.0
+        self._payload_indexes_ensured: set[tuple[str, str]] = set()
 
         self.mock_storage: Dict[str, list] = {}
 
@@ -271,6 +272,7 @@ class VectorDBClient:
                         "Collection '%s' already exists with correct dim=%d",
                         collection_name, dim,
                     )
+                    self._ensure_payload_indexes(collection_name)
                     return True
 
                 if not ALLOW_DESTRUCTIVE_RECREATE:
@@ -306,6 +308,7 @@ class VectorDBClient:
                     vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
                 ),
             )
+            self._ensure_payload_indexes(collection_name)
             logger.info("Created Qdrant collection '%s' (dim=%d)", collection_name, dim)
             return True
 
@@ -360,6 +363,39 @@ class VectorDBClient:
             if self._is_retryable_connection_error(exc):
                 self._invalidate_connection(str(exc))
             return False
+
+    def _ensure_payload_indexes(self, collection_name: str) -> None:
+        """Ensure payload indexes required by filtered searches exist."""
+        if not self.client:
+            return
+
+        index_key = (collection_name, "workspace_id")
+        if index_key in self._payload_indexes_ensured:
+            return
+
+        try:
+            self._execute_with_reconnect(
+                f"create payload index workspace_id on '{collection_name}'",
+                lambda: self.client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="workspace_id",
+                    field_schema="keyword",
+                ),
+            )
+            logger.info("Ensured Qdrant payload index workspace_id on '%s'", collection_name)
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if "already exists" in error_text or "exists" in error_text:
+                logger.debug("Qdrant payload index workspace_id already exists on '%s'", collection_name)
+            else:
+                logger.warning(
+                    "Could not ensure Qdrant payload index workspace_id on '%s': %s",
+                    collection_name,
+                    exc,
+                )
+                return
+
+        self._payload_indexes_ensured.add(index_key)
 
     def resolve_collection_name(
         self,
@@ -450,6 +486,8 @@ class VectorDBClient:
                         vectors_config=VectorParams(size=actual_dim, distance=Distance.COSINE),
                     ),
                 )
+                self._payload_indexes_ensured.discard((collection_name, "workspace_id"))
+                self._ensure_payload_indexes(collection_name)
 
         except Exception as probe_exc:
             logger.debug(
@@ -560,6 +598,7 @@ class VectorDBClient:
         try:
             query_filter = None
             if workspace_id is not None:
+                self._ensure_payload_indexes(collection_name)
                 query_filter = Filter(
                     must=[
                         FieldCondition(

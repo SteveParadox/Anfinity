@@ -45,6 +45,7 @@ except Exception:  # pragma: no cover - isolated module-loading tests stub the a
         return dict(enriched.get("source_location") or {"citation_label": enriched.get("citation_label")})
 from app.services.retrieval_cross_checker import RetrievalCrossChecker, RetrievalValidation
 from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
+from app.services.llm_service import LLMService, get_llm_service
 
 logger = logging.getLogger(__name__)
 settings = app_config.settings
@@ -139,7 +140,7 @@ class GeneratedAnswer:
 
 
 class AnswerGenerator:
-    """Generate answers from retrieved chunks using Ollama only."""
+    """Generate answers from retrieved chunks using the configured LLM provider."""
 
     TECHNICAL_TERMS = {
         "ai", "llm", "embedding", "embeddings", "model", "models", "semantic",
@@ -164,12 +165,25 @@ class AnswerGenerator:
         runtime = _ai_runtime()
         llm_runtime = getattr(runtime, "llm", None)
         ollama_runtime = getattr(runtime, "ollama", None)
+        self.primary_provider = str(getattr(llm_runtime, "provider", getattr(settings, "LLM_PROVIDER", "ollama")) or "ollama").lower()
+        self.use_fallback = bool(getattr(llm_runtime, "use_fallback", getattr(settings, "LLM_USE_FALLBACK", True)))
 
-        self.model = model or getattr(llm_runtime, "ollama_model", getattr(settings, "OLLAMA_MODEL", "phi3:mini"))
+        requested_model = model
+        if self.primary_provider == "openai" and requested_model and openai_model is None:
+            openai_model = requested_model
+            requested_model = None
+
+        self.model = requested_model or getattr(llm_runtime, "ollama_model", getattr(settings, "OLLAMA_MODEL", "phi3:mini"))
         self.openai_model = openai_model or getattr(
             llm_runtime,
             "openai_model",
             getattr(settings, "OPENAI_MODEL", "gpt-4o-mini"),
+        )
+        self.llm_service: LLMService = get_llm_service(
+            model=self.model,
+            openai_model=self.openai_model,
+            primary_provider=self.primary_provider,
+            use_fallback=self.use_fallback,
         )
         self.temperature = temperature if temperature is not None else getattr(
             llm_runtime,
@@ -228,9 +242,11 @@ class AnswerGenerator:
         )
 
         logger.info(
-            "AnswerGenerator initialized: model=%s fallback_model=%s url=%s timeouts(connect=%.1fs, read=%.1fs, write=%.1fs, pool=%.1fs) threshold=%.2f",
+            "AnswerGenerator initialized: primary=%s fallback=%s ollama_model=%s openai_model=%s url=%s timeouts(connect=%.1fs, read=%.1fs, write=%.1fs, pool=%.1fs) threshold=%.2f",
+            self.primary_provider,
+            self.use_fallback,
             self.model,
-            self.ollama_fallback_model,
+            self.openai_model,
             self.ollama_base_url,
             self.ollama_connect_timeout,
             self.ollama_read_timeout,
@@ -298,7 +314,7 @@ class AnswerGenerator:
         try:
             answer_text, tokens_used, model_used = await self._call_llm(system_prompt, user_prompt)
         except Exception as exc:
-            logger.warning("Primary Ollama generation failed, retrying with compact context: %s", exc)
+            logger.warning("Primary LLM generation failed, retrying with compact context: %s", exc)
             compact_chunks = self._select_chunks_for_generation(query, filtered_chunks, compact=True)
             compact_context = self._build_context(compact_chunks, include_citations)
             compact_user_prompt = self._build_user_prompt(query, compact_context, compact_chunks)
@@ -318,7 +334,7 @@ class AnswerGenerator:
                 quality_check.fallback_reason = "compact_llm_retry"
             except Exception as retry_exc:
                 logger.warning(
-                    "Compact Ollama retry failed, using extractive grounded fallback: %s",
+                    "Compact LLM retry failed, using extractive grounded fallback: %s",
                     retry_exc,
                 )
                 return self._build_extractive_grounded_answer(
@@ -394,27 +410,37 @@ class AnswerGenerator:
     ) -> Tuple[str, int, str]:
         model_name = model_override or self.model
         logger.info(
-            "Calling Ollama model=%s url=%s timeouts(connect=%.1fs, read=%.1fs, write=%.1fs, pool=%.1fs)",
+            "Calling configured LLM provider primary=%s fallback=%s ollama_model=%s openai_model=%s",
+            self.primary_provider,
+            self.use_fallback,
             model_name,
-            self.ollama_base_url,
-            self.ollama_connect_timeout,
-            self.ollama_read_timeout,
-            self.ollama_write_timeout,
-            self.ollama_pool_timeout,
+            self.openai_model,
         )
         try:
-            answer_text = await self._ollama_generate(
-                system_prompt,
-                user_prompt,
-                model_override=model_override,
-                max_tokens_override=max_tokens_override,
-                num_ctx_override=num_ctx_override,
+            del num_ctx_override
+            service = self.llm_service
+            if model_override and self.primary_provider == "ollama":
+                service = get_llm_service(
+                    model=model_override,
+                    openai_model=self.openai_model,
+                    primary_provider=self.primary_provider,
+                    use_fallback=self.use_fallback,
+                )
+            response = await service.async_chat_completion(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=self.temperature,
+                max_tokens=max_tokens_override or self.max_tokens,
+                primary_provider=self.primary_provider,
             )
-            return answer_text, 0, model_name
+            return response.answer, int(response.tokens_used or 0), response.model
         except Exception as exc:
-            logger.error("Ollama inference failed: %s", exc, exc_info=True)
+            logger.error("Configured LLM inference failed: %s", exc, exc_info=True)
             raise RuntimeError(
-                f"Ollama inference failed (exclusive mode, no fallback). Error: {type(exc).__name__}: {exc}"
+                f"LLM inference failed using configured provider '{self.primary_provider}'. "
+                f"Error: {type(exc).__name__}: {exc}"
             ) from exc
 
     async def _ollama_generate(
@@ -1140,7 +1166,7 @@ ANSWER:"""
         return conflicts, bool(conflicts)
 
 
-_generator: Optional[AnswerGenerator] = None
+_generators: Dict[tuple, AnswerGenerator] = {}
 
 
 def get_answer_generator(
@@ -1153,9 +1179,23 @@ def get_answer_generator(
     detect_conflicts: bool = True,
     ollama_timeout: Optional[int] = None,
 ) -> AnswerGenerator:
-    global _generator
-    if _generator is None:
-        _generator = AnswerGenerator(
+    runtime = _ai_runtime()
+    llm_runtime = getattr(runtime, "llm", None)
+    key = (
+        model,
+        openai_model,
+        ollama_base_url,
+        similarity_threshold,
+        min_unique_documents,
+        detect_conflicts,
+        ollama_timeout,
+        str(getattr(llm_runtime, "provider", getattr(settings, "LLM_PROVIDER", "ollama")) or "ollama").lower(),
+        bool(getattr(llm_runtime, "use_fallback", getattr(settings, "LLM_USE_FALLBACK", True))),
+        getattr(llm_runtime, "openai_model", getattr(settings, "OPENAI_MODEL", "gpt-4o-mini")),
+        getattr(llm_runtime, "ollama_model", getattr(settings, "OLLAMA_MODEL", "phi3:mini")),
+    )
+    if key not in _generators:
+        _generators[key] = AnswerGenerator(
             model=model,
             openai_model=openai_model,
             openai_api_key=openai_api_key,
@@ -1165,9 +1205,8 @@ def get_answer_generator(
             detect_conflicts=detect_conflicts,
             ollama_timeout=ollama_timeout,
         )
-    return _generator
+    return _generators[key]
 
 
 def reset_answer_generator() -> None:
-    global _generator
-    _generator = None
+    _generators.clear()

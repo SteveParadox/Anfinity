@@ -427,6 +427,51 @@ class LLMService:
             raise RuntimeError("OpenAI returned a non-object JSON payload")
         return parsed
 
+    async def async_json_object(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Generate and parse a JSON object using the configured provider order."""
+        runtime = _ai_runtime()
+        resolved_max_tokens = max_tokens if max_tokens is not None else runtime.llm.max_tokens
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        last_exc: Optional[Exception] = None
+
+        for provider_name in self._provider_order():
+            try:
+                if provider_name == "openai":
+                    return await self.async_openai_json(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        model=model or self.openai_model,
+                        temperature=temperature,
+                        max_tokens=resolved_max_tokens,
+                    )
+
+                provider = self._async_providers.get(provider_name)
+                if provider is None:
+                    continue
+                response = await provider(messages, temperature, resolved_max_tokens)
+                content = (response.answer or "").strip()
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE | re.DOTALL).strip()
+                parsed = json.loads(content or "{}")
+                if not isinstance(parsed, dict):
+                    raise RuntimeError(f"{provider_name} returned a non-object JSON payload")
+                return parsed
+            except Exception as exc:
+                logger.warning("%s JSON generation failed: %s", provider_name, exc)
+                last_exc = exc
+
+        raise RuntimeError(f"All LLM providers failed JSON generation. Last error: {last_exc}")
+
     def _provider_order(self, primary_override: Optional[str] = None) -> List[str]:
         primary = str(primary_override or self.primary_provider or "ollama").lower()
         if primary not in {"ollama", "openai"}:
@@ -503,6 +548,35 @@ class LLMService:
                 return await provider(messages, resolved_temperature, resolved_max_tokens)
             except Exception as exc:
                 logger.warning("%s failed: %s", provider_name, exc)
+                if self._is_token_exhaustion(str(exc)):
+                    logger.warning("Token exhaustion detected on %s", provider_name)
+                last_exc = exc
+
+        raise RuntimeError(f"All LLM providers failed. Last error: {last_exc}")
+
+    async def async_chat_completion(
+        self,
+        messages: List[dict],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        primary_provider: Optional[str] = None,
+    ) -> LLMResponse:
+        """Generate from caller-provided chat messages using configured provider order."""
+        runtime = _ai_runtime()
+        resolved_temperature = temperature if temperature is not None else runtime.llm.temperature
+        resolved_max_tokens = max_tokens if max_tokens is not None else runtime.llm.max_tokens
+        last_exc: Optional[Exception] = None
+
+        for provider_name in self._provider_order(primary_override=primary_provider):
+            provider = self._async_providers.get(provider_name)
+            if provider is None:
+                continue
+            try:
+                logger.info("Trying async chat provider: %s", provider_name)
+                return await provider(messages, resolved_temperature, resolved_max_tokens)
+            except Exception as exc:
+                logger.warning("%s chat completion failed: %s", provider_name, exc)
                 if self._is_token_exhaustion(str(exc)):
                     logger.warning("Token exhaustion detected on %s", provider_name)
                 last_exc = exc
