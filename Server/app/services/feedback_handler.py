@@ -48,9 +48,23 @@ class FeedbackHandler:
         seen: set[tuple[str, str]] = set()
 
         for source in list(answer_sources or []):
+            source_kind = str(source.get("source_kind") or "").strip().lower()
             chunk_id = str(source.get("chunk_id") or "").strip()
             document_id = str(source.get("document_id") or "").strip()
             if not chunk_id or not document_id:
+                continue
+            if source_kind and source_kind != "document":
+                logger.debug(
+                    "Skipping non-document feedback source for chunk weights: source_kind=%s chunk_id=%s",
+                    source_kind,
+                    chunk_id,
+                )
+                continue
+            if not source_kind and chunk_id == document_id:
+                logger.debug(
+                    "Skipping legacy note-like feedback source for chunk weights: chunk_id=%s",
+                    chunk_id,
+                )
                 continue
 
             pair = (chunk_id, document_id)

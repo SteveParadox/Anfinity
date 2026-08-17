@@ -394,7 +394,14 @@ def _source_pairs_for_result_feedback(
     document_id = _normalize_feedback_id(item.get("document_id"))
     if not document_id:
         return []
-    return [{"chunk_id": normalized_target, "document_id": document_id}]
+    return [
+        {
+            "chunk_id": normalized_target,
+            "document_id": document_id,
+            "source_kind": _normalize_feedback_id(item.get("source_kind")),
+            "source_type": _normalize_feedback_id(item.get("source_type")),
+        }
+    ]
 
 
 def _ensure_feedback_reason(feedback_type: str, reason_code: Optional[str]) -> None:
