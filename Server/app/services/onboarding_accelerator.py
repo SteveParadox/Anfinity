@@ -515,7 +515,7 @@ class OnboardingAcceleratorService:
 
     async def _generate_curriculum_draft(
         self,
-        role_bundle: RoleQueryBundle,u
+        role_bundle: RoleQueryBundle,
         candidates: Sequence[OnboardingCandidateNote],
         insufficient_content: bool,
     ) -> Mapping[str, Any]:
