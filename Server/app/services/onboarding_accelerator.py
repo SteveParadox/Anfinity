@@ -520,13 +520,39 @@ class OnboardingAcceleratorService:
         insufficient_content: bool,
     ) -> Mapping[str, Any]:
         system_prompt = (
-            "You are generating a 4-week onboarding curriculum for a workspace.\n"
-            "You must stay strictly grounded in the provided candidate notes.\n"
-            "Never invent documents, systems, processes, tools, or terminology that are not supported by the notes.\n"
-            "Use only note IDs from the candidate set.\n"
-            "If the workspace content is sparse, say so clearly and keep the curriculum modest.\n"
-            "Return JSON only."
+            "You generate a 4-week onboarding curriculum for a workspace using ONLY the provided candidate notes.\n\n"
+
+            "GROUNDING:\n"
+            "- Treat the candidate notes as the complete source of truth.\n"
+            "- Never invent, infer, assume, or hallucinate documents, systems, tools, processes, policies, terminology, "
+            "people, teams, workflows, or concepts that are not explicitly supported by the notes.\n"
+            "- Every curriculum item must be traceable to one or more provided candidate note IDs.\n"
+            "- Use only note IDs that appear in the candidate set. Never create, modify, or guess note IDs.\n"
+            "- Prefer direct evidence from the notes over broad interpretations or generic onboarding knowledge.\n"
+            "- Do not fill gaps with plausible-sounding content. If something is not supported, omit it.\n\n"
+
+            "CURRICULUM DESIGN:\n"
+            "- Build a practical 4-week progression from foundational context to deeper, supported knowledge.\n"
+            "- Keep the scope proportional to the amount and quality of available workspace content.\n"
+            "- Do not manufacture a progression when the notes do not support one.\n"
+            "- Avoid repeating the same material unless repetition is clearly useful for onboarding.\n"
+            "- Each week and learning item should have a clear purpose and should reference the supporting note IDs.\n"
+            "- Do not introduce prerequisites, outcomes, terminology, or learning objectives that cannot be grounded in the notes.\n"
+            "- If the notes are sparse, explicitly indicate that the curriculum is constrained by limited source material and keep it modest.\n\n"
+
+            "EVIDENCE:\n"
+            "- Every substantive claim in the output must be supported by the cited note IDs.\n"
+            "- Do not cite a note merely because it is topically related; the note must actually support the item.\n"
+            "- When multiple notes support an item, include all relevant note IDs rather than inventing a stronger conclusion.\n\n"
+
+            "OUTPUT:\n"
+            "- Return valid JSON only. No Markdown, prose outside the JSON, commentary, or code fences.\n"
+            "- Follow the requested output schema exactly.\n"
+            "- Do not add undocumented fields.\n"
+            "- Ensure the JSON is syntactically valid and internally consistent.\n"
+            "- If there is insufficient evidence for a field, use the schema's appropriate empty/null value rather than inventing content.\n"
         )
+        
         candidate_payload = [self._serialize_candidate_for_model(candidate) for candidate in candidates]
         candidate_payload_json = json.dumps(candidate_payload, ensure_ascii=True, separators=(",", ":"))
         while len(candidate_payload_json) > self.MAX_MODEL_CONTEXT_CHARS and len(candidate_payload) > 8:
