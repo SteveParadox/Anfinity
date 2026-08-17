@@ -129,8 +129,29 @@ class RAGRetriever:
 
                 for result in raw_results:
                     payload = result.get("payload", {})
-                    chunk_id = str(payload.get("chunk_id", result.get("id", "")))
+                    chunk_id_raw = payload.get("chunk_id")
+                    if not chunk_id_raw:
+                        logger.warning(
+                            "Skipping vector result without chunk_id: result_id=%s",
+                            result.get("id"),
+                        )
+                        continue
+
+                    chunk_id = str(chunk_id_raw).strip()
                     if not chunk_id:
+                        logger.warning(
+                            "Skipping vector result with blank chunk_id: result_id=%s",
+                            result.get("id"),
+                        )
+                        continue
+
+                    document_id = str(payload.get("document_id") or "").strip()
+                    if not document_id:
+                        logger.warning(
+                            "Skipping vector result without document_id: chunk_id=%s result_id=%s",
+                            chunk_id,
+                            result.get("id"),
+                        )
                         continue
 
                     similarity = float(result.get("similarity", 0.0))
@@ -153,7 +174,7 @@ class RAGRetriever:
                     metadata.update(
                         {
                             "chunk_id": chunk_id,
-                            "document_id": str(payload.get("document_id", "unknown")),
+                            "document_id": document_id,
                             "chunk_index": payload.get("chunk_index", 0),
                             "document_title": payload.get("document_title", ""),
                         }
@@ -161,7 +182,7 @@ class RAGRetriever:
 
                     chunk = RetrievedChunk(
                         chunk_id=chunk_id,
-                        document_id=str(payload.get("document_id", "unknown")),
+                        document_id=document_id,
                         text=text,
                         similarity=similarity,
                         chunk_index=payload.get("chunk_index", 0),

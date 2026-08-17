@@ -221,6 +221,21 @@ class TopKRetriever:
                 try:
                     payload = result.get("payload", {})
                     similarity = result.get("similarity", 0.0)
+                    chunk_id = str(payload.get("chunk_id") or "").strip()
+                    document_id = str(payload.get("document_id") or "").strip()
+                    if not chunk_id:
+                        logger.warning(
+                            "Skipping vector result without chunk_id: result_id=%s",
+                            result.get("id"),
+                        )
+                        continue
+                    if not document_id:
+                        logger.warning(
+                            "Skipping vector result without document_id: chunk_id=%s result_id=%s",
+                            chunk_id,
+                            result.get("id"),
+                        )
+                        continue
 
                     metadata = enrich_citation_metadata(
                         payload.get("metadata") or {},
@@ -229,8 +244,8 @@ class TopKRetriever:
                     )
 
                     chunk = RetrievedChunk(
-                        chunk_id=payload.get("chunk_id", result.get("id", "")),
-                        document_id=payload.get("document_id", ""),
+                        chunk_id=chunk_id,
+                        document_id=document_id,
                         similarity=similarity,
                         text=payload.get("text") or payload.get("chunk_text") or payload.get("text_preview", ""),
                         source_type=payload.get("source_type", "unknown"),

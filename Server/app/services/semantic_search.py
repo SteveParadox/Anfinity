@@ -467,7 +467,8 @@ class SemanticSearchService:
                 continue
 
         if not chunk_ids:
-            return chunks
+            logger.warning("Dropping %d retriever fallback chunks with invalid chunk IDs", len(chunks))
+            return []
 
         try:
             rows = await db.execute(
@@ -476,8 +477,8 @@ class SemanticSearchService:
                 .where(Chunk.id.in_(chunk_ids))
             )
         except Exception as exc:
-            logger.warning("Failed to hydrate retriever fallback chunks: %s", exc)
-            return chunks
+            logger.warning("Dropping retriever fallback chunks after failed SQL hydration: %s", exc)
+            return []
 
         hydrated_by_id = {
             str(chunk_row.id): (chunk_row, document_row)
@@ -488,22 +489,38 @@ class SemanticSearchService:
         for chunk in chunks:
             row = hydrated_by_id.get(str(chunk.chunk_id))
             if row is None:
-                hydrated.append(chunk)
+                logger.warning(
+                    "Dropping stale vector result: chunk_id=%s document_id=%s",
+                    chunk.chunk_id,
+                    chunk.document_id,
+                )
                 continue
 
             chunk_row, document_row = row
+            if str(chunk.document_id) != str(document_row.id):
+                logger.warning(
+                    "Vector metadata mismatch: chunk_id=%s vector_document_id=%s db_document_id=%s",
+                    chunk.chunk_id,
+                    chunk.document_id,
+                    document_row.id,
+                )
+
             merged_metadata = {
                 **(chunk_row.chunk_metadata or {}),
                 **(chunk.metadata or {}),
             }
             merged_metadata.setdefault("source_kind", "document")
-            merged_metadata.setdefault("document_id", str(document_row.id))
-            merged_metadata.setdefault("chunk_id", str(chunk_row.id))
-            merged_metadata.setdefault("chunk_index", chunk_row.chunk_index)
-            merged_metadata.setdefault("document_title", document_row.title or chunk.document_title)
-            merged_metadata.setdefault("token_count", chunk_row.token_count or chunk.token_count or 0)
-            merged_metadata.setdefault("context_before", chunk_row.context_before or chunk.context_before)
-            merged_metadata.setdefault("context_after", chunk_row.context_after or chunk.context_after)
+            merged_metadata.update(
+                {
+                    "document_id": str(document_row.id),
+                    "chunk_id": str(chunk_row.id),
+                    "chunk_index": chunk_row.chunk_index,
+                    "document_title": document_row.title or chunk.document_title,
+                    "token_count": chunk_row.token_count or chunk.token_count or 0,
+                    "context_before": chunk_row.context_before or chunk.context_before,
+                    "context_after": chunk_row.context_after or chunk.context_after,
+                }
+            )
             if getattr(chunk_row, "created_at", None):
                 merged_metadata.setdefault("created_at", chunk_row.created_at.isoformat())
             if getattr(document_row, "created_at", None):

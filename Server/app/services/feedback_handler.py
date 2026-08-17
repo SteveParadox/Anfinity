@@ -11,7 +11,7 @@ from sqlalchemy import Float, String, cast, func, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Answer, ChunkWeight, Feedback, SearchFeedback
+from app.database.models import Answer, Chunk, ChunkWeight, Document, Feedback, SearchFeedback
 from app.database.session import log_session_query_metrics
 
 logger = logging.getLogger(__name__)
@@ -191,6 +191,14 @@ class FeedbackHandler:
         if not source_pairs:
             return []
 
+        source_pairs = await self._filter_existing_document_chunk_pairs(
+            source_pairs=source_pairs,
+            workspace_id=workspace_id,
+            db=db,
+        )
+        if not source_pairs:
+            return []
+
         existing_result = await db.execute(
             select(ChunkWeight).where(
                 ChunkWeight.workspace_id == workspace_id,
@@ -302,6 +310,14 @@ class FeedbackHandler:
         if not source_pairs:
             return []
 
+        source_pairs = await self._filter_existing_document_chunk_pairs(
+            source_pairs=source_pairs,
+            workspace_id=workspace_id,
+            db=db,
+        )
+        if not source_pairs:
+            return []
+
         previous_signal = int(max(-1, min(1, previous_signal)))
         new_signal = int(max(-1, min(1, new_signal)))
         if previous_signal == new_signal:
@@ -396,6 +412,61 @@ class FeedbackHandler:
             )
 
         return chunk_updates
+
+    async def _filter_existing_document_chunk_pairs(
+        self,
+        *,
+        source_pairs: list[tuple[str, str]],
+        workspace_id: UUID,
+        db: AsyncSession,
+    ) -> list[tuple[str, str]]:
+        parsed_pairs: list[tuple[str, UUID, UUID]] = []
+        for chunk_id, document_id in source_pairs:
+            try:
+                chunk_uuid = UUID(str(chunk_id))
+                document_uuid = UUID(str(document_id))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Skipping feedback source with invalid IDs: chunk_id=%s document_id=%s",
+                    chunk_id,
+                    document_id,
+                )
+                continue
+            parsed_pairs.append((str(chunk_uuid), chunk_uuid, document_uuid))
+
+        if not parsed_pairs:
+            return []
+
+        chunk_ids = [chunk_uuid for _, chunk_uuid, _ in parsed_pairs]
+        document_ids = [document_uuid for _, _, document_uuid in parsed_pairs]
+        result = await db.execute(
+            select(Chunk.id, Chunk.document_id)
+            .join(Document, Chunk.document_id == Document.id)
+            .where(
+                Document.workspace_id == workspace_id,
+                Chunk.id.in_(chunk_ids),
+                Chunk.document_id.in_(document_ids),
+            )
+        )
+        valid_pairs = {
+            (str(chunk_id), str(document_id))
+            for chunk_id, document_id in result.all()
+        }
+
+        filtered: list[tuple[str, str]] = []
+        for normalized_chunk_id, _, document_uuid in parsed_pairs:
+            pair = (normalized_chunk_id, str(document_uuid))
+            if pair not in valid_pairs:
+                logger.warning(
+                    "Skipping feedback for stale or mismatched source: chunk_id=%s document_id=%s workspace_id=%s",
+                    normalized_chunk_id,
+                    document_uuid,
+                    workspace_id,
+                )
+                continue
+            filtered.append(pair)
+
+        return filtered
 
     async def _calculate_confidence_impact(
         self,

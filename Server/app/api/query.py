@@ -311,41 +311,36 @@ async def _hydrate_answer_chunks(
         )
         chunk_map = {str(chunk.id): (chunk, doc) for chunk, doc in result.all()}
     except Exception as exc:
-        logger.warning("Falling back to retriever payloads for answer chunks: %s", exc)
+        logger.warning("Dropping retrieved chunks after failed answer-generation hydration: %s", exc)
 
     hydrated: List[AnswerRetrievedChunk] = []
     for retrieved in rag_chunks:
         chunk_row = chunk_map.get(str(retrieved.chunk_id))
         if not chunk_row:
-            text = (getattr(retrieved, "text", "") or "").strip()
-            if not text:
-                continue
-            hydrated.append(
-                AnswerRetrievedChunk(
-                    chunk_id=str(retrieved.chunk_id),
-                    document_id=str(retrieved.document_id),
-                    similarity=float(retrieved.similarity or 0.0),
-                    text=text,
-                    source_type=str(getattr(retrieved, "source_type", "document")),
-                    chunk_index=int(getattr(retrieved, "chunk_index", 0) or 0),
-                    document_title=getattr(retrieved, "document_title", "") or "Untitled Document",
-                    token_count=int(getattr(retrieved, "token_count", 0) or 0),
-                    context_before=getattr(retrieved, "context_before", None),
-                    context_after=getattr(retrieved, "context_after", None),
-                    metadata=enrich_citation_metadata(
-                        {**(getattr(retrieved, "metadata", None) or {}), "source_kind": "document"},
-                        document_title=getattr(retrieved, "document_title", "") or "Untitled Document",
-                        source_type=str(getattr(retrieved, "source_type", "document")),
-                    ),
-                )
+            logger.warning(
+                "Dropping stale retrieved chunk for answer generation: chunk_id=%s document_id=%s",
+                getattr(retrieved, "chunk_id", ""),
+                getattr(retrieved, "document_id", ""),
             )
             continue
 
         chunk, doc = chunk_row
+        if str(getattr(retrieved, "document_id", "")) != str(doc.id):
+            logger.warning(
+                "Retrieved chunk document mismatch for answer generation: chunk_id=%s vector_document_id=%s db_document_id=%s",
+                getattr(retrieved, "chunk_id", ""),
+                getattr(retrieved, "document_id", ""),
+                doc.id,
+            )
+
         metadata = {
             **(chunk.chunk_metadata or {}),
             **(getattr(retrieved, "metadata", None) or {}),
             "source_kind": "document",
+            "chunk_id": str(chunk.id),
+            "document_id": str(doc.id),
+            "chunk_index": int(chunk.chunk_index or 0),
+            "document_title": doc.title or getattr(retrieved, "document_title", "") or "Untitled Document",
         }
         if getattr(chunk, "created_at", None):
             metadata.setdefault("created_at", chunk.created_at.isoformat())

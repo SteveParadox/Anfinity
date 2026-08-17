@@ -520,7 +520,8 @@ async def _hydrate_retrieved_chunks(
             continue
 
     if not chunk_ids:
-        return chunks
+        logger.warning("Dropping %d retrieved chunks with invalid chunk IDs for answer sources", len(chunks))
+        return []
 
     try:
         rows = await db.execute(
@@ -529,8 +530,8 @@ async def _hydrate_retrieved_chunks(
             .where(Chunk.id.in_(chunk_ids))
         )
     except Exception as exc:
-        logger.warning("Falling back to retriever payloads for answer sources: %s", exc)
-        return chunks
+        logger.warning("Dropping retrieved chunks after failed answer-source hydration: %s", exc)
+        return []
 
     hydrated_by_id = {
         str(chunk_row.id): (chunk_row, document_row)
@@ -541,14 +542,35 @@ async def _hydrate_retrieved_chunks(
     for chunk in chunks:
         row = hydrated_by_id.get(str(chunk.chunk_id))
         if row is None:
-            hydrated.append(chunk)
+            logger.warning(
+                "Dropping stale retrieved chunk for answer sources: chunk_id=%s document_id=%s",
+                chunk.chunk_id,
+                chunk.document_id,
+            )
             continue
 
         chunk_row, document_row = row
+        if str(chunk.document_id) != str(document_row.id):
+            logger.warning(
+                "Retrieved chunk document mismatch for answer sources: chunk_id=%s vector_document_id=%s db_document_id=%s",
+                chunk.chunk_id,
+                chunk.document_id,
+                document_row.id,
+            )
+
         merged_metadata = {
             **(chunk_row.chunk_metadata or {}),
             **(chunk.metadata or {}),
         }
+        merged_metadata.update(
+            {
+                "source_kind": "document",
+                "chunk_id": str(chunk_row.id),
+                "document_id": str(document_row.id),
+                "chunk_index": int(chunk_row.chunk_index),
+                "document_title": document_row.title or chunk.document_title,
+            }
+        )
         if getattr(chunk_row, "created_at", None):
             merged_metadata.setdefault("created_at", chunk_row.created_at.isoformat())
         merged_metadata = enrich_citation_metadata(
