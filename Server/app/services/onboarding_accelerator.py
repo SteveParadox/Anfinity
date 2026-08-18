@@ -327,7 +327,6 @@ class OnboardingAcceleratorService:
         llm_service: Optional[LLMService] = None,
     ) -> None:
         self.llm_service = llm_service or get_llm_service(
-            openai_model=settings.ONBOARDING_ACCELERATOR_MODEL,
             primary_provider=settings.ai_runtime.llm.provider,
             use_fallback=settings.ai_runtime.llm.use_fallback,
         )
@@ -593,7 +592,6 @@ class OnboardingAcceleratorService:
         return await self.llm_service.async_json_object(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            model=settings.ONBOARDING_ACCELERATOR_MODEL,
             temperature=0.15,
             max_tokens=settings.ONBOARDING_ACCELERATOR_MAX_TOKENS,
         )
