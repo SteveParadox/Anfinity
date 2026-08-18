@@ -589,6 +589,23 @@ class OnboardingAcceleratorService:
             "6. Glossary terms should come from the note content when possible.\n"
             "7. If evidence is weak, say so in the summary and use fewer, more cautious objectives."
         )
+        
+        # Resolve model and configuration for logging
+        runtime = settings.ai_runtime
+        resolved_model = (
+            runtime.llm.openai_model
+            if runtime.llm.provider == "openai"
+            else runtime.llm.ollama_model
+        )
+        resolved_max_tokens = settings.ONBOARDING_ACCELERATOR_MAX_TOKENS
+        
+        logger.info(
+            "OpenAI JSON generation: model=%r base_url=%r max_tokens=%r",
+            resolved_model,
+            getattr(runtime.openai, "base_url", None),
+            resolved_max_tokens,
+        )
+        
         return await self.llm_service.async_json_object(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
