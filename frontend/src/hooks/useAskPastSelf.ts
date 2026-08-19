@@ -101,28 +101,14 @@ export async function* streamAskPastSelf(
   };
 
   try {
-    const response = await fetch(`${apiBase}/chat/ask`, {
+    const response = await api.stream('/chat/ask', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${api.getToken() || ''}`,
-      },
       body: JSON.stringify(payload),
       signal: options.signal,
     });
 
     if (!response.ok) {
-      let detail = `HTTP ${response.status}`;
-      try {
-        const errorBody = await response.json();
-        detail = errorBody.detail || detail;
-      } catch {
-        const errorText = await response.text().catch(() => '');
-        if (errorText) {
-          detail = errorText;
-        }
-      }
-      throw new Error(detail);
+      throw await api.errorFromResponse(response);
     }
 
     if (!response.body) {
@@ -176,7 +162,6 @@ export async function askPastSelfSync(
   followUpQuestions: string[];
   answerStatus: 'supported' | 'partial' | 'refusal';
 }> {
-  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8080';
   const payload = {
     workspace_id: options.workspaceId,
     query: options.query,
@@ -185,19 +170,14 @@ export async function askPastSelfSync(
     similarity_threshold: options.similarityThreshold ?? 0.3,
   };
 
-  const response = await fetch(`${apiBase}/chat/ask/sync`, {
+  const response = await api.stream('/chat/ask/sync', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${api.getToken() || ''}`,
-    },
     body: JSON.stringify(payload),
     signal: options.signal,
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    throw await api.errorFromResponse(response);
   }
 
   return response.json();

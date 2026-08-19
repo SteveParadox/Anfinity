@@ -150,6 +150,40 @@ function useWindowWidth(): number {
   return width;
 }
 
+function useWindowHeight(): number {
+  const [height, setHeight] = useState(() => window.innerHeight);
+
+  useEffect(() => {
+    let frameId: number | null = null;
+
+    const handleResize = () => {
+      if (frameId !== null) return;
+
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        setHeight((currentHeight) => {
+          const nextHeight = window.innerHeight;
+          return currentHeight === nextHeight ? currentHeight : nextHeight;
+        });
+      });
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []);
+
+  return height;
+}
+
+function formatViewLabel(view: View): string {
+  return view.replace(/-/g, ' ');
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 function App() {
@@ -163,6 +197,7 @@ function App() {
   );
 
   const windowWidth = useWindowWidth();
+  const windowHeight = useWindowHeight();
   const [shellStats, setShellStats] = useState<WorkspaceStatsResponse | null>(null);
   const [shellStatsLoading, setShellStatsLoading] = useState(false);
   const [shellStatsError, setShellStatsError] = useState<string | null>(null);
@@ -311,15 +346,24 @@ function App() {
       integrations: <IntegrationsView />,
       workflows:  <WorkflowsView />,
       settings:   <SettingsView user={contextUser} />,
-      pricing:    <PricingView currentPlan={contextUser.plan ?? 'free'} />,
+      pricing: (
+        <PricingView
+          currentPlan={contextUser.plan ?? 'free'}
+          workspaceId={currentWorkspaceId}
+          isAuthenticated={Boolean(contextUser)}
+        />
+      ),
       upload:     <DocumentUploadView />,
       documents:  <DocumentsView />,
     };
-  }, [canUseSearch, canViewGraph, canViewNotes, canViewWorkflows, contextUser]);
+  }, [canUseSearch, canViewGraph, canViewNotes, canViewWorkflows, contextUser, currentWorkspaceId]);
 
   // ── Derived layout values ───────────────────────────────────────────────
   const sidebarWidth   = sidebarCollapsed ? SIDEBAR_COLLAPSED : SIDEBAR_EXPANDED;
   const sidebarOffscreen = isMobile && !mobileSidebarOpen;
+  const showHeaderBrand = windowWidth >= 420;
+  const showWorkspaceSwitcher = windowWidth >= 760;
+  const showHeaderDividers = windowWidth >= 420;
 
   const userInitial = (contextUser?.name ?? contextUser?.email ?? '?').charAt(0).toUpperCase();
   const userName    = contextUser?.full_name ?? contextUser?.name ?? 'User';
@@ -439,7 +483,7 @@ function App() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            padding: '0 20px',
+            padding: isSmall ? '0 10px' : '0 20px',
             position: 'sticky',
             top: 0,
             zIndex: 30,
@@ -447,7 +491,7 @@ function App() {
           }}
         >
           {/* Left — hamburger + breadcrumb */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: isSmall ? 8 : 14, minWidth: 0, flex: '1 1 auto' }}>
             {isMobile && (
               <button
                 onClick={() => setMobileSidebarOpen(true)}
@@ -477,7 +521,9 @@ function App() {
               </button>
             )}
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: showHeaderBrand ? 8 : 0, minWidth: 0 }}>
+              {showHeaderBrand && (
+                <>
               <span
                 style={{
                   fontFamily: TT.fontDisplay,
@@ -485,32 +531,41 @@ function App() {
                   letterSpacing: '0.06em',
                   color: TT.snow,
                   lineHeight: 1,
+                  whiteSpace: 'nowrap',
                 }}
               >
                 <span style={{ color: TT.yolk }}>AN</span>FINITY
               </span>
-              <span style={{ color: TT.inkMid, fontFamily: TT.fontMono, fontSize: 12 }}>/</span>
+                  <span style={{ color: TT.inkMid, fontFamily: TT.fontMono, fontSize: 12 }}>/</span>
+                </>
+              )}
               <span
                 aria-current="page"
                 style={{
                   fontFamily: TT.fontDisplay,
-                  fontSize: 16,
+                  fontSize: isSmall ? 15 : 16,
                   letterSpacing: '0.08em',
                   color: TT.inkSubtle,
                   textTransform: 'uppercase',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  maxWidth: isSmall ? 150 : 220,
                 }}
               >
-                {currentView}
+                {formatViewLabel(currentView)}
               </span>
             </div>
 
-            <div style={{ marginLeft: 6, minWidth: 0 }}>
-              <WorkspaceSwitcher compact={isSmall} />
-            </div>
+            {showWorkspaceSwitcher && (
+              <div style={{ marginLeft: 6, minWidth: 0 }}>
+                <WorkspaceSwitcher compact={isMobile} />
+              </div>
+            )}
           </div>
 
           {/* Right — insights toggle + user info */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: isSmall ? 6 : 10, flexShrink: 0 }}>
 
             {/* Logout error inline */}
             {logoutError && (

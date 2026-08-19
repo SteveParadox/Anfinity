@@ -548,6 +548,38 @@ class ApiClient {
   }
 
   /**
+   * Stream a protected API endpoint while reusing the same base URL and auth
+   * headers as normal JSON requests. The caller owns response body parsing.
+   */
+  async stream(endpoint: string, options: RequestInit = {}): Promise<Response> {
+    const headers: Record<string, string> = {};
+
+    if (!(options.body instanceof FormData)) {
+      headers['Content-Type'] = 'application/json';
+    }
+
+    Object.assign(headers, options.headers as Record<string, string>);
+
+    if (this.token) {
+      headers.Authorization = `Bearer ${this.token}`;
+    }
+
+    return fetch(`${this.baseUrl}${endpoint}`, {
+      ...options,
+      headers,
+    });
+  }
+
+  async errorFromResponse(response: Response): Promise<ApiError> {
+    const contentType = response.headers.get('content-type');
+    const body = contentType?.includes('application/json')
+      ? await response.json().catch(() => ({}))
+      : await response.text().catch(() => '');
+
+    return this.buildApiError(response.status, body);
+  }
+
+  /**
    * Check if user is authenticated
    */
   isAuthenticated(): boolean {
@@ -781,36 +813,41 @@ class ApiClient {
     }
 
     if (!response.ok) {
-      const error = body?.error || { code: 'UNKNOWN_ERROR', message: 'Unknown error' };
-      const message = error.message || body.detail || `HTTP ${response.status}`;
-
-      switch (response.status) {
-        case 400:
-          throw new ValidationError(message, error.metadata);
-        case 401:
-          this.clearToken(); // Clear invalid token
-          throw new AuthenticationError(message);
-        case 403:
-          throw new AuthorizationError(message);
-        case 402:
-          throw new EntitlementError(message, error.metadata || body?.error?.metadata || body?.metadata);
-        case 404:
-          throw new NotFoundError(message);
-        case 422:
-          throw new ValidationError(message, error.metadata);
-        case 429:
-          throw new RateLimitError(message || 'Rate limited - please try again later');
-        case 500:
-        case 502:
-        case 503:
-        case 504:
-          throw new ServerError(message);
-        default:
-          throw new ApiError(response.status, error.code || 'UNKNOWN', message);
-      }
+      throw this.buildApiError(response.status, body);
     }
 
     return body.items ? body : body;
+  }
+
+  private buildApiError(status: number, body: any): ApiError {
+    const error = body?.error || {};
+    const message = error.message || body?.detail || (typeof body === 'string' && body ? body : `HTTP ${status}`);
+    const metadata = error.metadata || body?.metadata;
+
+    switch (status) {
+      case 400:
+        return new ValidationError(message, metadata);
+      case 401:
+        this.clearToken();
+        return new AuthenticationError(message);
+      case 403:
+        return new AuthorizationError(message);
+      case 402:
+        return new EntitlementError(message, metadata);
+      case 404:
+        return new NotFoundError(message);
+      case 422:
+        return new ValidationError(message, metadata);
+      case 429:
+        return new RateLimitError(message || 'Rate limited - please try again later');
+      case 500:
+      case 502:
+      case 503:
+      case 504:
+        return new ServerError(message);
+      default:
+        return new ApiError(status, error.code || 'UNKNOWN', message, metadata);
+    }
   }
 
   /**
