@@ -133,17 +133,17 @@ export class EventClient {
           WS_BASE_URL
         );
 
-        // Pass token as query parameter if available
+        // The token is carried in a WebSocket subprotocol, never the URL.
+        const protocols = this.token ? [`anfinity.jwt.${this.token}`] : undefined;
         if (this.token) {
-          url.searchParams.set('token', this.token);
-          console.debug('🔐 [WS TOKEN] Token set in query parameters');
+          console.debug('🔐 [WS TOKEN] Credential subprotocol configured');
         } else {
           console.warn('⚠️ [WS TOKEN] No token available for WebSocket connection');
         }
 
-        console.debug('📡 [WS CONNECT] Connecting to:', url.toString().replace(/token=[^&]*/, 'token=****'));
+        console.debug('📡 [WS CONNECT] Connecting to:', url.toString());
 
-        this.ws = new WebSocket(url.toString());
+        this.ws = new WebSocket(url.toString(), protocols);
 
         const timeout = setTimeout(() => {
           if (settled) return;
