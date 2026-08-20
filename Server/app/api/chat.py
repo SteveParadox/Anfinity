@@ -18,7 +18,12 @@ from app.config import get_ollama_request_headers, settings
 from app.core.auth import get_current_active_user
 from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser, WorkspaceSection
-from app.database.session import get_db
+from app.database.session import (
+    async_session_scope,
+    bind_db_user_context,
+    get_db,
+    log_session_query_metrics,
+)
 from app.services.strict_note_rag import (
     CitationStreamTransformer,
     GroundedAnswerStreamGuard,
@@ -512,6 +517,7 @@ async def _rag_stream(
     history: Optional[List[ChatMessage]],
     top_k: int,
     threshold: float,
+    correlation_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Core streaming generator.
@@ -526,7 +532,7 @@ async def _rag_stream(
       event: done    data: {type, followUpQuestions, answerStatus, confidence, correlationId}
       event: error   data: {type, message, correlationId}
     """
-    correlation_id = str(uuid4())
+    correlation_id = correlation_id or str(uuid4())
     stream_started_at = time.perf_counter()
     logger.info(
         "ask_past_self_stream_started",
@@ -756,17 +762,76 @@ async def ask_past_self(
     # Auth check outside the generator — HTTPException propagates cleanly here.
     await _verify_workspace_access(request.workspace_id, current_user, db)
 
+    correlation_id = str(uuid4())
+
     async def _event_stream() -> AsyncGenerator[str, None]:
-        async for chunk in _rag_stream(
-            query=request.query,
-            workspace_id=request.workspace_id,
-            user=current_user,
-            db=db,
-            history=request.history,
-            top_k=request.top_k,
-            threshold=request.similarity_threshold,
-        ):
-            yield chunk
+        stream_started_at = time.perf_counter()
+        logger.info(
+            "ask_past_self_stream_session_opening",
+            extra={
+                "correlation_id": correlation_id,
+                "workspace_id": str(request.workspace_id),
+                "user_id": str(getattr(current_user, "id", "")),
+            },
+        )
+        try:
+            async with async_session_scope() as stream_db:
+                bind_db_user_context(stream_db, current_user.id)
+                async for chunk in _rag_stream(
+                    query=request.query,
+                    workspace_id=request.workspace_id,
+                    user=current_user,
+                    db=stream_db,
+                    history=request.history,
+                    top_k=request.top_k,
+                    threshold=request.similarity_threshold,
+                    correlation_id=correlation_id,
+                ):
+                    yield chunk
+                log_session_query_metrics(
+                    stream_db,
+                    "ask_past_self_stream",
+                    level=logging.INFO,
+                )
+        except asyncio.CancelledError:
+            logger.info(
+                "ask_past_self_stream_cancelled",
+                extra={
+                    "correlation_id": correlation_id,
+                    "workspace_id": str(request.workspace_id),
+                    "user_id": str(getattr(current_user, "id", "")),
+                    "elapsed_ms": round((time.perf_counter() - stream_started_at) * 1000, 2),
+                },
+            )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "ask_past_self_stream_unhandled_error",
+                extra={
+                    "correlation_id": correlation_id,
+                    "workspace_id": str(request.workspace_id),
+                    "user_id": str(getattr(current_user, "id", "")),
+                    "error_type": type(exc).__name__,
+                    "elapsed_ms": round((time.perf_counter() - stream_started_at) * 1000, 2),
+                },
+            )
+            yield _sse_event(
+                "error",
+                {
+                    "message": "Ask Your Past Self failed while streaming.",
+                    "correlationId": correlation_id,
+                },
+            )
+        finally:
+            logger.info(
+                "ask_past_self_stream_session_closed",
+                extra={
+                    "correlation_id": correlation_id,
+                    "workspace_id": str(request.workspace_id),
+                    "user_id": str(getattr(current_user, "id", "")),
+                    "elapsed_ms": round((time.perf_counter() - stream_started_at) * 1000, 2),
+                },
+            )
 
     return StreamingResponse(
         _event_stream(),
