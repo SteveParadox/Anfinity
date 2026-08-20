@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
@@ -303,6 +304,19 @@ async def retrieve_strict_note_context(
     min_score: float = MIN_SUPPORTED_SCORE,
 ) -> StrictRAGResult:
     """Retrieve answerable evidence from live note rows in one workspace."""
+    started_at = time.perf_counter()
+    logger.info(
+        "ask_past_self_retrieval_started",
+        extra={
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+            "query_length": len(query or ""),
+            "requested_limit": limit,
+            "min_score": min_score,
+            "max_notes_scanned": MAX_NOTES_SCANNED,
+            "is_superuser": bool(getattr(user, "is_superuser", False)),
+        },
+    )
 
     query_stmt = (
         select(Note)
@@ -328,13 +342,25 @@ async def retrieve_strict_note_context(
 
     result = await db.execute(query_stmt)
     notes = result.scalars().all()
+    logger.info(
+        "ask_past_self_notes_loaded",
+        extra={
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+            "note_count": len(notes),
+        },
+    )
     extractor = SearchHighlightExtractor()
     candidates: List[StrictRAGSource] = []
+    notes_with_content = 0
+    chunks_scanned = 0
+    chunks_rejected = 0
 
     for note in notes:
         content = str(getattr(note, "content", "") or "")
         if not content.strip():
             continue
+        notes_with_content += 1
 
         title = _clean_title(getattr(note, "title", None))
         tags = _coerce_tags(getattr(note, "tags", None))
@@ -344,9 +370,11 @@ async def retrieve_strict_note_context(
             content=content,
             tags=tags,
         )
+        chunks_scanned += len(chunks)
         for chunk in chunks:
             score, components, off_topic = _score_chunk(query, chunk)
             if off_topic or score < MIN_PARTIAL_SCORE:
+                chunks_rejected += 1
                 continue
             similarity_percent = calibrate_similarity_percent(score)
             created_at = _isoformat(getattr(note, "created_at", None) or getattr(note, "updated_at", None))
@@ -367,7 +395,30 @@ async def retrieve_strict_note_context(
                 )
             )
 
+    logger.info(
+        "ask_past_self_scoring_complete",
+        extra={
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+            "notes_with_content": notes_with_content,
+            "chunks_scanned": chunks_scanned,
+            "chunks_rejected": chunks_rejected,
+            "candidate_count": len(candidates),
+            "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        },
+    )
+
     sources = _dedupe_sources_by_note(candidates, limit)
+    logger.info(
+        "ask_past_self_sources_deduplicated",
+        extra={
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+            "candidate_count": len(candidates),
+            "source_count": len(sources),
+            "top_scores": [source.similarity for source in sources[:3]],
+        },
+    )
     gated = evaluate_sources(sources, query=query, min_score=min_score)
     logger.info(
         "ask_past_self_retrieval_complete",

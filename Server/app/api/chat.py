@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import AsyncGenerator, List, Optional
 from uuid import UUID, uuid4
 
@@ -100,6 +101,13 @@ async def _verify_workspace_access(
 
     Raises before any retrieval or streaming work if the user cannot use chat in the workspace.
     """
+    logger.info(
+        "ask_past_self_workspace_access_started",
+        extra={
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+        },
+    )
     await ensure_workspace_permission(
         workspace_id=workspace_id,
         user=user,
@@ -115,10 +123,25 @@ async def _verify_workspace_access(
         action="view",
     )
     if not await workspace_feature_enabled(db, workspace_id, "ai_search", "ask_past_self_enabled"):
+        logger.warning(
+            "ask_past_self_workspace_feature_disabled",
+            extra={
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+                "feature": "ask_past_self_enabled",
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Ask Your Past Self is disabled for this workspace.",
         )
+    logger.info(
+        "ask_past_self_workspace_access_granted",
+        extra={
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+        },
+    )
 
 
 def _determine_confidence(sources: List[RAGSource]) -> str:
@@ -181,10 +204,23 @@ async def retrieve_context(
     threshold: float = 0.3,
 ) -> StrictRAGResult:
     """Retrieve live note-only evidence and gate answerability."""
+    started_at = time.perf_counter()
     try:
         workspace_min_score = await get_workspace_ai_min_similarity(db, workspace_id)
         min_score = max(float(threshold or 0.0), workspace_min_score, MIN_SUPPORTED_SCORE)
-        return await retrieve_strict_note_context(
+        logger.info(
+            "ask_past_self_context_retrieval_started",
+            extra={
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+                "query_length": len(query or ""),
+                "requested_top_k": k,
+                "requested_threshold": threshold,
+                "workspace_min_score": workspace_min_score,
+                "effective_min_score": min_score,
+            },
+        )
+        retrieval = await retrieve_strict_note_context(
             query=query,
             workspace_id=workspace_id,
             user=user,
@@ -192,8 +228,30 @@ async def retrieve_context(
             limit=k,
             min_score=min_score,
         )
+        logger.info(
+            "ask_past_self_context_retrieval_complete",
+            extra={
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+                "answer_status": retrieval.answer_status,
+                "confidence": retrieval.confidence,
+                "source_count": len(retrieval.sources),
+                "refusal_reason": retrieval.refusal_reason,
+                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                **retrieval.diagnostics,
+            },
+        )
+        return retrieval
     except Exception:
-        logger.exception("Error retrieving context for query=%r workspace=%s", query, workspace_id)
+        logger.exception(
+            "ask_past_self_context_retrieval_failed",
+            extra={
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+                "query_length": len(query or ""),
+                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+        )
         return StrictRAGResult(
             sources=[],
             answer_status="refusal",
@@ -341,16 +399,55 @@ async def generate_answer(messages: List[dict]) -> str:
     Generate an answer using Ollama, falling back to OpenAI on any failure.
     Both backends run asynchronously without blocking the event loop.
     """
+    started_at = time.perf_counter()
+    logger.info(
+        "ask_past_self_llm_generation_started",
+        extra={"message_count": len(messages), "backend": "ollama"},
+    )
     try:
-        logger.info("Attempting LLM generation with Ollama")
-        return await _generate_with_ollama(messages)
+        response = await _generate_with_ollama(messages)
+        logger.info(
+            "ask_past_self_llm_generation_complete",
+            extra={
+                "backend": "ollama",
+                "response_length": len(response),
+                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+        )
+        return response
     except Exception as exc:
-        logger.warning("Ollama failed (%s), falling back to OpenAI", exc)
+        logger.warning(
+            "ask_past_self_llm_backend_failed",
+            extra={
+                "backend": "ollama",
+                "error_type": type(exc).__name__,
+                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+            exc_info=True,
+        )
 
     try:
-        return await _generate_with_openai(messages)
+        fallback_started_at = time.perf_counter()
+        logger.info(
+            "ask_past_self_llm_generation_started",
+            extra={"message_count": len(messages), "backend": "openai"},
+        )
+        response = await _generate_with_openai(messages)
+        logger.info(
+            "ask_past_self_llm_generation_complete",
+            extra={
+                "backend": "openai",
+                "response_length": len(response),
+                "elapsed_ms": round((time.perf_counter() - fallback_started_at) * 1000, 2),
+            },
+        )
+        return response
     except Exception as exc:
-        logger.error("OpenAI fallback also failed: %s", exc)
+        logger.error(
+            "ask_past_self_llm_all_backends_failed",
+            extra={"backend": "openai", "error_type": type(exc).__name__},
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"All LLM backends failed: {exc}",
@@ -430,6 +527,19 @@ async def _rag_stream(
       event: error   data: {type, message, correlationId}
     """
     correlation_id = str(uuid4())
+    stream_started_at = time.perf_counter()
+    logger.info(
+        "ask_past_self_stream_started",
+        extra={
+            "correlation_id": correlation_id,
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+            "query_length": len(query or ""),
+            "history_count": len(history or []),
+            "top_k": top_k,
+            "threshold": threshold,
+        },
+    )
     yield _sse_event("start", {"correlationId": correlation_id, "status": "retrieving"})
 
     retrieval = await retrieve_context(
@@ -450,6 +560,16 @@ async def _rag_stream(
                 "user_id": str(getattr(user, "id", "")),
                 "reason": retrieval.refusal_reason,
                 **retrieval.diagnostics,
+            },
+        )
+        logger.info(
+            "ask_past_self_stream_refusal_sent",
+            extra={
+                "correlation_id": correlation_id,
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+                "reason": retrieval.refusal_reason,
+                "elapsed_ms": round((time.perf_counter() - stream_started_at) * 1000, 2),
             },
         )
         yield _sse_event("token", {"text": REFUSAL_TEXT, "correlationId": correlation_id})
@@ -477,6 +597,18 @@ async def _rag_stream(
     sources = retrieval.sources
     system_prompt = build_rag_system_prompt(query, sources)
     messages = _build_messages(system_prompt, query, history)
+    logger.info(
+        "ask_past_self_prompt_built",
+        extra={
+            "correlation_id": correlation_id,
+            "workspace_id": str(workspace_id),
+            "source_count": len(sources),
+            "message_count": len(messages),
+            "prompt_length": len(system_prompt),
+            "answer_status": retrieval.answer_status,
+            "confidence": retrieval.confidence,
+        },
+    )
     citation_transformer = CitationStreamTransformer(sources)
     grounding_guard = GroundedAnswerStreamGuard(sources)
 
@@ -492,8 +624,13 @@ async def _rag_stream(
                     yield _sse_event("token", {"text": display_token, "correlationId": correlation_id})
         except Exception as ollama_exc:
             logger.warning(
-                "Streaming Ollama chat failed (%s), falling back to buffered generation",
-                ollama_exc,
+                "ask_past_self_streaming_ollama_failed",
+                extra={
+                    "correlation_id": correlation_id,
+                    "workspace_id": str(workspace_id),
+                    "error_type": type(ollama_exc).__name__,
+                },
+                exc_info=True,
             )
             full_response = await generate_answer(messages)
             for chunk in _chunk_text_for_stream(full_response):
@@ -517,6 +654,16 @@ async def _rag_stream(
         if tail:
             yield _sse_event("token", {"text": tail, "correlationId": correlation_id})
     except HTTPException as exc:
+        logger.error(
+            "ask_past_self_stream_generation_failed",
+            extra={
+                "correlation_id": correlation_id,
+                "workspace_id": str(workspace_id),
+                "user_id": str(getattr(user, "id", "")),
+                "status_code": exc.status_code,
+            },
+            exc_info=True,
+        )
         yield _sse_event("error", {"message": exc.detail, "correlationId": correlation_id})
         return
 
@@ -555,6 +702,20 @@ async def _rag_stream(
             "correlationId": correlation_id,
         },
     )
+    logger.info(
+        "ask_past_self_stream_complete",
+        extra={
+            "correlation_id": correlation_id,
+            "workspace_id": str(workspace_id),
+            "user_id": str(getattr(user, "id", "")),
+            "response_length": len(full_response),
+            "source_count": len(cited_sources),
+            "answer_status": answer_status,
+            "confidence": confidence,
+            "follow_up_count": len(extract_follow_up_questions(full_response)),
+            "elapsed_ms": round((time.perf_counter() - stream_started_at) * 1000, 2),
+        },
+    )
 
 
 # ============================================================================
@@ -580,6 +741,18 @@ async def ask_past_self(
       event: done    data: {type, followUpQuestions, answerStatus, confidence, correlationId}
       event: error   data: {type, message, correlationId}
     """
+    logger.info(
+        "ask_past_self_request_received",
+        extra={
+            "workspace_id": str(request.workspace_id),
+            "user_id": str(getattr(current_user, "id", "")),
+            "query_length": len(request.query or ""),
+            "history_count": len(request.history or []),
+            "top_k": request.top_k,
+            "threshold": request.similarity_threshold,
+            "streaming": True,
+        },
+    )
     # Auth check outside the generator — HTTPException propagates cleanly here.
     await _verify_workspace_access(request.workspace_id, current_user, db)
 
@@ -612,6 +785,19 @@ async def ask_past_self_sync(
     POST /chat/ask/sync — Non-streaming variant.
     Returns the complete response in a single JSON payload.
     """
+    request_started_at = time.perf_counter()
+    logger.info(
+        "ask_past_self_request_received",
+        extra={
+            "workspace_id": str(request.workspace_id),
+            "user_id": str(getattr(current_user, "id", "")),
+            "query_length": len(request.query or ""),
+            "history_count": len(request.history or []),
+            "top_k": request.top_k,
+            "threshold": request.similarity_threshold,
+            "streaming": False,
+        },
+    )
     await _verify_workspace_access(request.workspace_id, current_user, db)
 
     retrieval = await retrieve_context(
@@ -624,6 +810,15 @@ async def ask_past_self_sync(
     )
 
     if not retrieval.can_answer:
+        logger.info(
+            "ask_past_self_sync_refusal_sent",
+            extra={
+                "workspace_id": str(request.workspace_id),
+                "user_id": str(getattr(current_user, "id", "")),
+                "reason": retrieval.refusal_reason,
+                "elapsed_ms": round((time.perf_counter() - request_started_at) * 1000, 2),
+            },
+        )
         return AskPastSelfResponse(
             answer=REFUSAL_TEXT,
             sources=[],
@@ -655,10 +850,24 @@ async def ask_past_self_sync(
         )
     answer = replace_source_markers(raw_answer, sources)
 
-    return AskPastSelfResponse(
+    response = AskPastSelfResponse(
         answer=answer,
         sources=[RAGSource(**source.to_api_dict()) for source in cited_sources],
         confidence="not_found" if REFUSAL_TEXT in raw_answer else retrieval.confidence,
         followUpQuestions=extract_follow_up_questions(raw_answer),
         answerStatus="refusal" if REFUSAL_TEXT in raw_answer else retrieval.answer_status,
     )
+    logger.info(
+        "ask_past_self_sync_complete",
+        extra={
+            "workspace_id": str(request.workspace_id),
+            "user_id": str(getattr(current_user, "id", "")),
+            "response_length": len(response.answer),
+            "source_count": len(response.sources),
+            "answer_status": response.answerStatus,
+            "confidence": response.confidence,
+            "follow_up_count": len(response.followUpQuestions),
+            "elapsed_ms": round((time.perf_counter() - request_started_at) * 1000, 2),
+        },
+    )
+    return response
