@@ -218,35 +218,41 @@ async def refresh_note_contributions_materialized_view(*, force: bool = False) -
         if _can_skip_refresh(force):
             return False
 
-        conn = await async_engine.connect()
-        autocommit_conn = conn
         lock_acquired = False
         try:
-            autocommit_conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
-            lock_result = await autocommit_conn.execute(
-                text("SELECT pg_try_advisory_lock(:lock_key)"),
-                {"lock_key": NOTE_CONTRIBUTIONS_REFRESH_LOCK_KEY},
-            )
-            lock_acquired = bool(lock_result.scalar())
-            if not lock_acquired:
-                return False
+            # `async with` guarantees conn.close() runs on the way out even if
+            # an exception is raised anywhere inside this block, so the pooled
+            # connection can never be left for the garbage collector to clean up.
+            async with async_engine.connect() as conn:
+                # execution_options() on AsyncConnection is synchronous (no I/O),
+                # so it must NOT be awaited.
+                autocommit_conn = conn.execution_options(isolation_level="AUTOCOMMIT")
 
-            await autocommit_conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY note_contributions"))
-            _last_refresh_monotonic = time.monotonic()
-            return True
+                lock_result = await autocommit_conn.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"),
+                    {"lock_key": NOTE_CONTRIBUTIONS_REFRESH_LOCK_KEY},
+                )
+                lock_acquired = bool(lock_result.scalar())
+                if not lock_acquired:
+                    return False
+
+                try:
+                    await autocommit_conn.execute(
+                        text("REFRESH MATERIALIZED VIEW CONCURRENTLY note_contributions")
+                    )
+                    _last_refresh_monotonic = time.monotonic()
+                    return True
+                finally:
+                    try:
+                        await autocommit_conn.execute(
+                            text("SELECT pg_advisory_unlock(:lock_key)"),
+                            {"lock_key": NOTE_CONTRIBUTIONS_REFRESH_LOCK_KEY},
+                        )
+                    except Exception:
+                        logger.exception("Failed to release note_contributions advisory lock")
         except Exception:
             logger.exception("Failed to refresh note_contributions materialized view")
             return False
-        finally:
-            if lock_acquired:
-                try:
-                    await autocommit_conn.execute(
-                        text("SELECT pg_advisory_unlock(:lock_key)"),
-                        {"lock_key": NOTE_CONTRIBUTIONS_REFRESH_LOCK_KEY},
-                    )
-                except Exception:
-                    logger.exception("Failed to release note_contributions advisory lock")
-            await conn.close()
 
 
 def schedule_note_contributions_refresh(*, force: bool = False) -> None:
