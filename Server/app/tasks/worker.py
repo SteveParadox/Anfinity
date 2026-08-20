@@ -64,8 +64,8 @@ def _task_postrun_handler(
         task_id,
         state,
     )
-    # FIX: Explicitly close SyncSessionLocal to prevent phantom ROLLBACK on connection return
-    # This ensures pool_reset_on_return=None doesn't start implicit transactions
+    # This remains a no-op for the sessionmaker used today, but preserves
+    # compatibility if workers later switch to a scoped-session factory.
     remove = getattr(SyncSessionLocal, "remove", None)
     if callable(remove):
         remove()

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from app.database.models import Document, DocumentStatus, User as DBUser, Workspace, Chunk, Embedding
-from app.database.session import get_db
+from app.database.session import async_session_scope, get_db
 from app.core.auth import get_current_user
 from app.ingestion.embedder import Embedder
 from app.ingestion.embedding_batch_processor import BatchEmbeddingProcessor
@@ -18,6 +18,40 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/embeddings", tags=["embeddings"])
+
+
+async def _process_document_embeddings_in_background(
+    document_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    batch_size: int,
+) -> Dict[str, Any]:
+    """Run document embedding work with a task-owned database session."""
+    async with async_session_scope() as task_db:
+        embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+        processor = BatchEmbeddingProcessor(
+            db=task_db,
+            embedding_provider=embedder._provider,
+            vector_db=get_vector_db_client(embedding_dim=embedder.dimension),
+            batch_size=batch_size,
+        )
+        return await processor.process_document_chunks(document_id, workspace_id)
+
+
+async def _process_workspace_embeddings_in_background(
+    workspace_id: uuid.UUID,
+    limit: Optional[int],
+    batch_size: int,
+) -> Dict[str, Any]:
+    """Run workspace embedding work with a task-owned database session."""
+    async with async_session_scope() as task_db:
+        embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+        processor = BatchEmbeddingProcessor(
+            db=task_db,
+            embedding_provider=embedder._provider,
+            vector_db=get_vector_db_client(embedding_dim=embedder.dimension),
+            batch_size=batch_size,
+        )
+        return await processor.process_pending_chunks(workspace_id, limit)
 
 
 class EmbeddingBatchRequest(BaseModel):
@@ -140,24 +174,16 @@ async def generate_document_embeddings(
         document.status = DocumentStatus.PROCESSING
         db.commit()
         
-        # Initialize embedding processor
-        embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
-        vector_db = get_vector_db_client(embedding_dim=embedder.dimension)
-        
         batch_size = batch_request.batch_size if batch_request else settings.EMBEDDING_BATCH_SIZE
-        processor = BatchEmbeddingProcessor(
-            db=db,
-            embedding_provider=embedder._provider,
-            vector_db=vector_db,
-            batch_size=batch_size
-        )
         
-        # Run embedding generation (can be async in background)
+        # Background work receives only IDs and opens its own session. Never
+        # capture the request-scoped ``db`` in a task that may outlive it.
         if background_tasks:
             background_tasks.add_task(
-                processor.process_document_chunks,
+                _process_document_embeddings_in_background,
                 document.id,
-                workspace.id
+                workspace.id,
+                batch_size,
             )
             
             return EmbeddingBatchResponse(
@@ -170,14 +196,14 @@ async def generate_document_embeddings(
                 errors=["Processing started in background"]
             )
         else:
-            # Synchronous processing
-            import asyncio
-            result = asyncio.run(
-                processor.process_document_chunks(
-                    document.id,
-                    workspace.id
-                )
+            embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+            processor = BatchEmbeddingProcessor(
+                db=db,
+                embedding_provider=embedder._provider,
+                vector_db=get_vector_db_client(embedding_dim=embedder.dimension),
+                batch_size=batch_size,
             )
+            result = await processor.process_document_chunks(document.id, workspace.id)
             
             return EmbeddingBatchResponse(
                 success=result["success"],
@@ -256,21 +282,12 @@ async def batch_generate_workspace_embeddings(
                 detail="No access to this workspace"
             )
         
-        # Initialize processor
-        embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
-        vector_db = get_vector_db_client(embedding_dim=embedder.dimension)
-        processor = BatchEmbeddingProcessor(
-            db=db,
-            embedding_provider=embedder._provider,
-            vector_db=vector_db,
-            batch_size=settings.EMBEDDING_BATCH_SIZE
-        )
-        
         if background_tasks:
             background_tasks.add_task(
-                processor.process_pending_chunks,
+                _process_workspace_embeddings_in_background,
                 workspace.id,
-                limit
+                limit,
+                settings.EMBEDDING_BATCH_SIZE,
             )
             
             return {
@@ -278,10 +295,14 @@ async def batch_generate_workspace_embeddings(
                 "message": "Batch embedding generation started in background"
             }
         else:
-            import asyncio
-            result = asyncio.run(
-                processor.process_pending_chunks(workspace.id, limit)
+            embedder = Embedder(provider=settings.EMBEDDING_PROVIDER)
+            processor = BatchEmbeddingProcessor(
+                db=db,
+                embedding_provider=embedder._provider,
+                vector_db=get_vector_db_client(embedding_dim=embedder.dimension),
+                batch_size=settings.EMBEDDING_BATCH_SIZE,
             )
+            result = await processor.process_pending_chunks(workspace.id, limit)
             return result
     
     except HTTPException:

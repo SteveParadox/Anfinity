@@ -11,7 +11,9 @@ import logging
 from typing import Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
 from app.core.auth import get_current_user
+from app.database.session import async_session_scope
 from app.database.models import User as DBUser
 
 logger = logging.getLogger(__name__)
@@ -35,7 +37,6 @@ async def system_health(
     - Vector DB connectivity
     - API availability
     """
-    from app.database.session import AsyncSessionLocal
     from app.services.vector_db import get_vector_db_client
     from app.events import get_broadcaster
     
@@ -50,9 +51,9 @@ async def system_health(
     
     # Check database
     try:
-        db = AsyncSessionLocal()
-        await db.execute("SELECT 1")
-        health_status["components"]["database"] = "healthy"
+        async with async_session_scope() as db:
+            await db.execute(text("SELECT 1"))
+            health_status["components"]["database"] = "healthy"
     except Exception as e:
         health_status["components"]["database"] = f"unhealthy: {str(e)}"
         health_status["status"] = "degraded"
@@ -164,12 +165,9 @@ async def ingestion_metrics(
     """
     from datetime import datetime, timedelta
     from sqlalchemy import select, func
-    from sqlalchemy.ext.asyncio import AsyncSessionLocal
     from app.database.models import Document, DocumentStatus, IngestionLog
     
-    db = AsyncSessionLocal()
-    
-    try:
+    async with async_session_scope() as db:
         # Total documents
         total_docs = await db.scalar(
             select(func.count(Document.id))
@@ -210,8 +208,6 @@ async def ingestion_metrics(
                 if total_docs else 0
             ),
         }
-    finally:
-        await db.close()
 
 
 @router.get("/metrics/embeddings")
@@ -220,12 +216,9 @@ async def embeddings_metrics(
 ) -> Dict[str, Any]:
     """Get embeddings generation metrics."""
     from sqlalchemy import select, func
-    from sqlalchemy.ext.asyncio import AsyncSessionLocal
     from app.database.models import Embedding
     
-    db = AsyncSessionLocal()
-    
-    try:
+    async with async_session_scope() as db:
         total_embeddings = await db.scalar(
             select(func.count(Embedding.id))
         )
@@ -247,8 +240,6 @@ async def embeddings_metrics(
             "by_model": by_model,
             "cache_stats": {},  # Will be filled from cache
         }
-    finally:
-        await db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────

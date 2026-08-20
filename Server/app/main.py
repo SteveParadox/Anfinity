@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 
 from app.config import get_ollama_request_headers, settings
-from app.database.session import init_db
+from app.database.session import async_engine, init_db, sync_engine
 from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions, notifications, approval_workflows, automations, onboarding, competitive_intelligence, preferences, billing
 from app.core.entitlements import EntitlementRequiredError
 from app.events import websocket_router
@@ -90,6 +90,8 @@ async def lifespan(app: FastAPI):
     
     # Close rate limiter connection
     await rate_limiter.close()
+    await async_engine.dispose()
+    sync_engine.dispose()
 
 
 app = FastAPI(

@@ -9,7 +9,12 @@ from starlette.websockets import WebSocketState
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.database.session import bind_db_user_context, get_db, get_session_info
+from app.database.session import (
+    async_session_scope,
+    bind_db_user_context,
+    get_db,
+    get_session_info,
+)
 from app.database.models import User as DBUser, Workspace, WorkspaceMember, WorkspaceRole
 from app.core.security import get_token_payload
 
@@ -17,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Security scheme
 security = HTTPBearer(auto_error=False)
+WEBSOCKET_TOKEN_SUBPROTOCOL_PREFIX = "anfinity.jwt."
 
 
 def _can_close_websocket(websocket: WebSocket) -> bool:
@@ -25,6 +31,24 @@ def _can_close_websocket(websocket: WebSocket) -> bool:
         websocket.client_state != WebSocketState.DISCONNECTED
         and websocket.application_state != WebSocketState.DISCONNECTED
     )
+
+
+def get_websocket_auth_token(websocket: WebSocket) -> tuple[Optional[str], Optional[str]]:
+    """Return a WebSocket JWT and the subprotocol selected for the handshake.
+
+    Browsers cannot set an Authorization header on a native WebSocket. The
+    token is therefore sent in a named subprotocol rather than the URL, which
+    keeps it out of ordinary request-line/access logs. Query-string support
+    is a compatibility fallback for older deployed clients.
+    """
+    offered = websocket.headers.get("sec-websocket-protocol", "")
+    for protocol in (item.strip() for item in offered.split(",")):
+        if protocol.startswith(WEBSOCKET_TOKEN_SUBPROTOCOL_PREFIX):
+            token = protocol.removeprefix(WEBSOCKET_TOKEN_SUBPROTOCOL_PREFIX)
+            if token:
+                return token, protocol
+
+    return websocket.query_params.get("token"), None
 
 
 # Role hierarchy for permission checking
@@ -150,14 +174,22 @@ async def get_current_active_user(
     return current_user
 
 
+async def get_streaming_current_user_id(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> UUID:
+    """Authenticate a long-lived stream without retaining a request session."""
+    async with async_session_scope() as db:
+        user = await get_current_user(credentials, db)
+        return user.id
+
+
 async def get_websocket_user(
     websocket: WebSocket,
     db: AsyncSession
 ) -> DBUser:
     """Get authenticated user from WebSocket connection.
     
-    WebSocket clients pass the token via query parameter:
-    - ws://host/path?token=JWT_TOKEN
+    WebSocket clients send the JWT in the ``anfinity.jwt.<token>`` subprotocol.
     
     Args:
         websocket: WebSocket connection
@@ -170,7 +202,7 @@ async def get_websocket_user(
         Exception: If authentication fails
     """
     # Get token from query parameters
-    token = websocket.query_params.get("token")
+    token, _ = get_websocket_auth_token(websocket)
     
     if not token:
         if _can_close_websocket(websocket):

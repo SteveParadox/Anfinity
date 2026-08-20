@@ -36,9 +36,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import get_current_user, get_websocket_user
+from app.core.auth import (
+    get_current_user,
+    get_streaming_current_user_id,
+    get_websocket_auth_token,
+    get_websocket_user,
+)
 from app.database.models import User as DBUser, Workspace, WorkspaceMember
-from app.database.session import get_db
+from app.database.session import async_session_scope
 from app.events.broadcaster import get_broadcaster
 
 logger = logging.getLogger(__name__)
@@ -83,6 +88,8 @@ class ConnectionManager:
         workspace_id: str,
         user_id: str,
         websocket: WebSocket,
+        *,
+        subprotocol: Optional[str] = None,
     ) -> bool:
         """Accept and register a WebSocket connection.
 
@@ -97,7 +104,7 @@ class ConnectionManager:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return False
 
-        await websocket.accept()
+        await websocket.accept(subprotocol=subprotocol)
 
         workspace_conns = self._connections.setdefault(workspace_id, {})
         workspace_conns.setdefault(user_id, []).append(websocket)
@@ -212,7 +219,7 @@ manager = ConnectionManager()
 
 async def _assert_workspace_access(
     workspace_id: UUID,
-    user: DBUser,
+    user_id: UUID,
     db: AsyncSession,
 ) -> Workspace:
     """Raise ``HTTPException`` (or return the workspace) after verifying
@@ -227,14 +234,14 @@ async def _assert_workspace_access(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    if workspace.owner_id == user.id:
+    if workspace.owner_id == user_id:
         return workspace
 
     # Check explicit membership.
     member_result = await db.execute(
         select(WorkspaceMember).where(
             WorkspaceMember.workspace_id == workspace_id,
-            WorkspaceMember.user_id == user.id,
+            WorkspaceMember.user_id == user_id,
         )
     )
     if member_result.scalars().first() is None:
@@ -316,13 +323,15 @@ async def _heartbeat_task(websocket: WebSocket) -> None:
 async def websocket_ingestion_events(
     websocket: WebSocket,
     workspace_id: str,
-    db: AsyncSession = Depends(get_db),
 ) -> None:
     """WebSocket endpoint for real-time ingestion events.
 
     **Connection**::
 
-        ws://host/events/ws/ingestion/{workspace_id}?token=<jwt>
+        ws://host/events/ws/ingestion/{workspace_id}
+
+    The browser sends the JWT using the ``anfinity.jwt.<token>`` WebSocket
+    subprotocol; it is not placed in the URL.
 
     **Server-pushed event envelope**::
 
@@ -338,13 +347,6 @@ async def websocket_ingestion_events(
         {"type": "ping"}   → server replies {"type": "pong"}
         {"type": "close"}  → clean shutdown
     """
-    # ---- Authentication ------------------------------------------------
-    try:
-        current_user: DBUser = await get_websocket_user(websocket, db)
-    except Exception as exc:
-        logger.warning("WebSocket authentication failed: %s", exc)
-        return
-
     # ---- Workspace validation ------------------------------------------
     try:
         workspace_uuid = UUID(workspace_id)
@@ -352,33 +354,53 @@ async def websocket_ingestion_events(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
+    _, auth_subprotocol = get_websocket_auth_token(websocket)
+
+    # Authentication and authorization are deliberately short-lived. Using a
+    # request-scoped dependency here would hold its implicit transaction and
+    # checked-out connection for the entire WebSocket lifetime.
     try:
-        await _assert_workspace_access(workspace_uuid, current_user, db)
+        async with async_session_scope() as db:
+            current_user: DBUser = await get_websocket_user(websocket, db)
+            current_user_id = str(current_user.id)
+            await _assert_workspace_access(workspace_uuid, current_user.id, db)
     except HTTPException:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("WebSocket authentication failed: %s", exc)
+        return
 
     # ---- Register connection -------------------------------------------
-    connected = await manager.connect(workspace_id, str(current_user.id), websocket)
-    if not connected:
-        return  # Cap exceeded; socket already closed inside connect()
-
-    # ---- Subscribe to Redis channel -----------------------------------
-    # Initialise both variables *before* the try/finally so the finally
-    # block can always reference them without an "unbound" risk.
-    broadcaster = await get_broadcaster()
-    pubsub = await broadcaster.subscribe(f"ingestion:{workspace_id}")
+    connected = False
+    pubsub = None
     redis_task: asyncio.Task | None = None
     heartbeat: asyncio.Task | None = None
 
     try:
+        connected = await manager.connect(
+            workspace_id,
+            current_user_id,
+            websocket,
+            subprotocol=auth_subprotocol,
+        )
+        if not connected:
+            return  # Cap exceeded; socket already closed inside connect()
+
+        # Setup is inside the cleanup boundary: a Redis error or cancellation
+        # cannot leave a registered stale socket behind.
+        broadcaster = await get_broadcaster()
+        pubsub = await broadcaster.subscribe(f"ingestion:{workspace_id}")
+
         redis_task = asyncio.create_task(
             _redis_listener_task(pubsub, workspace_id, manager),
-            name=f"redis-listener:{workspace_id}:{current_user.id}",
+            name=f"redis-listener:{workspace_id}:{current_user_id}",
         )
         heartbeat = asyncio.create_task(
             _heartbeat_task(websocket),
-            name=f"heartbeat:{workspace_id}:{current_user.id}",
+            name=f"heartbeat:{workspace_id}:{current_user_id}",
         )
 
         # ---- Main receive loop ----------------------------------------
@@ -390,14 +412,14 @@ async def websocket_ingestion_events(
             except WebSocketDisconnect:
                 logger.info(
                     "Client %s disconnected from workspace %s",
-                    current_user.id, workspace_id,
+                    current_user_id, workspace_id,
                 )
                 break
 
             try:
                 frame = json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning("Non-JSON frame from client %s; ignoring", current_user.id)
+                logger.warning("Non-JSON frame from client %s; ignoring", current_user_id)
                 continue
 
             frame_type = frame.get("type")
@@ -407,12 +429,12 @@ async def websocket_ingestion_events(
             elif frame_type == "close":
                 break
             else:
-                logger.debug("Unhandled client frame type=%s from %s", frame_type, current_user.id)
+                logger.debug("Unhandled client frame type=%s from %s", frame_type, current_user_id)
 
     except Exception as exc:
         logger.error(
             "Unexpected error in WebSocket handler for workspace %s user %s: %s",
-            workspace_id, current_user.id, exc,
+            workspace_id, current_user_id, exc,
         )
     finally:
         # Cancel background tasks.
@@ -425,14 +447,16 @@ async def websocket_ingestion_events(
                     pass
 
         # Unregister the socket.
-        await manager.disconnect(workspace_id, str(current_user.id), websocket)
+        if connected:
+            await manager.disconnect(workspace_id, current_user_id, websocket)
 
         # Release the Redis pub/sub subscription.
-        try:
-            await pubsub.unsubscribe()
-            await pubsub.aclose()
-        except Exception as exc:
-            logger.warning("Error closing pub/sub for workspace %s: %s", workspace_id, exc)
+        if pubsub is not None:
+            try:
+                await pubsub.unsubscribe()
+                await pubsub.aclose()
+            except Exception as exc:
+                logger.warning("Error closing pub/sub for workspace %s: %s", workspace_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +467,7 @@ async def websocket_ingestion_events(
 @router.get("/sse/ingestion/{workspace_id}")
 async def sse_ingestion_events(
     workspace_id: str,
-    current_user: DBUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user_id: UUID = Depends(get_streaming_current_user_id),
 ) -> StreamingResponse:
     """Server-Sent Events endpoint for ingestion updates.
 
@@ -463,7 +486,10 @@ async def sse_ingestion_events(
         raise HTTPException(status_code=400, detail="Invalid workspace ID")
 
     # Enforce membership — identical policy to the WebSocket path.
-    await _assert_workspace_access(workspace_uuid, current_user, db)
+    # The response generator only owns Redis resources. Do not retain a
+    # request-scoped database session for the duration of the SSE stream.
+    async with async_session_scope() as db:
+        await _assert_workspace_access(workspace_uuid, current_user_id, db)
 
     async def event_generator():
         broadcaster = await get_broadcaster()
@@ -496,7 +522,7 @@ async def sse_ingestion_events(
                     logger.warning("Malformed SSE message: %s", exc)
 
         except asyncio.CancelledError:
-            logger.debug("SSE stream cancelled for workspace %s user %s", workspace_id, current_user.id)
+            logger.debug("SSE stream cancelled for workspace %s user %s", workspace_id, current_user_id)
         finally:
             try:
                 await pubsub.unsubscribe()

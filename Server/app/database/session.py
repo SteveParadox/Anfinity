@@ -1,6 +1,7 @@
 """Database session management."""
 import logging
 import ssl
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -59,7 +60,10 @@ async_engine = create_async_engine(
     pool_size=settings.DATABASE_POOL_SIZE,
     max_overflow=settings.DATABASE_MAX_OVERFLOW,
     pool_pre_ping=True,
-    pool_reset_on_return=None,
+    # Keep the pool's rollback-on-return safety net enabled. A correctly
+    # closed AsyncSession already rolls back, but this protects direct engine
+    # users if their cleanup path changes or fails.
+    pool_reset_on_return="rollback",
     echo=settings.DEBUG,
     connect_args={"ssl": ssl_context},
 )
@@ -80,7 +84,7 @@ sync_engine = create_engine(
     pool_size=10,
     max_overflow=5,
     pool_pre_ping=True,
-    pool_reset_on_return=None,
+    pool_reset_on_return="rollback",
     echo=settings.DEBUG,
     connect_args=SSL_CONNECT_ARGS,
 )
@@ -249,17 +253,34 @@ def bind_db_rls_bypass(db: AsyncSession | Session, enabled: bool = True) -> None
         session_info.pop("app_current_user_id", None)
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency for getting async database sessions."""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
+@asynccontextmanager
+async def async_session_scope(*, commit_on_success: bool = False) -> AsyncGenerator[AsyncSession, None]:
+    """Own one AsyncSession and always return its connection to the pool.
+
+    Sessions are task-local resources. Callers must not retain them beyond
+    this scope or pass them to background work. ``BaseException`` is
+    intentional: cancellation must use the same rollback/close path as a
+    database exception.
+    """
+    session = AsyncSessionLocal()
+    try:
+        yield session
+        if commit_on_success:
             await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+    except BaseException:
+        # rollback() is safe when no transaction was opened and guarantees a
+        # connection cannot be returned with an open transaction.
+        await session.rollback()
+        raise
+    finally:
+        # close() releases the connection even if rollback/commit failed.
+        await session.close()
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI request dependency with deterministic transaction ownership."""
+    async with async_session_scope(commit_on_success=True) as session:
+        yield session
 
 
 def get_sync_db():
