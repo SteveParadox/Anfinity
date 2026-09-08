@@ -54,8 +54,9 @@ function InnerRouter() {
       <Suspense fallback={<RouteLoadingFallback />}>
         <Routes>
           {/* Public Routes */}
-          <Route path="/login" element={<LoginPage />} />
+<Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
+          <Route path="/auth/callback" element={<GoogleAuthCallbackPage />} />
           <Route path="/auth/google/callback" element={<GoogleAuthCallbackPage />} />
 
           {/* Protected Routes */}
