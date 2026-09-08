@@ -85,7 +85,9 @@ function refusalReasonLabel(reason: string | undefined): string {
       return 'No accessible notes matched this question.';
     case 'weak_or_indirect_note_evidence':
     case 'limited_note_evidence':
-      return 'Only limited note evidence matched this question.';
+      return 'Only limited note evidence matched this question — the answer below may be incomplete.';
+    case 'no_valid_citation':
+      return 'Retrieved notes were related, but the answer model did not cite them.';
     case 'general_knowledge_not_supported_by_notes':
       return 'This question needs direct support in your notes.';
     case 'no_citation_emitted':
@@ -117,7 +119,7 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
   ) && Boolean(workspaceSettings?.settings?.ai_search?.source_cards_default ?? true);
   const showSimilarity = Boolean(userSettings?.settings?.ai_search?.show_similarity_scores ?? true);
   const defaultTopK = userSettings?.settings?.ai_search?.default_top_k ?? 6;
-  const similarityThreshold = workspaceSettings?.settings?.ai_search?.min_note_similarity ?? 0.46;
+  const similarityThreshold = workspaceSettings?.settings?.ai_search?.min_note_similarity ?? 0.38;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
