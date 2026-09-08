@@ -53,6 +53,23 @@ type ChatStateMessage = {
 };
 
 const STREAM_READ_TIMEOUT_MS = 180_000;
+const STREAM_CONNECT_TIMEOUT_MS = 30_000;
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
 
 async function readStreamChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
@@ -129,11 +146,15 @@ export async function* streamAskPastSelf(
   };
 
   try {
-    const response = await api.stream('/chat/ask', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-      signal: options.signal,
-    });
+    const response = await withTimeout(
+      api.stream('/chat/ask', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        signal: options.signal,
+      }),
+      STREAM_CONNECT_TIMEOUT_MS,
+      'Ask Your Past Self timed out while connecting to the server.'
+    );
 
     if (!response.ok) {
       throw await api.errorFromResponse(response);
@@ -198,11 +219,15 @@ export async function askPastSelfSync(
     similarity_threshold: options.similarityThreshold ?? 0.3,
   };
 
-  const response = await api.stream('/chat/ask/sync', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-    signal: options.signal,
-  });
+  const response = await withTimeout(
+    api.stream('/chat/ask/sync', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      signal: options.signal,
+    }),
+    STREAM_CONNECT_TIMEOUT_MS,
+    'Ask Your Past Self timed out while connecting to the server.'
+  );
 
   if (!response.ok) {
     throw await api.errorFromResponse(response);

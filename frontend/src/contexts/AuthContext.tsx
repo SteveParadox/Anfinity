@@ -412,13 +412,14 @@ export function AuthProvider({ children }: AuthProviderProps) {
         preferredWorkspaceId: currentWorkspaceIdRef.current,
         fallbackToList: true,
       });
+      setupTokenRefresh();
     } catch (err) {
       api.clearToken();
       setUser(null);
       clearWorkspaceState();
       throw err;
     }
-  }, [applyAuthPayload, clearWorkspaceState]);
+  }, [applyAuthPayload, clearWorkspaceState, setupTokenRefresh]);
 
   const clearError = useCallback(() => setError(null), []);
 
