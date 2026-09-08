@@ -239,6 +239,107 @@ class ChatRAGTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sources_event["refusalReason"], "no_citation_emitted")
         self.assertNotIn("general ranking function", token_text)
 
+    async def test_rag_stream_does_not_append_fallback_after_partial_model_output(self):
+        workspace_id = uuid4()
+        fake_user = SimpleNamespace(id=uuid4())
+        retrieval = chat.StrictRAGResult(
+            sources=[self._source(title="Ranking Notes", source_id="S1")],
+            answer_status="supported",
+            confidence="medium",
+        )
+
+        async def failing_stream(_messages):
+            yield "You wrote that BM25 helped reorder matches [S1]."
+            raise RuntimeError("stream disconnected")
+
+        with patch.object(chat, "retrieve_context", AsyncMock(return_value=retrieval)), patch.object(
+            chat,
+            "_stream_with_ollama",
+            failing_stream,
+        ), patch.object(
+            chat,
+            "generate_answer",
+            AsyncMock(return_value="A second full answer [S1]."),
+        ) as fallback:
+            chunks = []
+            async for chunk in chat._rag_stream(
+                query="What did I write about ranking?",
+                workspace_id=workspace_id,
+                user=fake_user,
+                db=None,
+                history=None,
+                top_k=6,
+                threshold=0.3,
+            ):
+                chunks.append(chunk)
+
+        events = self._parse_sse(chunks)
+        token_text = "".join(event.get("text", "") for event in events if event["type"] == "token")
+
+        self.assertIn("BM25 helped reorder", token_text)
+        self.assertNotIn("second full answer", token_text)
+        fallback.assert_not_awaited()
+
+    async def test_generate_answer_uses_global_openai_provider_without_trying_ollama(self):
+        messages = [{"role": "user", "content": "Answer from my notes."}]
+
+        with patch.object(chat.settings, "LLM_PROVIDER", "openai"), patch.object(
+            chat.settings, "LLM_USE_FALLBACK", False
+        ), patch.object(chat.settings, "OPENAI_API_KEY", "test-key"), patch.object(
+            chat.settings, "OLLAMA_ENABLED", False
+        ), patch.object(
+            chat,
+            "_generate_with_ollama",
+            AsyncMock(side_effect=AssertionError("Ollama must not be attempted")),
+        ), patch.object(
+            chat,
+            "_generate_with_openai",
+            AsyncMock(return_value="OpenAI answer [S1]."),
+        ) as openai_generation:
+            answer = await chat.generate_answer(messages)
+
+        self.assertEqual(answer, "OpenAI answer [S1].")
+        openai_generation.assert_awaited_once_with(messages)
+
+    async def test_rag_stream_selects_global_openai_provider(self):
+        workspace_id = uuid4()
+        fake_user = SimpleNamespace(id=uuid4())
+        retrieval = chat.StrictRAGResult(
+            sources=[self._source(title="Ranking Notes", source_id="S1")],
+            answer_status="supported",
+            confidence="medium",
+        )
+
+        async def fake_openai_stream(_messages):
+            yield "You wrote that BM25 helped reorder matches [S1]."
+
+        async def unexpected_ollama_stream(_messages):
+            raise AssertionError("Ollama must not be attempted")
+            yield ""
+
+        with patch.object(chat.settings, "LLM_PROVIDER", "openai"), patch.object(
+            chat.settings, "LLM_USE_FALLBACK", False
+        ), patch.object(chat.settings, "OPENAI_API_KEY", "test-key"), patch.object(
+            chat.settings, "OLLAMA_ENABLED", False
+        ), patch.object(chat, "retrieve_context", AsyncMock(return_value=retrieval)), patch.object(
+            chat, "_stream_with_openai", fake_openai_stream
+        ), patch.object(chat, "_stream_with_ollama", unexpected_ollama_stream):
+            chunks = []
+            async for chunk in chat._rag_stream(
+                query="What did I write about ranking?",
+                workspace_id=workspace_id,
+                user=fake_user,
+                db=None,
+                history=None,
+                top_k=6,
+                threshold=0.3,
+            ):
+                chunks.append(chunk)
+
+        events = self._parse_sse(chunks)
+        token_text = "".join(event.get("text", "") for event in events if event["type"] == "token")
+        self.assertIn("BM25 helped reorder", token_text)
+
     async def test_note_retrieval_query_scopes_to_owned_or_collaborated_notes(self):
         class EmptyResult:
             def scalars(self):
