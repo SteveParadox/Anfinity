@@ -122,9 +122,9 @@ export function WorkflowsView() {
     currentWorkspaceId && hasPermission(currentWorkspaceId, 'workflows', 'view'),
   );
   const { workspace: workspaceSettings } = useProductSettings(currentWorkspaceId, Boolean(currentWorkspaceId));
-  const approvalsEnabled = Boolean(workspaceSettings?.settings.approvals.enabled ?? true);
+  const approvalsEnabled = Boolean(workspaceSettings?.settings?.approvals?.enabled ?? true);
   const defaultApprovalDueAt = buildDefaultApprovalDueDate(
-    workspaceSettings?.settings.approvals.default_due_days ?? 5,
+    workspaceSettings?.settings?.approvals?.default_due_days ?? 5,
   );
 
   const [selectedTab, setSelectedTab] = useState<TabValue>('submitted');
