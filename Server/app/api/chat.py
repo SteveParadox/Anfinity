@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from types import SimpleNamespace
 from typing import AsyncGenerator, List, Optional
 from uuid import UUID, uuid4
 
@@ -207,6 +208,7 @@ async def retrieve_context(
     db: AsyncSession,
     k: int = 6,
     threshold: float = 0.3,
+    correlation_id: Optional[str] = None,
 ) -> StrictRAGResult:
     """Retrieve live note-only evidence and gate answerability."""
     started_at = time.perf_counter()
@@ -223,6 +225,7 @@ async def retrieve_context(
                 "requested_threshold": threshold,
                 "workspace_min_score": workspace_min_score,
                 "effective_min_score": min_score,
+                "correlation_id": correlation_id,
             },
         )
         retrieval = await retrieve_strict_note_context(
@@ -232,6 +235,7 @@ async def retrieve_context(
             db=db,
             limit=k,
             min_score=min_score,
+            correlation_id=correlation_id,
         )
         logger.info(
             "ask_past_self_context_retrieval_complete",
@@ -243,6 +247,7 @@ async def retrieve_context(
                 "source_count": len(retrieval.sources),
                 "refusal_reason": retrieval.refusal_reason,
                 "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "correlation_id": correlation_id,
                 **retrieval.diagnostics,
             },
         )
@@ -255,6 +260,7 @@ async def retrieve_context(
                 "user_id": str(getattr(user, "id", "")),
                 "query_length": len(query or ""),
                 "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "correlation_id": correlation_id,
             },
         )
         return StrictRAGResult(
@@ -469,6 +475,19 @@ def _api_sources(sources: List[StrictRAGSource]) -> List[dict]:
     return [source.to_api_dict() for source in sources]
 
 
+def _ground_answer(raw_answer: str, sources: List[StrictRAGSource]) -> tuple[str, List[StrictRAGSource], bool]:
+    """Keep only source-cited answer text and return display-ready citations."""
+    grounding_guard = GroundedAnswerStreamGuard(sources)
+    citation_transformer = CitationStreamTransformer(sources)
+    grounded_answer = grounding_guard.feed(raw_answer) + grounding_guard.flush()
+    if not grounding_guard.released_any and REFUSAL_TEXT not in (raw_answer or ""):
+        return REFUSAL_TEXT, [], False
+
+    cited_sources = cited_sources_from_answer(grounded_answer, sources)
+    display_answer = citation_transformer.feed(grounded_answer) + citation_transformer.flush()
+    return display_answer, cited_sources, bool(cited_sources) or REFUSAL_TEXT in display_answer
+
+
 def _sse_event(event: str, payload: dict) -> str:
     """Emit a named SSE event while preserving the legacy payload type field."""
     body = dict(payload)
@@ -555,6 +574,7 @@ async def _rag_stream(
         db=db,
         k=top_k,
         threshold=threshold,
+        correlation_id=correlation_id,
     )
 
     if not retrieval.can_answer:
@@ -747,9 +767,11 @@ async def ask_past_self(
       event: done    data: {type, followUpQuestions, answerStatus, confidence, correlationId}
       event: error   data: {type, message, correlationId}
     """
+    correlation_id = str(uuid4())
     logger.info(
         "ask_past_self_request_received",
         extra={
+            "correlation_id": correlation_id,
             "workspace_id": str(request.workspace_id),
             "user_id": str(getattr(current_user, "id", "")),
             "query_length": len(request.query or ""),
@@ -762,7 +784,10 @@ async def ask_past_self(
     # Auth check outside the generator — HTTPException propagates cleanly here.
     await _verify_workspace_access(request.workspace_id, current_user, db)
 
-    correlation_id = str(uuid4())
+    stream_user = SimpleNamespace(
+        id=current_user.id,
+        is_superuser=bool(getattr(current_user, "is_superuser", False)),
+    )
 
     async def _event_stream() -> AsyncGenerator[str, None]:
         stream_started_at = time.perf_counter()
@@ -780,7 +805,7 @@ async def ask_past_self(
                 async for chunk in _rag_stream(
                     query=request.query,
                     workspace_id=request.workspace_id,
-                    user=current_user,
+                    user=stream_user,
                     db=stream_db,
                     history=request.history,
                     top_k=request.top_k,
@@ -851,9 +876,11 @@ async def ask_past_self_sync(
     Returns the complete response in a single JSON payload.
     """
     request_started_at = time.perf_counter()
+    correlation_id = str(uuid4())
     logger.info(
         "ask_past_self_request_received",
         extra={
+            "correlation_id": correlation_id,
             "workspace_id": str(request.workspace_id),
             "user_id": str(getattr(current_user, "id", "")),
             "query_length": len(request.query or ""),
@@ -872,6 +899,7 @@ async def ask_past_self_sync(
         db=db,
         k=request.top_k,
         threshold=request.similarity_threshold,
+        correlation_id=correlation_id,
     )
 
     if not retrieval.can_answer:
@@ -881,6 +909,7 @@ async def ask_past_self_sync(
                 "workspace_id": str(request.workspace_id),
                 "user_id": str(getattr(current_user, "id", "")),
                 "reason": retrieval.refusal_reason,
+                "correlation_id": correlation_id,
                 "elapsed_ms": round((time.perf_counter() - request_started_at) * 1000, 2),
             },
         )
@@ -897,11 +926,12 @@ async def ask_past_self_sync(
     messages = _build_messages(system_prompt, request.query, request.history)
 
     raw_answer = await generate_answer(messages)  # raises HTTP 502 on total failure
-    cited_sources = cited_sources_from_answer(raw_answer, sources)
-    if not cited_sources and REFUSAL_TEXT not in raw_answer:
+    answer, cited_sources, has_supported_answer = _ground_answer(raw_answer, sources)
+    if not has_supported_answer:
         logger.warning(
             "ask_past_self_sync_uncited_answer_refused",
             extra={
+                "correlation_id": correlation_id,
                 "workspace_id": str(request.workspace_id),
                 "user_id": str(getattr(current_user, "id", "")),
             },
@@ -913,18 +943,18 @@ async def ask_past_self_sync(
             followUpQuestions=[],
             answerStatus="refusal",
         )
-    answer = replace_source_markers(raw_answer, sources)
 
     response = AskPastSelfResponse(
         answer=answer,
         sources=[RAGSource(**source.to_api_dict()) for source in cited_sources],
-        confidence="not_found" if REFUSAL_TEXT in raw_answer else retrieval.confidence,
+        confidence="not_found" if REFUSAL_TEXT in answer else retrieval.confidence,
         followUpQuestions=extract_follow_up_questions(raw_answer),
-        answerStatus="refusal" if REFUSAL_TEXT in raw_answer else retrieval.answer_status,
+        answerStatus="refusal" if REFUSAL_TEXT in answer else retrieval.answer_status,
     )
     logger.info(
         "ask_past_self_sync_complete",
         extra={
+            "correlation_id": correlation_id,
             "workspace_id": str(request.workspace_id),
             "user_id": str(getattr(current_user, "id", "")),
             "response_length": len(response.answer),

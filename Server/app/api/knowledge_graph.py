@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,7 +15,7 @@ from app.core.permissions import ensure_workspace_permission
 from app.database.models import User as DBUser
 from app.database.models import WorkspaceSection
 from app.database.session import bind_db_rls_bypass, get_db
-from app.services.graph_service import get_graph_service
+from app.services.graph_service import get_graph_service, seed_workspace_graph_background
 
 router = APIRouter(prefix="/knowledge-graph", tags=["Knowledge Graph"])
 
@@ -165,6 +165,7 @@ async def sync_internal_workspace_clusters(
 @router.get("/{workspace_id}", response_model=KnowledgeGraphResponse)
 async def get_knowledge_graph(
     workspace_id: UUID,
+    background_tasks: BackgroundTasks,
     node_types: Optional[List[str]] = Query(None),
     edge_types: Optional[List[str]] = Query(None),
     search: Optional[str] = Query(None),
@@ -183,7 +184,11 @@ async def get_knowledge_graph(
         action="view",
     )
 
-    graph_data = await get_graph_service().build_graph_data(
+    graph_service = get_graph_service()
+    if await graph_service.workspace_graph_needs_seed(db, workspace_id):
+        background_tasks.add_task(seed_workspace_graph_background, workspace_id)
+
+    graph_data = await graph_service.build_graph_data(
         db=db,
         workspace_id=workspace_id,
         filters={
@@ -195,6 +200,7 @@ async def get_knowledge_graph(
             "node_limit": node_limit,
             "edge_limit": edge_limit,
         },
+        seed=False,
     )
 
     return KnowledgeGraphResponse(**graph_data)

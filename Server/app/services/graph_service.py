@@ -30,6 +30,7 @@ from app.database.models import (
     Note,
     Workspace,
 )
+from app.database.session import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -167,8 +168,12 @@ def extract_tags_from_document(document: Document, combined_text: str) -> List[s
 class GraphService:
     """Persisted graph builder, clustering service, and note sync helper."""
 
-    async def ensure_workspace_graph_seeded(self, db: AsyncSession, workspace_id: UUID) -> None:
-        """Seed graph rows from existing notes and indexed documents."""
+    async def missing_graph_items(
+        self,
+        db: AsyncSession,
+        workspace_id: UUID,
+    ) -> tuple[list[Note], list[Document]]:
+        """Return notes/documents that still lack rows in the persisted graph."""
         existing_nodes_result = await db.execute(
             select(GraphNode.node_type, GraphNode.external_id).where(GraphNode.workspace_id == workspace_id)
         )
@@ -200,6 +205,16 @@ class GraphService:
             document for document in documents
             if str(document.id) not in existing_ids_by_type[GraphNodeType.DOCUMENT]
         ]
+        return missing_notes, missing_documents
+
+    async def workspace_graph_needs_seed(self, db: AsyncSession, workspace_id: UUID) -> bool:
+        """Cheap pending-backfill check used to decide whether to schedule a seed job."""
+        missing_notes, missing_documents = await self.missing_graph_items(db, workspace_id)
+        return bool(missing_notes or missing_documents)
+
+    async def ensure_workspace_graph_seeded(self, db: AsyncSession, workspace_id: UUID) -> None:
+        """Seed graph rows from existing notes and indexed documents."""
+        missing_notes, missing_documents = await self.missing_graph_items(db, workspace_id)
 
         if not missing_notes and not missing_documents:
             return
@@ -222,8 +237,11 @@ class GraphService:
         db: AsyncSession,
         workspace_id: UUID,
         filters: Optional[Dict[str, Any]] = None,
+        *,
+        seed: bool = True,
     ) -> Dict[str, Any]:
-        await self.ensure_workspace_graph_seeded(db, workspace_id)
+        if seed:
+            await self.ensure_workspace_graph_seeded(db, workspace_id)
         filters = filters or {}
         node_types = set(filters.get("node_types") or [])
         edge_types = set(filters.get("edge_types") or [])
@@ -1354,6 +1372,16 @@ def get_graph_service() -> GraphService:
     if _graph_service is None:
         _graph_service = GraphService()
     return _graph_service
+
+
+async def seed_workspace_graph_background(workspace_id: UUID) -> None:
+    """Backfill graph rows in a fresh session so GET requests can return quickly."""
+    try:
+        async with AsyncSessionLocal() as db:
+            await get_graph_service().ensure_workspace_graph_seeded(db, workspace_id)
+            await db.commit()
+    except Exception as exc:
+        logger.warning("Skipping background graph seed for workspace %s: %s", workspace_id, exc)
 
 
 async def buildGraphData(
