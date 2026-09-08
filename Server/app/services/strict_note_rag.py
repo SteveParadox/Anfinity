@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -10,10 +12,11 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Note, NoteCollaborator, User as DBUser
+from app.services.embeddings import get_embedding_service
 from app.services.retrieval_relevance import analyze_chunk_relevance, analyze_query_intent
 from app.services.search_highlights import SearchHighlightExtractor, SearchTextChunk
 
@@ -24,6 +27,10 @@ REFUSAL_TEXT = "I couldn't find enough in your notes to answer that."
 MIN_SUPPORTED_SCORE = 0.46
 MIN_PARTIAL_SCORE = 0.38
 MAX_NOTES_SCANNED = 500
+PARTIAL_GROUNDING_TEXT = (
+    "I found related notes, but the answer model did not provide a valid citation. "
+    "Review the source evidence below."
+)
 
 _CITATION_ID_RE = re.compile(r"\[(S\d+)\]")
 _PERSONAL_ANCHOR_RE = re.compile(
@@ -150,7 +157,45 @@ def _direct_answer_support(query: str, text: str) -> float:
     return 0.0
 
 
-def _score_chunk(query: str, chunk: SearchTextChunk) -> tuple[float, Dict[str, float], bool]:
+def _parse_embedding(value: Any) -> List[float]:
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            raw = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    else:
+        return []
+
+    if not isinstance(raw, list):
+        return []
+    try:
+        vector = [float(item) for item in raw]
+    except (TypeError, ValueError):
+        return []
+    return vector if vector and all(math.isfinite(item) for item in vector) else []
+
+
+def _cosine_similarity(left: List[float], right: List[float]) -> float:
+    if not left or len(left) != len(right):
+        return 0.0
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return max(0.0, min(1.0, sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)))
+
+
+def _embedding_to_pg(vector: List[float]) -> str:
+    return f"[{','.join(map(str, vector))}]"
+
+
+def _score_chunk(
+    query: str,
+    chunk: SearchTextChunk,
+    semantic_score: float = 0.0,
+) -> tuple[float, Dict[str, float], bool]:
     relevance = analyze_chunk_relevance(
         query,
         chunk.text,
@@ -175,14 +220,27 @@ def _score_chunk(query: str, chunk: SearchTextChunk) -> tuple[float, Dict[str, f
         if term and term in str(chunk.metadata.get("title") or "").lower()
     )
     title_bonus = min(title_hits / max(len(intent.content_terms), 1), 1.0) * 0.08
-    score = (
-        relevance.evidence_score * 0.52
-        + relevance.lexical_overlap * 0.28
-        + relevance.exact_match_ratio * 0.10
-        + relevance.domain_alignment * 0.04
-        + title_bonus
-        + exact_phrase_bonus
-    )
+    if semantic_score > 0.0:
+        # Note embeddings are the primary signal; lexical evidence still helps
+        # disambiguate similar notes and keeps the path useful without vectors.
+        score = (
+            semantic_score * 0.60
+            + relevance.evidence_score * 0.18
+            + relevance.lexical_overlap * 0.10
+            + relevance.exact_match_ratio * 0.06
+            + relevance.domain_alignment * 0.06
+            + title_bonus
+            + exact_phrase_bonus
+        )
+    else:
+        score = (
+            relevance.evidence_score * 0.52
+            + relevance.lexical_overlap * 0.28
+            + relevance.exact_match_ratio * 0.10
+            + relevance.domain_alignment * 0.04
+            + title_bonus
+            + exact_phrase_bonus
+        )
     answerability = _direct_answer_support(query, chunk.text)
     if relevance.off_topic:
         score *= 0.2
@@ -197,6 +255,7 @@ def _score_chunk(query: str, chunk: SearchTextChunk) -> tuple[float, Dict[str, f
         "lexical": round(relevance.lexical_overlap, 4),
         "exact": round(relevance.exact_match_ratio, 4),
         "domain": round(relevance.domain_alignment, 4),
+        "semantic": round(semantic_score, 4),
         "answerability": round(answerability, 4),
     }
     return score, components, relevance.off_topic
@@ -260,7 +319,7 @@ def evaluate_sources(
         ]
         if not directly_supported:
             return StrictRAGResult(
-                sources=[],
+                sources=sources,
                 answer_status="refusal",
                 confidence="not_found",
                 refusal_reason="general_knowledge_not_supported_by_notes",
@@ -276,7 +335,7 @@ def evaluate_sources(
             diagnostics={"top_score": round(top_score, 4), "source_count": len(sources)},
         )
 
-    if top_score >= MIN_PARTIAL_SCORE and len(medium_sources) >= 2:
+    if top_score >= MIN_PARTIAL_SCORE and len(medium_sources) >= 1:
         return StrictRAGResult(
             sources=sources,
             answer_status="partial",
@@ -302,6 +361,7 @@ async def retrieve_strict_note_context(
     db: AsyncSession,
     limit: int = 6,
     min_score: float = MIN_SUPPORTED_SCORE,
+    correlation_id: Optional[str] = None,
 ) -> StrictRAGResult:
     """Retrieve answerable evidence from live note rows in one workspace."""
     started_at = time.perf_counter()
@@ -315,6 +375,7 @@ async def retrieve_strict_note_context(
             "min_score": min_score,
             "max_notes_scanned": MAX_NOTES_SCANNED,
             "is_superuser": bool(getattr(user, "is_superuser", False)),
+            "correlation_id": correlation_id,
         },
     )
 
@@ -352,6 +413,72 @@ async def retrieve_strict_note_context(
     )
     extractor = SearchHighlightExtractor()
     candidates: List[StrictRAGSource] = []
+    semantic_scores: Dict[str, float] = {}
+    semantic_available = False
+    embedded_notes = [note for note in notes if _parse_embedding(getattr(note, "embedding", None))]
+    if embedded_notes:
+        try:
+            query_embedding = get_embedding_service().embed_query(query)
+            if query_embedding:
+                try:
+                    dimension = len(query_embedding)
+                    access_clause = (
+                        "n.user_id = :user_id OR EXISTS ("
+                        "SELECT 1 FROM note_collaborators nc "
+                        "WHERE nc.note_id = n.id AND nc.user_id = :user_id)"
+                    )
+                    if getattr(user, "is_superuser", False):
+                        access_clause = "TRUE"
+                    async with db.begin_nested():
+                        vector_result = await db.execute(
+                            text(
+                                f"""
+                                SELECT n.id,
+                                       1.0 - (n.embedding_vector <=> CAST(:embedding AS vector({dimension}))) AS similarity
+                                FROM notes n
+                                WHERE n.workspace_id = :workspace_id
+                                  AND n.embedding_vector IS NOT NULL
+                                  AND ({access_clause})
+                                ORDER BY n.embedding_vector <=> CAST(:embedding AS vector({dimension}))
+                                LIMIT :limit
+                                """
+                            ),
+                            {
+                                "embedding": _embedding_to_pg(query_embedding),
+                                "workspace_id": workspace_id,
+                                "user_id": user.id,
+                                "limit": MAX_NOTES_SCANNED,
+                            },
+                        )
+                        semantic_scores = {
+                            str(note_id): max(0.0, min(float(score or 0.0), 1.0))
+                            for note_id, score in vector_result.all()
+                            if score is not None
+                        }
+                except Exception as exc:
+                    logger.info(
+                        "ask_past_self_pgvector_unavailable workspace=%s: %s",
+                        workspace_id,
+                        exc,
+                    )
+
+                # Older databases may have only the JSON embedding column.
+                if not semantic_scores:
+                    semantic_scores = {
+                        str(note.id): score
+                        for note in embedded_notes
+                        if (score := _cosine_similarity(
+                            query_embedding,
+                            _parse_embedding(getattr(note, "embedding", None)),
+                        )) > 0.0
+                    }
+                semantic_available = bool(semantic_scores)
+        except Exception as exc:
+            logger.warning(
+                "ask_past_self_semantic_retrieval_unavailable workspace=%s: %s",
+                workspace_id,
+                exc,
+            )
     notes_with_content = 0
     chunks_scanned = 0
     chunks_rejected = 0
@@ -372,7 +499,9 @@ async def retrieve_strict_note_context(
         )
         chunks_scanned += len(chunks)
         for chunk in chunks:
-            score, components, off_topic = _score_chunk(query, chunk)
+            semantic_score = semantic_scores.get(str(note.id), 0.0)
+            chunk.metadata["semantic_score"] = semantic_score
+            score, components, off_topic = _score_chunk(query, chunk, semantic_score)
             if off_topic or score < MIN_PARTIAL_SCORE:
                 chunks_rejected += 1
                 continue
@@ -404,6 +533,8 @@ async def retrieve_strict_note_context(
             "chunks_scanned": chunks_scanned,
             "chunks_rejected": chunks_rejected,
             "candidate_count": len(candidates),
+            "semantic_available": semantic_available,
+            "semantic_note_count": len(semantic_scores),
             "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
         },
     )

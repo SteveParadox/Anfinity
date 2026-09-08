@@ -29,6 +29,7 @@ from app.services.strict_note_rag import (
     CitationStreamTransformer,
     GroundedAnswerStreamGuard,
     MIN_SUPPORTED_SCORE,
+    PARTIAL_GROUNDING_TEXT,
     REFUSAL_TEXT,
     StrictRAGResult,
     StrictRAGSource,
@@ -90,6 +91,8 @@ class AskPastSelfResponse(BaseModel):
     confidence: str = Field(..., pattern="^(high|medium|low|not_found)$")
     followUpQuestions: List[str]
     answerStatus: str = Field(default="supported", pattern="^(supported|partial|refusal)$")
+    refusalReason: Optional[str] = None
+    diagnostics: dict = Field(default_factory=dict)
 
 
 # ============================================================================
@@ -443,6 +446,11 @@ async def generate_answer(messages: List[dict]) -> str:
             "ask_past_self_llm_generation_started",
             extra={"message_count": len(messages), "backend": "openai"},
         )
+        if not getattr(settings, "OPENAI_API_KEY", None):
+            raise RuntimeError(
+                "Ollama is unavailable and no OPENAI_API_KEY is configured. "
+                "Start Ollama or configure an OpenAI-compatible LLM backend."
+            )
         response = await _generate_with_openai(messages)
         logger.info(
             "ask_past_self_llm_generation_complete",
@@ -461,7 +469,7 @@ async def generate_answer(messages: List[dict]) -> str:
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"All LLM backends failed: {exc}",
+            detail=f"Ollama is unavailable and the fallback LLM failed: {exc}",
         ) from exc
 
 
@@ -481,7 +489,7 @@ def _ground_answer(raw_answer: str, sources: List[StrictRAGSource]) -> tuple[str
     citation_transformer = CitationStreamTransformer(sources)
     grounded_answer = grounding_guard.feed(raw_answer) + grounding_guard.flush()
     if not grounding_guard.released_any and REFUSAL_TEXT not in (raw_answer or ""):
-        return REFUSAL_TEXT, [], False
+        return PARTIAL_GROUNDING_TEXT, list(sources), True
 
     cited_sources = cited_sources_from_answer(grounded_answer, sources)
     display_answer = citation_transformer.feed(grounded_answer) + citation_transformer.flush()
@@ -602,9 +610,11 @@ async def _rag_stream(
         yield _sse_event(
             "sources",
             {
-                "sources": [],
+                "sources": _api_sources(retrieval.sources),
                 "answerStatus": "refusal",
                 "confidence": "not_found",
+                "refusalReason": retrieval.refusal_reason,
+                "diagnostics": retrieval.diagnostics,
                 "correlationId": correlation_id,
             },
         )
@@ -614,6 +624,8 @@ async def _rag_stream(
                 "followUpQuestions": [],
                 "answerStatus": "refusal",
                 "confidence": "not_found",
+                "refusalReason": retrieval.refusal_reason,
+                "diagnostics": retrieval.diagnostics,
                 "correlationId": correlation_id,
             },
         )
@@ -666,7 +678,8 @@ async def _rag_stream(
                 if display_chunk:
                     yield _sse_event("token", {"text": display_chunk, "correlationId": correlation_id})
         grounded_tail = grounding_guard.flush()
-        if not grounding_guard.released_any and REFUSAL_TEXT not in "".join(full_response_parts):
+        uncited_answer = not grounding_guard.released_any and REFUSAL_TEXT not in "".join(full_response_parts)
+        if uncited_answer:
             logger.warning(
                 "ask_past_self_suppressed_uncited_answer",
                 extra={
@@ -675,7 +688,7 @@ async def _rag_stream(
                     "user_id": str(getattr(user, "id", "")),
                 },
             )
-            grounded_tail = REFUSAL_TEXT
+            grounded_tail = PARTIAL_GROUNDING_TEXT
         tail = citation_transformer.feed(grounded_tail) + citation_transformer.flush()
         if tail:
             yield _sse_event("token", {"text": tail, "correlationId": correlation_id})
@@ -698,7 +711,19 @@ async def _rag_stream(
     cited_sources = cited_sources_from_answer(full_response, sources)
     answer_status = retrieval.answer_status
     confidence = retrieval.confidence
-    if not cited_sources and REFUSAL_TEXT not in full_response:
+    refusal_reason = retrieval.refusal_reason
+    source_payload = cited_sources
+    if uncited_answer:
+        answer_status = "partial"
+        confidence = "low"
+        refusal_reason = "no_citation_emitted"
+        source_payload = sources
+    elif REFUSAL_TEXT in full_response:
+        answer_status = "refusal"
+        confidence = "not_found"
+        refusal_reason = "model_refusal"
+        source_payload = sources
+    elif not cited_sources:
         logger.warning(
             "ask_past_self_answer_without_valid_citations",
             extra={
@@ -709,13 +734,20 @@ async def _rag_stream(
         )
         answer_status = "refusal"
         confidence = "not_found"
+        refusal_reason = "no_valid_citation"
+        source_payload = sources
 
     yield _sse_event(
         "sources",
         {
-            "sources": _api_sources(cited_sources),
+            "sources": _api_sources(source_payload),
             "answerStatus": answer_status,
             "confidence": confidence,
+            "refusalReason": refusal_reason,
+            "diagnostics": {
+                **retrieval.diagnostics,
+                **({"grounding": "no_citation_emitted"} if uncited_answer else {}),
+            },
             "correlationId": correlation_id,
         },
     )
@@ -725,6 +757,11 @@ async def _rag_stream(
             "followUpQuestions": extract_follow_up_questions(full_response),
             "answerStatus": answer_status,
             "confidence": confidence,
+            "refusalReason": refusal_reason,
+            "diagnostics": {
+                **retrieval.diagnostics,
+                **({"grounding": "no_citation_emitted"} if uncited_answer else {}),
+            },
             "correlationId": correlation_id,
         },
     )
@@ -915,10 +952,12 @@ async def ask_past_self_sync(
         )
         return AskPastSelfResponse(
             answer=REFUSAL_TEXT,
-            sources=[],
+            sources=[RAGSource(**source.to_api_dict()) for source in retrieval.sources],
             confidence="not_found",
             followUpQuestions=[],
             answerStatus="refusal",
+            refusalReason=retrieval.refusal_reason,
+            diagnostics=retrieval.diagnostics,
         )
 
     sources = retrieval.sources
@@ -937,19 +976,23 @@ async def ask_past_self_sync(
             },
         )
         return AskPastSelfResponse(
-            answer=REFUSAL_TEXT,
-            sources=[],
-            confidence="not_found",
+            answer=PARTIAL_GROUNDING_TEXT,
+            sources=[RAGSource(**source.to_api_dict()) for source in sources],
+            confidence="low",
             followUpQuestions=[],
-            answerStatus="refusal",
+            answerStatus="partial",
+            refusalReason="no_citation_emitted",
+            diagnostics={"grounding": "no_citation_emitted"},
         )
 
     response = AskPastSelfResponse(
         answer=answer,
         sources=[RAGSource(**source.to_api_dict()) for source in cited_sources],
-        confidence="not_found" if REFUSAL_TEXT in answer else retrieval.confidence,
+        confidence="low" if answer == PARTIAL_GROUNDING_TEXT else ("not_found" if REFUSAL_TEXT in answer else retrieval.confidence),
         followUpQuestions=extract_follow_up_questions(raw_answer),
-        answerStatus="refusal" if REFUSAL_TEXT in answer else retrieval.answer_status,
+        answerStatus="partial" if answer == PARTIAL_GROUNDING_TEXT else ("refusal" if REFUSAL_TEXT in answer else retrieval.answer_status),
+        refusalReason="no_citation_emitted" if answer == PARTIAL_GROUNDING_TEXT else retrieval.refusal_reason,
+        diagnostics={**retrieval.diagnostics, **({"grounding": "no_citation_emitted"} if answer == PARTIAL_GROUNDING_TEXT else {})},
     )
     logger.info(
         "ask_past_self_sync_complete",

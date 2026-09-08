@@ -47,9 +47,9 @@ USER_SETTINGS_DEFAULTS: dict[str, Any] = {
 WORKSPACE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "ai_search": {
         "ask_past_self_enabled": True,
-        # Minimum semantic similarity for note retrieval (0.38-0.85).
-        # 0.55 reduces low-quality source matches without making search too brittle.
-        "min_note_similarity": 0.55,
+        # Minimum blended semantic/lexical score for note retrieval (0.38-0.85).
+        # 0.46 keeps the supported gate aligned with the Ask Your Past Self UI.
+        "min_note_similarity": 0.46,
         "source_cards_default": True,
     },
     "notes": {
