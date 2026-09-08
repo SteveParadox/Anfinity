@@ -58,6 +58,20 @@ describe('parseSseEvents', () => {
     expect(parsed.remainder).toBe('event: token\ndata: {"text":"hello"');
   });
 
+  it('parses CRLF-delimited events without dropping metadata', async () => {
+    const { parseSseEvents } = await loadParser();
+    const parsed = parseSseEvents(
+      'event: sources\r\ndata: {"answerStatus":"partial","refusalReason":"no_citation_emitted"}\r\n\r\n'
+    );
+
+    expect(parsed.remainder).toBe('');
+    expect(parsed.events[0]).toMatchObject({
+      type: 'sources',
+      answerStatus: 'partial',
+      refusalReason: 'no_citation_emitted',
+    });
+  });
+
   it('sends settings-derived retrieval options in the stream payload', async () => {
     const { streamAskPastSelf } = await loadParser();
     const encoder = new TextEncoder();

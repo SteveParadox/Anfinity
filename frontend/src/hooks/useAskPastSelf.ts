@@ -23,6 +23,8 @@ export interface ChatStreamMessage {
   message?: string;
   confidence?: 'high' | 'medium' | 'low' | 'not_found';
   answerStatus?: 'supported' | 'partial' | 'refusal';
+  refusalReason?: string;
+  diagnostics?: Record<string, unknown>;
   correlationId?: string;
   status?: string;
 }
@@ -45,21 +47,47 @@ type ChatStateMessage = {
   role: 'user' | 'assistant';
   content: string;
   sources?: RAGSource[];
+  answerStatus?: 'supported' | 'partial' | 'refusal';
+  refusalReason?: string;
+  diagnostics?: Record<string, unknown>;
 };
+
+const STREAM_READ_TIMEOUT_MS = 180_000;
+
+async function readStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          void reader.cancel();
+          reject(new Error('Ask Your Past Self timed out while waiting for the answer.'));
+        }, STREAM_READ_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
 
 export function parseSseEvents(buffer: string): {
   events: ChatStreamMessage[];
   remainder: string;
 } {
   const events: ChatStreamMessage[] = [];
-  const rawEvents = buffer.split('\n\n');
+  const rawEvents = buffer.split(/\r?\n\r?\n/);
   const remainder = rawEvents.pop() ?? '';
 
   for (const rawEvent of rawEvents) {
     let eventType = '';
     const dataLines: string[] = [];
 
-    for (const line of rawEvent.split('\n')) {
+    for (const line of rawEvent.split(/\r?\n/)) {
       if (line.startsWith('event:')) {
         eventType = line.slice(6).trim();
       }
@@ -120,7 +148,7 @@ export async function* streamAskPastSelf(
     let buffer = '';
 
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readStreamChunk(reader);
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
 
       const parsed = parseSseEvents(buffer);
@@ -205,7 +233,11 @@ export function useAskPastSelf(workspaceId?: string) {
   }, [workspaceId]);
 
   const replaceLastAssistant = React.useCallback(
-    (content: string, sources: RAGSource[]) => {
+    (
+      content: string,
+      sources: RAGSource[],
+      metadata: Pick<ChatStateMessage, 'answerStatus' | 'refusalReason' | 'diagnostics'> = {},
+    ) => {
       setMessages((prev) => {
         const updated = [...prev];
         for (let index = updated.length - 1; index >= 0; index -= 1) {
@@ -214,11 +246,12 @@ export function useAskPastSelf(workspaceId?: string) {
               ...updated[index],
               content,
               sources,
+              ...metadata,
             };
             return updated;
           }
         }
-        return [...updated, { role: 'assistant', content, sources }];
+        return [...updated, { role: 'assistant', content, sources, ...metadata }];
       });
     },
     []
@@ -262,7 +295,11 @@ export function useAskPastSelf(workspaceId?: string) {
           if (chunk.type === 'sources' && chunk.sources) {
             sources = chunk.sources;
             setStreamingSources(sources);
-            replaceLastAssistant(assistantContent, sources);
+            replaceLastAssistant(assistantContent, sources, {
+              answerStatus: chunk.answerStatus,
+              refusalReason: chunk.refusalReason,
+              diagnostics: chunk.diagnostics,
+            });
             continue;
           }
 
@@ -278,6 +315,11 @@ export function useAskPastSelf(workspaceId?: string) {
 
           if (chunk.type === 'done') {
             setFollowUpQuestions(chunk.followUpQuestions || []);
+            replaceLastAssistant(assistantContent, sources, {
+              answerStatus: chunk.answerStatus,
+              refusalReason: chunk.refusalReason,
+              diagnostics: chunk.diagnostics,
+            });
             continue;
           }
 

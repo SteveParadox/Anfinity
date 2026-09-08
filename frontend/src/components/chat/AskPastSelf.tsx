@@ -11,6 +11,8 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   sources?: RAGSource[];
+  answerStatus?: 'supported' | 'partial' | 'refusal';
+  refusalReason?: string;
 }
 
 interface AskPastSelfProps {
@@ -77,6 +79,26 @@ function isNotEnoughEvidenceMessage(content: string): boolean {
     || normalized.includes('not enough in your notes');
 }
 
+function refusalReasonLabel(reason: string | undefined): string {
+  switch (reason) {
+    case 'no_note_evidence':
+      return 'No accessible notes matched this question.';
+    case 'weak_or_indirect_note_evidence':
+    case 'limited_note_evidence':
+      return 'Only limited note evidence matched this question.';
+    case 'general_knowledge_not_supported_by_notes':
+      return 'This question needs direct support in your notes.';
+    case 'no_citation_emitted':
+      return 'The answer model did not cite the retrieved notes.';
+    case 'model_refusal':
+      return 'The answer model could not ground a response in the retrieved notes.';
+    case 'retrieval_error':
+      return 'Note retrieval failed before an answer could be generated.';
+    default:
+      return reason ? `Retrieval status: ${reason.replaceAll('_', ' ')}` : '';
+  }
+}
+
 export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
   const {
     messages,
@@ -91,11 +113,11 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const showSourceCards = Boolean(
-    userSettings?.settings.ai_search.show_source_cards ?? true
-  ) && Boolean(workspaceSettings?.settings.ai_search.source_cards_default ?? true);
-  const showSimilarity = Boolean(userSettings?.settings.ai_search.show_similarity_scores ?? true);
-  const defaultTopK = userSettings?.settings.ai_search.default_top_k ?? 6;
-  const similarityThreshold = workspaceSettings?.settings.ai_search.min_note_similarity ?? 0.46;
+    userSettings?.settings?.ai_search?.show_source_cards ?? true
+  ) && Boolean(workspaceSettings?.settings?.ai_search?.source_cards_default ?? true);
+  const showSimilarity = Boolean(userSettings?.settings?.ai_search?.show_similarity_scores ?? true);
+  const defaultTopK = userSettings?.settings?.ai_search?.default_top_k ?? 6;
+  const similarityThreshold = workspaceSettings?.settings?.ai_search?.min_note_similarity ?? 0.46;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -345,7 +367,11 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
 
         {visibleMessages.map((message: Message, index: number) => {
           const isUser = message.role === 'user';
-          const needsWarningTone = !isUser && isNotEnoughEvidenceMessage(message.content);
+          const needsWarningTone = !isUser && (
+            isNotEnoughEvidenceMessage(message.content)
+            || message.answerStatus === 'partial'
+            || message.answerStatus === 'refusal'
+          );
 
           return (
             <div
@@ -395,6 +421,24 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
                 >
                   {message.content}
                 </p>
+
+                {!isUser && message.refusalReason && (
+                  <div
+                    style={{
+                      marginTop: 10,
+                      paddingTop: 9,
+                      borderTop: `1px solid ${TT.border}`,
+                      fontFamily: TT.fontMono,
+                      fontSize: 9,
+                      lineHeight: 1.5,
+                      letterSpacing: '0.04em',
+                      textTransform: 'uppercase',
+                      color: TT.textSubtle,
+                    }}
+                  >
+                    {refusalReasonLabel(message.refusalReason)}
+                  </div>
+                )}
 
                 {showSourceCards && message.sources && message.sources.length > 0 && (
                   <div
