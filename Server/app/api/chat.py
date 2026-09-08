@@ -326,7 +326,7 @@ Answer (cite sources inline):"""
 
 
 # ============================================================================
-# STEP 2.5: LLM Generation (Ollama → OpenAI fallback, fully async)
+# STEP 2.5: LLM Generation (global provider configuration, fully async)
 # ============================================================================
 
 async def _generate_with_ollama(messages: List[dict]) -> str:
@@ -337,10 +337,14 @@ async def _generate_with_ollama(messages: List[dict]) -> str:
     """
     from app.services.llm_service import OllamaClient
 
+    runtime = settings.ai_runtime
+    if not runtime.ollama.enabled:
+        raise RuntimeError("Ollama is disabled by the global AI configuration")
+
     ollama = OllamaClient(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.OLLAMA_MODEL,
-        timeout=settings.OLLAMA_TIMEOUT,
+        base_url=runtime.ollama.base_url,
+        model=runtime.llm.ollama_model,
+        timeout=runtime.ollama.timeout,
     )
     if not ollama.is_available():
         raise RuntimeError("Ollama not available")
@@ -351,8 +355,8 @@ async def _generate_with_ollama(messages: List[dict]) -> str:
         None,
         lambda: ollama.chat(  # use chat() not generate() for role-aware inference
             messages=messages,
-            temperature=0.3,
-            num_predict=1000,
+            temperature=runtime.llm.temperature,
+            num_predict=runtime.llm.max_tokens,
         ),
     )
     return response_text
@@ -360,25 +364,29 @@ async def _generate_with_ollama(messages: List[dict]) -> str:
 
 async def _stream_with_ollama(messages: List[dict]) -> AsyncGenerator[str, None]:
     """Stream chat chunks directly from Ollama for faster first-token latency."""
+    runtime = settings.ai_runtime
+    if not runtime.ollama.enabled:
+        raise RuntimeError("Ollama is disabled by the global AI configuration")
+
     payload = {
-        "model": settings.OLLAMA_MODEL,
+        "model": runtime.llm.ollama_model,
         "messages": messages,
         "stream": True,
         "keep_alive": "10m",
         "options": {
-            "temperature": 0.3,
-            "num_predict": min(getattr(settings, "LLM_MAX_TOKENS", 1000), 1000),
+            "temperature": runtime.llm.temperature,
+            "num_predict": runtime.llm.max_tokens,
         },
     }
 
     async with _OLLAMA_STREAM_SEMAPHORE:
-        connect_timeout = float(getattr(settings, "OLLAMA_CONNECT_TIMEOUT", 10) or 10)
-        read_timeout = float(settings.OLLAMA_TIMEOUT)
+        connect_timeout = float(runtime.ollama.connect_timeout)
+        read_timeout = float(runtime.ollama.read_timeout)
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout),
             headers=get_ollama_request_headers(),
         ) as client:
-            async with client.stream("POST", f"{settings.OLLAMA_BASE_URL}/api/chat", json=payload) as response:
+            async with client.stream("POST", f"{runtime.ollama.base_url}/api/chat", json=payload) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line:
@@ -391,97 +399,137 @@ async def _stream_with_ollama(messages: List[dict]) -> AsyncGenerator[str, None]
                         break
 
 
+async def _stream_with_openai(messages: List[dict]) -> AsyncGenerator[str, None]:
+    """Stream chat chunks from the globally configured OpenAI-compatible API."""
+    from openai import AsyncOpenAI
+
+    runtime = settings.ai_runtime
+    if not runtime.openai.api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    client_kwargs = {
+        "api_key": runtime.openai.api_key,
+        "timeout": runtime.openai.timeout,
+    }
+    if runtime.openai.base_url:
+        client_kwargs["base_url"] = runtime.openai.base_url
+
+    client = AsyncOpenAI(**client_kwargs)
+    stream = await client.chat.completions.create(
+        model=runtime.llm.openai_model,
+        messages=messages,
+        temperature=runtime.llm.temperature,
+        max_tokens=runtime.llm.max_tokens,
+        stream=True,
+    )
+    try:
+        async for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            content = getattr(choices[0].delta, "content", None) or ""
+            if content:
+                yield content
+    finally:
+        close = getattr(stream, "close", None)
+        if close:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+
 async def _generate_with_openai(messages: List[dict]) -> str:
     """
-    Fallback generation via OpenAI (async, non-blocking).
+    Generate via the globally configured OpenAI-compatible provider.
     Raises on any API error.
     """
     from openai import AsyncOpenAI  # async client — no run_in_executor needed
 
+    runtime = settings.ai_runtime
+    if not runtime.openai.api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
     client_kwargs = {
-        "api_key": settings.OPENAI_API_KEY,
-        "timeout": 30.0,
+        "api_key": runtime.openai.api_key,
+        "timeout": runtime.openai.timeout,
     }
-    if getattr(settings, "OPENAI_BASE_URL", None):
-        client_kwargs["base_url"] = settings.OPENAI_BASE_URL
+    if runtime.openai.base_url:
+        client_kwargs["base_url"] = runtime.openai.base_url
 
     client = AsyncOpenAI(**client_kwargs)
     response = await client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
+        model=runtime.llm.openai_model,
         messages=messages,
-        temperature=0.3,
-        max_tokens=1000,
+        temperature=runtime.llm.temperature,
+        max_tokens=runtime.llm.max_tokens,
     )
     return response.choices[0].message.content or ""
 
 
 async def generate_answer(messages: List[dict]) -> str:
     """
-    Generate an answer using Ollama, falling back to OpenAI on any failure.
-    Both backends run asynchronously without blocking the event loop.
+    Generate an answer using the globally configured provider order.
     """
-    started_at = time.perf_counter()
-    logger.info(
-        "ask_past_self_llm_generation_started",
-        extra={"message_count": len(messages), "backend": "ollama"},
-    )
-    try:
-        response = await _generate_with_ollama(messages)
-        logger.info(
-            "ask_past_self_llm_generation_complete",
-            extra={
-                "backend": "ollama",
-                "response_length": len(response),
-                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
-            },
-        )
-        return response
-    except Exception as exc:
-        logger.warning(
-            "ask_past_self_llm_backend_failed",
-            extra={
-                "backend": "ollama",
-                "error_type": type(exc).__name__,
-                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
-            },
-            exc_info=True,
-        )
+    runtime = settings.ai_runtime
+    providers = [runtime.llm.provider]
+    if runtime.llm.use_fallback:
+        providers.append("openai" if runtime.llm.provider == "ollama" else "ollama")
 
-    try:
-        fallback_started_at = time.perf_counter()
+    last_exc: Optional[Exception] = None
+    for provider in providers:
+        if provider == "ollama" and not runtime.ollama.enabled:
+            continue
+        if provider == "openai" and not runtime.openai.api_key:
+            continue
+
+        started_at = time.perf_counter()
         logger.info(
             "ask_past_self_llm_generation_started",
-            extra={"message_count": len(messages), "backend": "openai"},
+            extra={"message_count": len(messages), "backend": provider},
         )
-        if not getattr(settings, "OPENAI_API_KEY", None):
-            raise RuntimeError(
-                "Ollama is unavailable and no OPENAI_API_KEY is configured. "
-                "Start Ollama or configure an OpenAI-compatible LLM backend."
+        try:
+            response = (
+                await _generate_with_openai(messages)
+                if provider == "openai"
+                else await _generate_with_ollama(messages)
             )
-        response = await _generate_with_openai(messages)
-        logger.info(
-            "ask_past_self_llm_generation_complete",
-            extra={
-                "backend": "openai",
-                "response_length": len(response),
-                "elapsed_ms": round((time.perf_counter() - fallback_started_at) * 1000, 2),
-            },
-        )
-        return response
-    except Exception as exc:
-        logger.error(
-            "ask_past_self_llm_all_backends_failed",
-            extra={"backend": "openai", "error_type": type(exc).__name__},
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=(
-                "The AI backend is unavailable. Start Ollama (and pull the model) "
-                "or configure an OpenAI-compatible LLM backend via OPENAI_API_KEY / "
-                "OPENAI_BASE_URL before asking Ask Your Past Self."
-            ),
-        ) from exc
+            logger.info(
+                "ask_past_self_llm_generation_complete",
+                extra={
+                    "backend": provider,
+                    "response_length": len(response),
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                },
+            )
+            return response
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "ask_past_self_llm_backend_failed",
+                extra={
+                    "backend": provider,
+                    "error_type": type(exc).__name__,
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                },
+                exc_info=True,
+            )
+
+    logger.error(
+        "ask_past_self_llm_all_backends_failed",
+        extra={
+            "provider": runtime.llm.provider,
+            "fallback_enabled": runtime.llm.use_fallback,
+            "error_type": type(last_exc).__name__ if last_exc else "NotConfigured",
+        },
+        exc_info=last_exc is not None,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=(
+            "The configured AI backend is unavailable. Check the selected provider, "
+            "model, credentials, and base URL, then retry."
+        ),
+    ) from last_exc
 
 
 def _chunk_text_for_stream(text: str, chunk_size: int = 48) -> List[str]:
@@ -665,29 +713,42 @@ async def _rag_stream(
     full_response_parts: List[str] = []
     try:
         try:
-            async for token in _stream_with_ollama(messages):
+            runtime = settings.ai_runtime
+            stream_generator = (
+                _stream_with_openai(messages)
+                if runtime.llm.provider == "openai"
+                else _stream_with_ollama(messages)
+            )
+            async for token in stream_generator:
                 full_response_parts.append(token)
                 grounded_token = grounding_guard.feed(token)
                 display_token = citation_transformer.feed(grounded_token)
                 if display_token:
                     yield _sse_event("token", {"text": display_token, "correlationId": correlation_id})
-        except Exception as ollama_exc:
+        except Exception as stream_exc:
             logger.warning(
-                "ask_past_self_streaming_ollama_failed",
+                "ask_past_self_streaming_provider_failed",
                 extra={
                     "correlation_id": correlation_id,
                     "workspace_id": str(workspace_id),
-                    "error_type": type(ollama_exc).__name__,
+                    "provider": settings.ai_runtime.llm.provider,
+                    "error_type": type(stream_exc).__name__,
                 },
                 exc_info=True,
             )
-            full_response = await generate_answer(messages)
-            for chunk in _chunk_text_for_stream(full_response):
-                full_response_parts.append(chunk)
-                grounded_chunk = grounding_guard.feed(chunk)
-                display_chunk = citation_transformer.feed(grounded_chunk)
-                if display_chunk:
-                    yield _sse_event("token", {"text": display_chunk, "correlationId": correlation_id})
+            # Once a streaming backend has emitted text, a fallback call would
+            # return a second complete answer and append it to the first one.
+            # Keep the partial stream coherent and let grounding feedback below
+            # describe the degraded result. Fallback is safe only before any
+            # model output has reached this generator.
+            if not "".join(full_response_parts).strip():
+                full_response = await generate_answer(messages)
+                for chunk in _chunk_text_for_stream(full_response):
+                    full_response_parts.append(chunk)
+                    grounded_chunk = grounding_guard.feed(chunk)
+                    display_chunk = citation_transformer.feed(grounded_chunk)
+                    if display_chunk:
+                        yield _sse_event("token", {"text": display_chunk, "correlationId": correlation_id})
         grounded_tail = grounding_guard.flush()
         uncited_answer = not grounding_guard.released_any and REFUSAL_TEXT not in "".join(full_response_parts)
         if uncited_answer:
@@ -891,7 +952,7 @@ async def ask_past_self(
             yield _sse_event(
                 "error",
                 {
-                    "message": "Ask Your Past Self failed while streaming. Check that the LLM backend (Ollama/OpenAI) is available and retry.",
+                    "message": "Ask Your Past Self failed while streaming. Check the configured AI provider and retry.",
                     "correlationId": correlation_id,
                 },
             )
