@@ -341,7 +341,7 @@ def build_google_auth_success_redirect(token_response: TokenResponse, redirect_p
             "redirect": sanitize_frontend_redirect_path(redirect_path),
         }
     )
-    return f"{frontend_url}/auth/google/callback#{fragment}"
+    return f"{frontend_url}/auth/callback#{fragment}"
 
 
 def build_google_auth_error_redirect(message: str, redirect_path: Optional[str] = None) -> str:
