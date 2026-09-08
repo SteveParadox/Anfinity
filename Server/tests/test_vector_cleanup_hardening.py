@@ -91,6 +91,12 @@ class _FakeWorkerVectorDB:
         return True
 
 
+class _PartiallyFailingWorkerVectorDB(_FakeWorkerVectorDB):
+    def upsert_vectors(self, collection_name, points):
+        self.upserts.append((collection_name, points))
+        return len(self.upserts) == 1
+
+
 class _FakeWorkerEmbedder:
     def __init__(self, provider=None):
         self.provider = provider
@@ -102,6 +108,10 @@ class _FakeWorkerEmbedder:
 
 
 class VectorCleanupHardeningTests(unittest.TestCase):
+    def test_worker_retry_countdown_is_capped(self):
+        self.assertEqual(worker._retry_countdown(0), worker.TASK_RETRY_BASE_SECONDS)
+        self.assertEqual(worker._retry_countdown(99), worker.TASK_RETRY_MAX_SECONDS)
+
     def test_vector_db_delete_points_reconnects_after_transient_connection_error(self):
         client = VectorDBClient(require_qdrant=False, embedding_dim=128)
 
@@ -201,6 +211,59 @@ class VectorCleanupHardeningTests(unittest.TestCase):
         self.assertIn("Failed to persist embedding metadata", str(exc.exception))
         self.assertEqual(fake_db.rollback_count, 1)
         self.assertEqual(len(fake_vector_db.upserts), 1)
+        self.assertEqual(
+            fake_vector_db.deletes,
+            [(str(document.workspace_id), [str(db_chunks[0].id)])],
+        )
+
+    def test_worker_index_vectors_cleans_partial_batch_upsert_failure(self):
+        fake_db = _FakeWorkerDB()
+        fake_vector_db = _PartiallyFailingWorkerVectorDB()
+        document = SimpleNamespace(
+            workspace_id=uuid4(),
+            title="Partial Upsert Cleanup",
+            source_type=SourceType.UPLOAD,
+        )
+        chunks = [
+            SimpleNamespace(
+                text="Chunk one",
+                index=0,
+                token_count=2,
+                context_before=None,
+                context_after=None,
+                metadata={},
+            ),
+            SimpleNamespace(
+                text="Chunk two",
+                index=1,
+                token_count=2,
+                context_before=None,
+                context_after=None,
+                metadata={},
+            ),
+        ]
+        db_chunks = [
+            SimpleNamespace(id=uuid4(), chunk_status=None),
+            SimpleNamespace(id=uuid4(), chunk_status=None),
+        ]
+
+        with (
+            mock.patch.object(worker, "Embedder", _FakeWorkerEmbedder),
+            mock.patch.object(worker, "get_vector_db_client", return_value=fake_vector_db),
+            mock.patch.object(worker, "VECTOR_UPSERT_BATCH_SIZE", 1),
+        ):
+            with self.assertRaises(RuntimeError) as exc:
+                worker._index_vectors(
+                    fake_db,
+                    document,
+                    "doc-1",
+                    chunks,
+                    db_chunks,
+                    {},
+                )
+
+        self.assertIn("Vector DB upsert failed", str(exc.exception))
+        self.assertEqual(len(fake_vector_db.upserts), 2)
         self.assertEqual(
             fake_vector_db.deletes,
             [(str(document.workspace_id), [str(db_chunks[0].id)])],

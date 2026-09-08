@@ -12,11 +12,11 @@ from app.services.integrations.base import ReauthorizationRequiredError
 from app.services.integrations.calendar import CalendarMeeting, build_meeting_note_content, calendar_match_is_confident, find_best_note_match, meeting_payload
 from app.services.integrations.gmail import extract_mime_body, format_email_note, parse_gmail_message
 from app.services.integrations.notion import (
-    COGNIFLOW_ID_PROPERTY,
+    ANFINITY_ID_PROPERTY,
     build_page_properties,
     content_to_notion_blocks,
-    extract_cogniflow_id,
-    normalize_cogniflow_id,
+    extract_anfinity_id,
+    normalize_anfinity_id,
     split_text_for_notion,
 )
 from app.services.integrations.oauth import OAuthState, decode_oauth_state, encode_oauth_state, refresh_connector_token
@@ -96,24 +96,24 @@ def test_slack_message_payload_uses_workspace_default_channel() -> None:
     assert message.buttons[0].value == "note-1"
 
 
-def test_notion_cogniflow_id_and_2000_character_chunking() -> None:
+def test_notion_anfinity_id_and_2000_character_chunking() -> None:
     note_id = str(uuid4())
     chunks = split_text_for_notion("x" * 4500)
     assert [len(chunk) for chunk in chunks] == [2000, 2000, 500]
 
     properties = build_page_properties("Decision log", note_id)
-    assert COGNIFLOW_ID_PROPERTY in properties
-    assert properties[COGNIFLOW_ID_PROPERTY]["rich_text"][0]["text"]["content"] == note_id
+    assert ANFINITY_ID_PROPERTY in properties
+    assert properties[ANFINITY_ID_PROPERTY]["rich_text"][0]["text"]["content"] == note_id
 
     page = {
         "properties": {
-            COGNIFLOW_ID_PROPERTY: {
+            ANFINITY_ID_PROPERTY: {
                 "rich_text": [{"plain_text": note_id, "text": {"content": note_id}}]
             }
         }
     }
-    assert extract_cogniflow_id(page) == note_id
-    assert normalize_cogniflow_id("not-a-uuid") is None
+    assert extract_anfinity_id(page) == note_id
+    assert normalize_anfinity_id("not-a-uuid") is None
 
     blocks = content_to_notion_blocks("A" * 4501)
     assert len(blocks) == 3

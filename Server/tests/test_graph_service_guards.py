@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 os.environ["DEBUG"] = "false"
 
 from app.services.graph_service import GraphService
+from app.database.models import GraphEdgeType, GraphNodeType
 
 
 def _make_node(node_id: str, label: str):
@@ -30,6 +31,27 @@ class _RecordingAsyncDB:
     async def execute(self, statement):
         self.statements.append(statement)
         return None
+
+
+class _FakeScalarResult:
+    def __init__(self, items):
+        self.items = items
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self.items
+
+
+class _SequencedGraphDB:
+    def __init__(self, results):
+        self.results = list(results)
+
+    async def execute(self, _statement):
+        if not self.results:
+            raise AssertionError("Unexpected graph query")
+        return self.results.pop(0)
 
 
 class GraphServiceGuardTests(unittest.TestCase):
@@ -108,6 +130,71 @@ class GraphServiceGuardTests(unittest.TestCase):
 
         self.assertIn("source_node_id", related_link_delete_sql)
         self.assertIn("target_node_id", related_link_delete_sql)
+
+    def test_build_graph_data_applies_default_response_limits(self) -> None:
+        service = GraphService()
+        workspace_id = uuid4()
+        node_one = SimpleNamespace(
+            id=uuid4(),
+            label="Alpha",
+            node_type=GraphNodeType.NOTE,
+            external_id=str(uuid4()),
+            weight=2.0,
+            node_metadata={},
+        )
+        node_two = SimpleNamespace(
+            id=uuid4(),
+            label="Bravo",
+            node_type=GraphNodeType.NOTE,
+            external_id=str(uuid4()),
+            weight=1.0,
+            node_metadata={},
+        )
+        edge_one = SimpleNamespace(
+            id=uuid4(),
+            source_node_id=node_one.id,
+            target_node_id=node_one.id,
+            edge_type=GraphEdgeType.NOTE_RELATED_NOTE,
+            weight=0.9,
+            edge_metadata={},
+        )
+        edge_two = SimpleNamespace(
+            id=uuid4(),
+            source_node_id=node_one.id,
+            target_node_id=node_one.id,
+            edge_type=GraphEdgeType.NOTE_RELATED_NOTE,
+            weight=0.8,
+            edge_metadata={},
+        )
+        fake_db = _SequencedGraphDB(
+            [
+                _FakeScalarResult([node_one, node_two]),
+                _FakeScalarResult([edge_one, edge_two]),
+            ]
+        )
+
+        async def _noop_seed(_db, _workspace_id):
+            return None
+
+        async def _empty_cluster_payload(_db, _workspace_id, _node_ids):
+            return {"clusters": [], "node_metadata": {}}
+
+        service.ensure_workspace_graph_seeded = _noop_seed
+        service._build_cluster_payload = _empty_cluster_payload
+
+        graph = asyncio.run(
+            service.build_graph_data(
+                db=fake_db,
+                workspace_id=workspace_id,
+                filters={"node_limit": 1, "edge_limit": 1},
+            )
+        )
+
+        self.assertEqual(len(graph["nodes"]), 1)
+        self.assertEqual(len(graph["edges"]), 1)
+        self.assertTrue(graph["stats"]["limited"])
+        self.assertEqual(graph["stats"]["node_limit"], 1)
+        self.assertEqual(graph["stats"]["edge_limit"], 1)
 
 
 if __name__ == "__main__":
