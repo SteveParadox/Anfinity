@@ -190,8 +190,8 @@ export function IntegrationsView() {
   const [runningInlineSyncId, setRunningInlineSyncId] = useState<string | null>(null);
 
   const deferredQuery = useDeferredValue(searchQuery.trim().toLowerCase());
-  const autoSyncEnabled = Boolean(workspaceSettings?.settings.integrations.auto_sync_enabled ?? true);
-  const syncFrequency = workspaceSettings?.settings.integrations.sync_frequency ?? 'hourly';
+  const autoSyncEnabled = Boolean(workspaceSettings?.settings?.integrations?.auto_sync_enabled ?? true);
+  const syncFrequency = workspaceSettings?.settings?.integrations?.sync_frequency ?? 'hourly';
   const syncPolicySummary = describeIntegrationSyncPolicy(workspaceSettings?.settings);
 
   const refresh = async () => {
