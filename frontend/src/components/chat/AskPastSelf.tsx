@@ -85,7 +85,7 @@ function refusalReasonLabel(reason: string | undefined): string {
       return 'No accessible notes matched this question.';
     case 'weak_or_indirect_note_evidence':
     case 'limited_note_evidence':
-      return 'Only limited note evidence matched this question — the answer below may be incomplete.';
+      return 'Only limited note evidence matched this question - the answer below may be incomplete.';
     case 'no_valid_citation':
       return 'Retrieved notes were related, but the answer model did not cite them.';
     case 'general_knowledge_not_supported_by_notes':
@@ -128,7 +128,7 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
   async function handleSendMessage() {
     if (!workspaceId || !input.trim() || loading) return;
 
-    const userMessage = input;
+    const userMessage = input.trim();
     setInput('');
     await chat(userMessage, workspaceId, {
       topK: defaultTopK,
@@ -359,7 +359,7 @@ export function AskPastSelf({ workspaceId, onClose }: AskPastSelfProps) {
                       e.currentTarget.style.transform = 'translateY(0)';
                     }}
                   >
-                    “{example}”
+                    "{example}"
                   </button>
                 ))}
               </div>

@@ -55,13 +55,44 @@ type ChatStateMessage = {
 const STREAM_READ_TIMEOUT_MS = 180_000;
 const STREAM_CONNECT_TIMEOUT_MS = 30_000;
 
-async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+function createLinkedAbortController(signal?: AbortSignal): {
+  controller: AbortController;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+
+  if (!signal) {
+    return { controller, cleanup: () => undefined };
+  }
+
+  const forwardAbort = () => controller.abort();
+  if (signal.aborted) {
+    controller.abort();
+  } else {
+    signal.addEventListener('abort', forwardAbort, { once: true });
+  }
+
+  return {
+    controller,
+    cleanup: () => signal.removeEventListener('abort', forwardAbort),
+  };
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+  onTimeout?: () => void,
+): Promise<T> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error(message)), ms);
+        timeoutId = setTimeout(() => {
+          onTimeout?.();
+          reject(new Error(message));
+        }, ms);
       }),
     ]);
   } finally {
@@ -73,6 +104,7 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 
 async function readStreamChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
+  onTimeout?: () => void,
 ): Promise<ReadableStreamReadResult<Uint8Array>> {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -80,6 +112,7 @@ async function readStreamChunk(
       reader.read(),
       new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => {
+          onTimeout?.();
           void reader.cancel();
           reject(new Error('Ask Your Past Self timed out while waiting for the answer.'));
         }, STREAM_READ_TIMEOUT_MS);
@@ -136,7 +169,6 @@ export function parseSseEvents(buffer: string): {
 export async function* streamAskPastSelf(
   options: AskPastSelfOptions
 ): AsyncGenerator<ChatStreamMessage> {
-  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8080';
   const payload = {
     workspace_id: options.workspaceId,
     query: options.query,
@@ -145,15 +177,18 @@ export async function* streamAskPastSelf(
     similarity_threshold: options.similarityThreshold ?? 0.3,
   };
 
+  const { controller, cleanup } = createLinkedAbortController(options.signal);
+
   try {
     const response = await withTimeout(
       api.stream('/chat/ask', {
         method: 'POST',
         body: JSON.stringify(payload),
-        signal: options.signal,
+        signal: controller.signal,
       }),
       STREAM_CONNECT_TIMEOUT_MS,
-      'Ask Your Past Self timed out while connecting to the server.'
+      'Ask Your Past Self timed out while connecting to the server.',
+      () => controller.abort(),
     );
 
     if (!response.ok) {
@@ -169,7 +204,7 @@ export async function* streamAskPastSelf(
     let buffer = '';
 
     while (true) {
-      const { done, value } = await readStreamChunk(reader);
+      const { done, value } = await readStreamChunk(reader, () => controller.abort());
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
 
       const parsed = parseSseEvents(buffer);
@@ -199,6 +234,8 @@ export async function* streamAskPastSelf(
       type: 'error',
       message: error instanceof Error ? error.message : 'Unknown error',
     };
+  } finally {
+    cleanup();
   }
 }
 
@@ -219,21 +256,27 @@ export async function askPastSelfSync(
     similarity_threshold: options.similarityThreshold ?? 0.3,
   };
 
-  const response = await withTimeout(
-    api.stream('/chat/ask/sync', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-      signal: options.signal,
-    }),
-    STREAM_CONNECT_TIMEOUT_MS,
-    'Ask Your Past Self timed out while connecting to the server.'
-  );
+  const { controller, cleanup } = createLinkedAbortController(options.signal);
+  try {
+    const response = await withTimeout(
+      api.stream('/chat/ask/sync', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }),
+      STREAM_CONNECT_TIMEOUT_MS,
+      'Ask Your Past Self timed out while connecting to the server.',
+      () => controller.abort(),
+    );
 
-  if (!response.ok) {
-    throw await api.errorFromResponse(response);
+    if (!response.ok) {
+      throw await api.errorFromResponse(response);
+    }
+
+    return response.json();
+  } finally {
+    cleanup();
   }
-
-  return response.json();
 }
 
 export function useAskPastSelf(workspaceId?: string) {
@@ -244,17 +287,29 @@ export function useAskPastSelf(workspaceId?: string) {
 
   const messagesRef = React.useRef<ChatStateMessage[]>([]);
   const abortRef = React.useRef<AbortController | null>(null);
+  const loadingRef = React.useRef(false);
+  const requestIdRef = React.useRef(0);
 
   React.useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
   React.useEffect(() => {
+    requestIdRef.current += 1;
     abortRef.current?.abort();
+    abortRef.current = null;
+    loadingRef.current = false;
     setMessages([]);
     setStreamingSources([]);
     setFollowUpQuestions([]);
     setLoading(false);
+
+    return () => {
+      requestIdRef.current += 1;
+      abortRef.current?.abort();
+      abortRef.current = null;
+      loadingRef.current = false;
+    };
   }, [workspaceId]);
 
   const replaceLastAssistant = React.useCallback(
@@ -284,7 +339,7 @@ export function useAskPastSelf(workspaceId?: string) {
 
   const chat = React.useCallback(
     async (query: string, workspaceId: string, overrides?: Partial<Pick<AskPastSelfOptions, 'topK' | 'similarityThreshold'>>) => {
-      if (loading) {
+      if (loadingRef.current) {
         return;
       }
 
@@ -294,10 +349,17 @@ export function useAskPastSelf(workspaceId?: string) {
       }));
 
       const controller = new AbortController();
+      const requestId = ++requestIdRef.current;
       abortRef.current = controller;
+      loadingRef.current = true;
 
       let assistantContent = '';
       let sources: RAGSource[] = [];
+      let receivedDone = false;
+
+      const isCurrentRequest = () => (
+        requestIdRef.current === requestId && abortRef.current === controller
+      );
 
       setLoading(true);
       setStreamingSources([]);
@@ -317,6 +379,10 @@ export function useAskPastSelf(workspaceId?: string) {
           similarityThreshold: overrides?.similarityThreshold,
           signal: controller.signal,
         })) {
+          if (!isCurrentRequest()) {
+            return;
+          }
+
           if (chunk.type === 'sources' && chunk.sources) {
             sources = chunk.sources;
             setStreamingSources(sources);
@@ -339,6 +405,7 @@ export function useAskPastSelf(workspaceId?: string) {
           }
 
           if (chunk.type === 'done') {
+            receivedDone = true;
             setFollowUpQuestions(chunk.followUpQuestions || []);
             replaceLastAssistant(assistantContent, sources, {
               answerStatus: chunk.answerStatus,
@@ -353,8 +420,16 @@ export function useAskPastSelf(workspaceId?: string) {
           }
         }
 
+        if (!receivedDone) {
+          throw new Error('Ask Your Past Self stream ended before the answer was complete.');
+        }
+
         replaceLastAssistant(assistantContent, sources);
       } catch (error) {
+        if (!isCurrentRequest()) {
+          return;
+        }
+
         if ((error as Error)?.name === 'AbortError') {
           setMessages((prev) => prev.filter((message, index) => {
             const isLast = index === prev.length - 1;
@@ -371,16 +446,22 @@ export function useAskPastSelf(workspaceId?: string) {
         const message = error instanceof Error ? error.message : 'Unknown error';
         replaceLastAssistant(`Error: ${message}`, []);
       } finally {
-        abortRef.current = null;
-        setLoading(false);
-        setStreamingSources([]);
+        if (isCurrentRequest()) {
+          abortRef.current = null;
+          loadingRef.current = false;
+          setLoading(false);
+          setStreamingSources([]);
+        }
       }
     },
-    [loading, replaceLastAssistant]
+    [replaceLastAssistant]
   );
 
   const clearChat = React.useCallback(() => {
+    requestIdRef.current += 1;
     abortRef.current?.abort();
+    abortRef.current = null;
+    loadingRef.current = false;
     setMessages([]);
     setStreamingSources([]);
     setFollowUpQuestions([]);

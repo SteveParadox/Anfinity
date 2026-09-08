@@ -101,4 +101,29 @@ describe('parseSseEvents', () => {
     expect(payload.similarity_threshold).toBe(0.62);
     expect(events[0]).toMatchObject({ type: 'done' });
   });
+
+  it('propagates caller cancellation to the underlying request', async () => {
+    const { streamAskPastSelf } = await loadParser();
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => (
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        }, { once: true });
+      })
+    ));
+    const controller = new AbortController();
+    const iterator = streamAskPastSelf({
+      workspaceId: 'workspace-1',
+      query: 'What did I write?',
+      signal: controller.signal,
+    })[Symbol.asyncIterator]();
+
+    const nextEvent = iterator.next();
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(nextEvent).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock.mock.calls[0][1]?.signal).toBeDefined();
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+  });
 });
