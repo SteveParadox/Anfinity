@@ -47,7 +47,12 @@ import type {
   WorkspacePermissionSection,
 } from '@/types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
+export function normalizeApiBaseUrl(value: string): string {
+  const normalized = value.trim().replace(/\/+$/, '');
+  return normalized || 'http://localhost:8080';
+}
+
+const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_URL || 'http://localhost:8080');
 const API_TIMEOUT = parseInt(import.meta.env.VITE_API_TIMEOUT || '30000'); // 30 seconds
 const MAX_RETRIES = parseInt(import.meta.env.VITE_API_MAX_RETRIES || '3');
 const RETRY_DELAY = parseInt(import.meta.env.VITE_API_RETRY_DELAY || '1000'); // ms
@@ -517,7 +522,7 @@ class ApiClient {
   private responseCache: Map<string, { value: unknown; expiresAt: number }> = new Map();
 
   constructor(baseUrl: string = API_BASE_URL) {
-    this.baseUrl = baseUrl;
+    this.baseUrl = normalizeApiBaseUrl(baseUrl);
     this.token = localStorage.getItem('token');
     this.logger = new RequestLogger();
   }

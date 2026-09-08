@@ -6,7 +6,9 @@
 import type { Event, EventListener, EventFilter } from '../types/events';
 import { EventType } from '../types/events';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://localhost:8000')
+  .trim()
+  .replace(/\/+$/, '');
 const WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
 const RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_ATTEMPTS = 10;
