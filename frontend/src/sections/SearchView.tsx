@@ -257,10 +257,10 @@ export function SearchView() {
   const workspaceId = authContext?.currentWorkspaceId;
   const hasPermission = authContext?.hasPermission ?? (() => false);
   const canUseSearch = Boolean(workspaceId && hasPermission(workspaceId, 'search', 'view'));
-  const { user: productSettings } = useProductSettings(workspaceId, Boolean(workspaceId));
-  const smartHighlightsEnabled = productSettings?.settings.ai_search.smart_highlights ?? true;
-  const showSimilarityEvidence = productSettings?.settings.ai_search.show_similarity_scores ?? true;
-  const defaultSearchTopK = clampSearchTopK(productSettings?.settings.ai_search.default_top_k ?? 6);
+const { user: productSettings } = useProductSettings(workspaceId, Boolean(workspaceId));
+  const smartHighlightsEnabled = Boolean(productSettings?.settings?.ai_search?.smart_highlights ?? true);
+  const showSimilarityEvidence = Boolean(productSettings?.settings?.ai_search?.show_similarity_scores ?? true);
+  const defaultSearchTopK = clampSearchTopK(productSettings?.settings?.ai_search?.default_top_k ?? 6);
 
   const getResultFeedbackDraft = (resultId: string): FeedbackDraftState =>
     resultFeedbackDrafts[resultId] ?? createFeedbackDraftState();

@@ -21,7 +21,7 @@ export function approvalPriorityOrDefault(
   priority: ApprovalWorkflowPriority | undefined,
   workspaceSettings?: ProductWorkspaceSettings | null,
 ): ApprovalWorkflowPriority {
-  return priority || workspaceSettings?.approvals.default_priority || 'normal';
+  return priority || workspaceSettings?.approvals?.default_priority || 'normal';
 }
 
 export function describeIntegrationSyncPolicy(workspaceSettings?: ProductWorkspaceSettings | null): string {

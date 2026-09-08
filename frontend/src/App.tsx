@@ -192,8 +192,8 @@ function App() {
   const { user: shellSettings, updateUserSettings } = useProductSettings(currentWorkspaceId, Boolean(contextUser));
 
   const themeChoice = useMemo<ThemeChoice | undefined>(
-    () => parseThemeChoice(shellSettings?.settings.appearance?.theme),
-    [shellSettings?.settings.appearance?.theme],
+    () => parseThemeChoice(shellSettings?.settings?.appearance?.theme),
+    [shellSettings?.settings?.appearance?.theme],
   );
 
   const windowWidth = useWindowWidth();
@@ -222,7 +222,7 @@ function App() {
   }, [isMobile]);
 
   useEffect(() => {
-    const density = shellSettings?.settings.appearance?.density;
+    const density = shellSettings?.settings?.appearance?.density;
     const root = document.documentElement;
 
     if (density) {
@@ -230,7 +230,7 @@ function App() {
     } else {
       delete root.dataset.density;
     }
-  }, [shellSettings?.settings.appearance?.density]);
+  }, [shellSettings?.settings?.appearance?.density]);
 
   useEffect(() => {
     if (!contextUser || !currentWorkspaceId) {
@@ -266,7 +266,7 @@ function App() {
   }, [contextUser, currentWorkspaceId]);
 
   const handleThemeChoiceChange = useCallback((choice: ThemeChoice) => {
-    const currentAppearance = shellSettings?.settings.appearance ?? {};
+    const currentAppearance = shellSettings?.settings?.appearance ?? {};
 
     void updateUserSettings({
       appearance: {
@@ -276,7 +276,7 @@ function App() {
     }).catch((error) => {
       console.error('Failed to save theme preference', error);
     });
-  }, [shellSettings?.settings.appearance, updateUserSettings]);
+  }, [shellSettings?.settings?.appearance, updateUserSettings]);
 
   const handleLogout = useCallback(async () => {
     try {
@@ -371,7 +371,9 @@ function App() {
     if (!currentWorkspaceId) return 'No workspace selected';
     if (shellStatsLoading && !shellStats) return 'Loading workspace metrics';
     if (shellStatsError) return 'Workspace metrics unavailable';
-    return `${shellStats?.notes.total ?? 0} notes | ${shellStats?.documents.total ?? 0} docs | ${shellStats?.vectors ?? 0} vectors`;
+    return shellStats
+      ? `${shellStats.notes?.total ?? 0} notes | ${shellStats.documents?.total ?? 0} docs | ${shellStats.vectors ?? 0} vectors`
+      : '';
   }, [currentWorkspaceId, shellStats, shellStatsError, shellStatsLoading]);
 
   // ── Auth loading guard ──────────────────────────────────────────────────

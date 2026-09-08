@@ -841,13 +841,13 @@ export function NotesView({
       ? hasPermission(selectedNote.workspaceId, 'notes', 'update')
       : selectedNote?.userId === user?.id
   );
-  const assistantTipsEnabled = Boolean(userSettings?.settings.onboarding.assistant_tips ?? true);
-  const allowNoteInvites = Boolean(userSettings?.settings.collaboration.allow_note_invites ?? true);
-  const showRealtimePresence = Boolean(userSettings?.settings.collaboration.presence_visible ?? true);
-  const showCollaboratorCursors = Boolean(userSettings?.settings.collaboration.show_collaborator_cursors ?? true);
-  const workspaceCommentThreadsEnabled = Boolean(workspaceSettings?.settings.collaboration.comment_threads_enabled ?? true);
-  const workspaceMentionsEnabled = Boolean(workspaceSettings?.settings.collaboration.mentions_enabled ?? true);
-  const defaultNoteVisibility = workspaceSettings?.settings.notes.default_visibility ?? 'private';
+const assistantTipsEnabled = Boolean(userSettings?.settings?.onboarding?.assistant_tips ?? true);
+  const allowNoteInvites = Boolean(userSettings?.settings?.collaboration?.allow_note_invites ?? true);
+  const showRealtimePresence = Boolean(userSettings?.settings?.collaboration?.presence_visible ?? true);
+  const showCollaboratorCursors = Boolean(userSettings?.settings?.collaboration?.show_collaborator_cursors ?? true);
+  const workspaceCommentThreadsEnabled = Boolean(workspaceSettings?.settings?.collaboration?.comment_threads_enabled ?? true);
+  const workspaceMentionsEnabled = Boolean(workspaceSettings?.settings?.collaboration?.mentions_enabled ?? true);
+  const defaultNoteVisibility = workspaceSettings?.settings?.notes?.default_visibility ?? 'private';
   const collaborationToken = api.getToken();
   const {
     guardedFetch,
