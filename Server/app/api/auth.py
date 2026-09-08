@@ -338,17 +338,25 @@ def build_google_auth_success_redirect(token_response: TokenResponse, redirect_p
     fragment = urlencode(
         {
             "access_token": token_response.access_token,
-            "token_type": token_response.token_type,
-            "expires_in": str(token_response.expires_in),
             "redirect": sanitize_frontend_redirect_path(redirect_path),
         }
     )
     return f"{frontend_url}/auth/google/callback#{fragment}"
 
 
-def build_google_auth_error_redirect(message: str) -> str:
+def build_google_auth_error_redirect(message: str, redirect_path: Optional[str] = None) -> str:
     frontend_url = settings.FRONTEND_URL.rstrip("/")
-    return f"{frontend_url}/login?{urlencode({'oauth_error': message})}"
+    params = {"oauth_error": message}
+    if redirect_path:
+        params["redirect"] = sanitize_frontend_redirect_path(redirect_path)
+    return f"{frontend_url}/login?{urlencode(params)}"
+
+
+def google_authorization_error_message(error: Optional[str]) -> str:
+    """Convert provider cancellation/errors into safe, user-facing copy."""
+    if error == "access_denied":
+        return "Google sign-in was cancelled."
+    return "Google sign-in could not be completed. Please try again."
 
 
 def _safe_google_response_json(response: httpx.Response) -> Mapping[str, Any]:
@@ -430,13 +438,31 @@ async def start_google_login(
 async def complete_google_login(
     request: Request,
     background_tasks: BackgroundTasks,
-    code: str,
-    state: str,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Complete Google sign-in, issue the app JWT, and return to the frontend."""
+    redirect_path = DEFAULT_AUTH_REDIRECT_PATH
     try:
+        if error:
+            if state:
+                try:
+                    redirect_path = decode_google_auth_state(state).redirect_path
+                except HTTPException:
+                    pass
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=google_authorization_error_message(error),
+            )
+        if not state:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google auth state is missing")
+        if not code:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google authorization code is missing")
+
         auth_state = decode_google_auth_state(state)
+        redirect_path = auth_state.redirect_path
         redirect_uri = build_google_auth_redirect_uri(request)
         token_payload = await exchange_google_auth_code(code, redirect_uri)
         access_token = str(token_payload.get("access_token") or "")
@@ -461,7 +487,7 @@ async def complete_google_login(
         token_response = TokenResponse(
             access_token=app_access_token,
             token_type="bearer",
-            expires_in=3600 * 24,
+            expires_in=settings.JWT_EXPIRATION_HOURS * 3600,
             user={
                 "id": str(user.id),
                 "email": user.email,
@@ -476,14 +502,14 @@ async def complete_google_login(
     except HTTPException as exc:
         await db.rollback()
         return RedirectResponse(
-            build_google_auth_error_redirect(str(exc.detail)),
+            build_google_auth_error_redirect(str(exc.detail), redirect_path),
             status_code=status.HTTP_302_FOUND,
         )
     except Exception:
         await db.rollback()
         logger.exception("Google login failed")
         return RedirectResponse(
-            build_google_auth_error_redirect("Google login failed"),
+            build_google_auth_error_redirect("Google login failed", redirect_path),
             status_code=status.HTTP_302_FOUND,
         )
 
@@ -582,7 +608,7 @@ async def register(
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
-        expires_in=3600 * 24,  # 24 hours
+        expires_in=settings.JWT_EXPIRATION_HOURS * 3600,
         user={
             "id": str(user.id),
             "email": user.email,
@@ -651,7 +677,7 @@ async def login(
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
-        expires_in=3600 * 24,  # 24 hours
+        expires_in=settings.JWT_EXPIRATION_HOURS * 3600,
         user={
             "id": str(user.id),
             "email": user.email,
@@ -687,7 +713,7 @@ async def refresh(
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
-        expires_in=3600 * 24,  # 24 hours
+        expires_in=settings.JWT_EXPIRATION_HOURS * 3600,
         user={
             "id": str(current_user.id),
             "email": current_user.email,

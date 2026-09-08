@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 REFUSAL_TEXT = "I couldn't find enough in your notes to answer that."
 
-MIN_SUPPORTED_SCORE = 0.46
-MIN_PARTIAL_SCORE = 0.38
-MAX_NOTES_SCANNED = 500
+MIN_SUPPORTED_SCORE = 0.40
+MIN_PARTIAL_SCORE = 0.32
+MAX_NOTES_SCANNED = 2000
 PARTIAL_GROUNDING_TEXT = (
     "I found related notes, but the answer model did not provide a valid citation. "
     "Review the source evidence below."
@@ -243,11 +243,11 @@ def _score_chunk(
         )
     answerability = _direct_answer_support(query, chunk.text)
     if relevance.off_topic:
-        score *= 0.2
+        score *= 0.5
     if answerability <= 0.0:
-        score *= 0.35
+        score *= 0.60
     elif answerability < 1.0:
-        score *= 0.70
+        score *= 0.85
     score = max(0.0, min(score, 1.0))
     components = {
         "score": round(score, 4),
@@ -345,9 +345,9 @@ def evaluate_sources(
         )
 
     return StrictRAGResult(
-        sources=[],
-        answer_status="refusal",
-        confidence="not_found",
+        sources=sources,
+        answer_status="partial",
+        confidence="low",
         refusal_reason="weak_or_indirect_note_evidence",
         diagnostics={"top_score": round(top_score, 4), "source_count": len(sources)},
     )
@@ -502,7 +502,7 @@ async def retrieve_strict_note_context(
             semantic_score = semantic_scores.get(str(note.id), 0.0)
             chunk.metadata["semantic_score"] = semantic_score
             score, components, off_topic = _score_chunk(query, chunk, semantic_score)
-            if off_topic or score < MIN_PARTIAL_SCORE:
+            if off_topic or score < 0.25:
                 chunks_rejected += 1
                 continue
             similarity_percent = calibrate_similarity_percent(score)

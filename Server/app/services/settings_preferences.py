@@ -47,9 +47,10 @@ USER_SETTINGS_DEFAULTS: dict[str, Any] = {
 WORKSPACE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "ai_search": {
         "ask_past_self_enabled": True,
-        # Minimum blended semantic/lexical score for note retrieval (0.38-0.85).
-        # 0.46 keeps the supported gate aligned with the Ask Your Past Self UI.
-        "min_note_similarity": 0.46,
+        # Minimum blended semantic/lexical score for note retrieval (0.35-0.85).
+        # 0.38 keeps the supported gate reachable for real paraphrase queries while
+        # still filtering out weak/off-topic matches.
+        "min_note_similarity": 0.38,
         "source_cards_default": True,
     },
     "notes": {
@@ -94,7 +95,7 @@ _ENUMS: dict[tuple[str, ...], set[str]] = {
 }
 
 _RANGES: dict[tuple[str, ...], tuple[float, float]] = {
-    ("ai_search", "min_note_similarity"): (0.38, 0.85),
+    ("ai_search", "min_note_similarity"): (0.35, 0.85),
     ("ai_search", "default_top_k"): (3, 12),
     ("approvals", "default_due_days"): (1, 30),
 }

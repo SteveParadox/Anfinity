@@ -217,7 +217,12 @@ async def retrieve_context(
     started_at = time.perf_counter()
     try:
         workspace_min_score = await get_workspace_ai_min_similarity(db, workspace_id)
-        min_score = max(float(threshold or 0.0), workspace_min_score, MIN_SUPPORTED_SCORE)
+        min_score = max(float(threshold or 0.0), workspace_min_score)
+        # Do not let a user-supplied threshold, workspace default, or constant floor
+        # push the gate so high that only near-perfect lexical matches pass. Cap the
+        # effective gate at a reachable level so paraphrase/semantic matches return
+        # "partial" evidence instead of a hard refusal.
+        min_score = min(max(min_score, MIN_SUPPORTED_SCORE * 0.80), 0.55)
         logger.info(
             "ask_past_self_context_retrieval_started",
             extra={
@@ -367,8 +372,10 @@ async def _stream_with_ollama(messages: List[dict]) -> AsyncGenerator[str, None]
     }
 
     async with _OLLAMA_STREAM_SEMAPHORE:
+        connect_timeout = float(getattr(settings, "OLLAMA_CONNECT_TIMEOUT", 10) or 10)
+        read_timeout = float(settings.OLLAMA_TIMEOUT)
         async with httpx.AsyncClient(
-            timeout=float(settings.OLLAMA_TIMEOUT),
+            timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout),
             headers=get_ollama_request_headers(),
         ) as client:
             async with client.stream("POST", f"{settings.OLLAMA_BASE_URL}/api/chat", json=payload) as response:
@@ -469,7 +476,11 @@ async def generate_answer(messages: List[dict]) -> str:
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Ollama is unavailable and the fallback LLM failed: {exc}",
+            detail=(
+                "The AI backend is unavailable. Start Ollama (and pull the model) "
+                "or configure an OpenAI-compatible LLM backend via OPENAI_API_KEY / "
+                "OPENAI_BASE_URL before asking Ask Your Past Self."
+            ),
         ) from exc
 
 
@@ -880,7 +891,7 @@ async def ask_past_self(
             yield _sse_event(
                 "error",
                 {
-                    "message": "Ask Your Past Self failed while streaming.",
+                    "message": "Ask Your Past Self failed while streaming. Check that the LLM backend (Ollama/OpenAI) is available and retry.",
                     "correlationId": correlation_id,
                 },
             )
