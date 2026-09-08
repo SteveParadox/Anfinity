@@ -586,7 +586,7 @@ export function SettingsView({ user }: SettingsViewProps) {
                 <RangeControl
                   label="Minimum note evidence"
                   value={draftWorkspace.ai_search.min_note_similarity}
-                  min={0.38}
+                  min={0.35}
                   max={0.85}
                   step={0.01}
                   format={(value) => `${Math.round(value * 100)}%`}

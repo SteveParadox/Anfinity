@@ -31,22 +31,22 @@ export function GoogleAuthCallbackPage() {
     processedRef.current = true;
 
     const completeLogin = async () => {
-      const searchParams = new URLSearchParams(window.location.search);
-      const fragmentParams = getFragmentParams();
-      const oauthError = searchParams.get('oauth_error') || fragmentParams.get('error');
-      if (oauthError) {
-        setError(oauthError);
-        return;
-      }
-
-      const token = fragmentParams.get('access_token');
-      if (!token) {
-        setError('Google login did not return a session token.');
-        return;
-      }
-
-      const redirectPath = sanitizeRedirectPath(fragmentParams.get('redirect'));
       try {
+        const searchParams = new URLSearchParams(window.location.search);
+        const fragmentParams = getFragmentParams();
+        const oauthError = searchParams.get('oauth_error') || fragmentParams.get('error');
+        if (oauthError) {
+          setError(oauthError);
+          return;
+        }
+
+        const token = fragmentParams.get('access_token');
+        if (!token) {
+          setError('Google login did not return a session token. Please try again.');
+          return;
+        }
+
+        const redirectPath = sanitizeRedirectPath(fragmentParams.get('redirect'));
         api.setToken(token);
         await refreshAuth();
         navigate(redirectPath, { replace: true });

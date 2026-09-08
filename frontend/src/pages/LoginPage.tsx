@@ -14,14 +14,24 @@ import { Loader2, LogIn, AlertCircle, Chrome } from 'lucide-react';
 import { PRODUCT_NAME, PRODUCT_ONE_LINER } from '@/lib/productModel';
 import { cn } from '@/lib/utils';
 
+function sanitizeRedirectPath(value: string | null): string {
+  if (!value || !value.startsWith('/') || value.startsWith('//') || value.includes('\\')) {
+    return '/dashboard';
+  }
+  return value;
+}
+
 export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { login, loginWithGoogle, isLoading, error, clearError } = useAuth();
   const redirectTo = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
-  const oauthError = new URLSearchParams(location.search).get('oauth_error');
+  const oauthParams = new URLSearchParams(location.search);
+  const oauthError = oauthParams.get('oauth_error');
   const displayError = error || oauthError;
-  const redirectPath = redirectTo ? `${redirectTo.pathname || ''}${redirectTo.search || ''}` : '/dashboard';
+  const redirectPath = redirectTo
+    ? `${redirectTo.pathname || ''}${redirectTo.search || ''}`
+    : sanitizeRedirectPath(oauthParams.get('redirect'));
 
   const [formData, setFormData] = useState({
     email: '',

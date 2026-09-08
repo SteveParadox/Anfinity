@@ -6,14 +6,15 @@
 import { useState } from 'react';
 import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
-import { Loader2, UserPlus, AlertCircle, Check } from 'lucide-react';
+import { Loader2, UserPlus, AlertCircle, Check, Chrome } from 'lucide-react';
 import { PRODUCT_NAME, PRODUCT_ONE_LINER, SIGNUP_VALUE_PROPS } from '@/lib/productModel';
 
 export function RegisterPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { register, isLoading, error, clearError } = useAuth();
+  const { register, loginWithGoogle, isLoading, error, clearError } = useAuth();
   const redirectTo = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
+  const redirectPath = redirectTo ? `${redirectTo.pathname || ''}${redirectTo.search || ''}` : '/dashboard';
 
   const [formData, setFormData] = useState({
     email: '',
@@ -94,6 +95,13 @@ export function RegisterPage() {
     if (validationErrors[name]) {
       setValidationErrors((prev) => ({ ...prev, [name]: '' }));
     }
+  };
+
+  const handleGoogleSignup = async () => {
+    clearError();
+    try {
+      await loginWithGoogle(redirectPath);
+    } catch {}
   };
 
   return (
@@ -323,6 +331,21 @@ export function RegisterPage() {
               )}
             </button>
           </form>
+
+          <div className="divider">
+            <div className="divider-line" />
+            <span className="divider-text">or continue with</span>
+            <div className="divider-line" />
+          </div>
+
+          <button type="button" className="google-auth-btn" disabled={isLoading} onClick={handleGoogleSignup}>
+            {isLoading ? (
+              <Loader2 size={15} className="animate-spin" />
+            ) : (
+              <Chrome size={15} />
+            )}
+            Continue with Google
+          </button>
 
           {/* Divider + signin */}
           <div className="divider">
