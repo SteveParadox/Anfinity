@@ -1668,6 +1668,7 @@ class ApiClient {
       {
         signal: options?.signal,
         retries: options?.retries,
+        timeout: 120000,
       }
     );
   }
