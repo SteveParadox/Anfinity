@@ -1,0 +1,58 @@
+name: Deploy realtime
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment environment
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+permissions:
+  contents: read
+concurrency:
+  group: realtime-${{ inputs.target }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: inputs.target != 'production' || github.ref == 'refs/heads/main'
+    environment: ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      REALTIME_BACKEND_URL: ${{ vars.REALTIME_BACKEND_URL }}
+      REALTIME_ALLOWED_ORIGINS: ${{ vars.REALTIME_ALLOWED_ORIGINS }}
+      REALTIME_PUBLIC_URL: ${{ vars.REALTIME_PUBLIC_URL }}
+      REALTIME_ORIGIN: ${{ vars.REALTIME_ORIGIN }}
+      REALTIME_SMOKE_BEARER: ${{ secrets.REALTIME_SMOKE_BEARER }}
+      REALTIME_SMOKE_NOTE_ID: ${{ vars.REALTIME_SMOKE_NOTE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Require deployment configuration and authenticated smoke account
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$REALTIME_BACKEND_URL"
+          test -n "$REALTIME_ALLOWED_ORIGINS"
+          test -n "$REALTIME_PUBLIC_URL"
+          test -n "$REALTIME_ORIGIN"
+          test -n "$REALTIME_SMOKE_BEARER"
+          test -n "$REALTIME_SMOKE_NOTE_ID"
+      - run: npm ci
+      - run: npm run realtime:typecheck
+      - run: npm run realtime:lint
+      - run: npm run test:unit
+      - run: npm run test:realtime
+      - run: npm run realtime:check -- --env "${{ inputs.target }}"
+      - name: Deploy selected environment
+        run: npm run realtime:deploy -- --env "${{ inputs.target }}" --var "REALTIME_BACKEND_URL:$REALTIME_BACKEND_URL" --var "REALTIME_ALLOWED_ORIGINS:$REALTIME_ALLOWED_ORIGINS"
+      - run: npm run realtime:smoke

@@ -4,9 +4,10 @@ import {
   useRef,
   useState,
 } from "react";
-import type PartySocket from "partysocket";
-import YPartyKitProvider from "y-partykit/provider";
+import { api } from "../api";
+import YPartyServerProvider from "y-partyserver/provider";
 import * as Y from "yjs";
+import { IndexeddbPersistence } from "y-indexeddb";
 import type {
   CollaborationClientMessage,
   CollaborationServerMessage,
@@ -15,11 +16,24 @@ import type {
   SelectionState,
 } from "./protocol";
 import { parseCollaborationServerMessage } from "./protocol";
-import { getPartykitHost, getNoteRoomId } from "./noteRoom";
+import { getRealtimeHost, getNoteRoomId } from "./noteRoom";
+
+class BoundedYProvider extends YPartyServerProvider {
+  async _reconnectWS(): Promise<void> {
+    if (this.wsUnsuccessfulReconnects >= 12) {
+      this.disconnect();
+      this.emit("connection-error", [new Error("Collaboration retries exhausted")]);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.random() * 250));
+    if (this.shouldConnect) await super._reconnectWS();
+  }
+}
 
 type ProviderStatus = "idle" | "connecting" | "connected" | "disconnected";
 
 export type NoteCollaborationSessionOptions = {
+  userId?: string;
   noteId?: string | null;
   token?: string | null;
   enabled?: boolean;
@@ -27,7 +41,7 @@ export type NoteCollaborationSessionOptions = {
 
 export type NoteCollaborationSession = {
   doc: Y.Doc | null;
-  provider: YPartyKitProvider | null;
+  provider: YPartyServerProvider | null;
   status: ProviderStatus;
   isSynced: boolean;
   collaborators: CollaboratorPresence[];
@@ -61,12 +75,13 @@ function upsertCollaborator(
 }
 
 export function useNoteCollaborationSession({
+  userId,
   noteId,
   token,
   enabled = true,
 }: NoteCollaborationSessionOptions): NoteCollaborationSession {
   const [doc, setDoc] = useState<Y.Doc | null>(null);
-  const [provider, setProvider] = useState<YPartyKitProvider | null>(null);
+  const [provider, setProvider] = useState<YPartyServerProvider | null>(null);
   const [status, setStatus] = useState<ProviderStatus>("idle");
   const [isSynced, setIsSynced] = useState(false);
   const [collaborators, setCollaborators] = useState<CollaboratorPresence[]>([]);
@@ -75,28 +90,15 @@ export function useNoteCollaborationSession({
   const [remoteSelections, setRemoteSelections] = useState<Record<string, SelectionState>>({});
   const [lastError, setLastError] = useState<string | null>(null);
 
-  const providerRef = useRef<YPartyKitProvider | null>(null);
-  const socketListenerRef = useRef<{
-    socket: PartySocket;
-    handler: (event: MessageEvent) => void;
-  } | null>(null);
-
+  const providerRef = useRef<YPartyServerProvider | null>(null);
+  const documentRef = useRef<{ noteId: string; userId?: string; doc: Y.Doc } | null>(null);
+  useEffect(() => () => { documentRef.current?.doc.destroy(); documentRef.current = null; }, []);
   const resetTransientState = useCallback(() => {
     const next = createEmptyTransientState();
     setCollaborators(next.collaborators);
     setTypingByUserId(next.typingByUserId);
     setRemoteCursors(next.remoteCursors);
     setRemoteSelections(next.remoteSelections);
-  }, []);
-
-  const detachSocketListener = useCallback(() => {
-    const current = socketListenerRef.current;
-    if (!current) {
-      return;
-    }
-
-    current.socket.removeEventListener("message", current.handler);
-    socketListenerRef.current = null;
   }, []);
 
   const applyServerMessage = useCallback((message: CollaborationServerMessage) => {
@@ -166,33 +168,6 @@ export function useNoteCollaborationSession({
     }
   }, []);
 
-  const attachSocketListener = useCallback((socket: PartySocket | null) => {
-    detachSocketListener();
-
-    if (!socket) {
-      return;
-    }
-
-    const handler = (event: MessageEvent) => {
-      if (typeof event.data !== "string") {
-        return;
-      }
-
-      const message = parseCollaborationServerMessage(event.data);
-      if (!message) {
-        return;
-      }
-
-      applyServerMessage(message);
-    };
-
-    socket.addEventListener("message", handler);
-    socketListenerRef.current = {
-      socket,
-      handler,
-    };
-  }, [applyServerMessage, detachSocketListener]);
-
   const sendCollaborationMessage = useCallback((message: CollaborationClientMessage) => {
     const currentProvider = providerRef.current;
     const socket = currentProvider?.ws;
@@ -201,7 +176,7 @@ export function useNoteCollaborationSession({
       return;
     }
 
-    socket.send(JSON.stringify(message));
+    currentProvider.sendMessage(JSON.stringify(message));
   }, []);
 
   const sendCursorMove = useCallback((payload: CursorState) => {
@@ -228,7 +203,6 @@ export function useNoteCollaborationSession({
   }, [sendCollaborationMessage]);
 
   useEffect(() => {
-    detachSocketListener();
 
     const trimmedNoteId = noteId?.trim();
     const trimmedToken = token?.trim();
@@ -246,19 +220,30 @@ export function useNoteCollaborationSession({
       return;
     }
 
-    const nextDoc = new Y.Doc();
-    const nextProvider = new YPartyKitProvider(
-      getPartykitHost(),
+    if (documentRef.current && (documentRef.current.noteId !== trimmedNoteId || documentRef.current.userId !== userId)) documentRef.current.doc.destroy();
+    const nextDoc = documentRef.current?.noteId === trimmedNoteId && documentRef.current.userId === userId ? documentRef.current.doc : new Y.Doc();
+    documentRef.current = { noteId: trimmedNoteId, userId, doc: nextDoc };
+    const nextProvider = new BoundedYProvider(
+      getRealtimeHost(),
       getNoteRoomId(trimmedNoteId),
       nextDoc,
       {
         connect: false,
-        params: async () => ({
-          token: trimmedToken,
-        }),
+        disableBc: true,
+        params: async () => {
+          try {
+            const { ticket } = await api.createRealtimeTicket(getNoteRoomId(trimmedNoteId));
+            return { ticket };
+          } catch (error) {
+            const status = (error as { status?: number }).status;
+            if (status === 401 || status === 403 || status === 404) nextProvider.disconnect();
+            throw error;
+          }
+        },
       },
     );
 
+    const persistence = userId ? new IndexeddbPersistence(`anfinity:${userId}:note:${trimmedNoteId}`, nextDoc) : null;
     let isDisposed = false;
 
     const handleStatus = (event: { status: ProviderStatus }) => {
@@ -270,12 +255,10 @@ export function useNoteCollaborationSession({
 
       if (event.status === "connected") {
         setLastError(null);
-        attachSocketListener(nextProvider.ws as PartySocket | null);
       }
 
       if (event.status === "disconnected") {
         setIsSynced(false);
-        detachSocketListener();
         resetTransientState();
       }
     };
@@ -286,9 +269,6 @@ export function useNoteCollaborationSession({
       }
 
       setIsSynced(synced);
-      if (synced) {
-        attachSocketListener(nextProvider.ws as PartySocket | null);
-      }
     };
 
     const handleConnectionError = () => {
@@ -300,16 +280,24 @@ export function useNoteCollaborationSession({
       setIsSynced(false);
     };
 
-    const handleConnectionClose = () => {
+    const handleConnectionClose = (event: CloseEvent) => {
+      if (event?.code === 4401 || event?.code === 4403) {
+        nextProvider.disconnect();
+        setLastError("Access expired or revoked. Sign in and reopen this note.");
+      }
       if (isDisposed) {
         return;
       }
 
       setIsSynced(false);
-      detachSocketListener();
       resetTransientState();
     };
 
+    const handleCustomMessage = (raw: string) => {
+      const message = parseCollaborationServerMessage(raw);
+      if (message) applyServerMessage(message);
+    };
+    nextProvider.on("custom-message", handleCustomMessage);
     nextProvider.on("status", handleStatus);
     nextProvider.on("synced", handleSynced);
     nextProvider.on("connection-error", handleConnectionError);
@@ -323,24 +311,29 @@ export function useNoteCollaborationSession({
     resetTransientState();
     setLastError(null);
 
-    nextProvider.connect();
+    void (persistence?.whenSynced ?? Promise.resolve()).then(() => {
+      if (!isDisposed) return nextProvider.connect();
+    }).catch(() => {
+      if (!isDisposed) { setLastError("Unable to authenticate collaboration. Reopen this note to retry."); setStatus("disconnected"); }
+    });
 
     return () => {
       isDisposed = true;
-      detachSocketListener();
+      nextProvider.off("custom-message", handleCustomMessage);
       nextProvider.off("status", handleStatus);
       nextProvider.off("synced", handleSynced);
       nextProvider.off("connection-error", handleConnectionError);
       nextProvider.off("connection-close", handleConnectionClose);
       nextProvider.awareness.setLocalState(null);
       nextProvider.destroy();
-      nextDoc.destroy();
+      void persistence?.destroy();
+      // Keep unsent CRDT edits when credentials rotate for the same note.
 
       if (providerRef.current === nextProvider) {
         providerRef.current = null;
       }
     };
-  }, [attachSocketListener, detachSocketListener, enabled, noteId, resetTransientState, token]);
+  }, [applyServerMessage, enabled, noteId, resetTransientState, token, userId]);
 
   return {
     doc,

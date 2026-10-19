@@ -10,10 +10,15 @@
     "preview": "vite preview",
     "generate:automation-registry": "python ../tools/generate_automation_registry.py",
     "inngest:dev": "inngest-cli dev -u http://localhost:3000/api/inngest",
-    "partykit:dev": "partykit dev",
-    "partykit:deploy": "partykit deploy",
     "test:unit": "vitest run",
-    "test:unit:watch": "vitest"
+    "test:unit:watch": "vitest",
+    "realtime:dev": "wrangler dev",
+    "realtime:deploy": "wrangler deploy",
+    "realtime:check": "wrangler deploy --dry-run",
+    "realtime:typecheck": "tsc -p tsconfig.worker.json",
+    "test:realtime": "vitest run --config vitest.worker.config.ts",
+    "realtime:lint": "eslint partykit/server.ts partykit/security.ts partykit/snapshot.ts partykit/collaboration-server.ts partykit/thinking-session-server.ts",
+    "realtime:smoke": "node tools/realtime-smoke.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
@@ -59,7 +64,7 @@
     "input-otp": "^1.4.2",
     "lucide-react": "^0.562.0",
     "next-themes": "^0.4.6",
-    "partykit": "^0.0.115",
+    "partyserver": "^0.5.10",
     "partysocket": "^1.1.18",
     "react": "^19.2.0",
     "react-day-picker": "^9.13.0",
@@ -73,17 +78,21 @@
     "tailwind-merge": "^3.4.0",
     "uuid": "^13.0.0",
     "vaul": "^1.1.2",
-    "y-partykit": "^0.0.33",
+    "y-indexeddb": "^9.0.12",
+    "y-partyserver": "^2.2.0",
     "yjs": "^13.6.30",
     "zod": "^4.3.5",
     "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.4",
+    "@cloudflare/workers-types": "^5.20261019.1",
     "@eslint/js": "^9.39.1",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
     "@types/react-router-dom": "^5.3.3",
+    "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^5.1.1",
     "autoprefixer": "^10.4.23",
     "eslint": "^9.39.1",
@@ -98,6 +107,16 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.4",
     "vite": "^7.2.4",
-    "vitest": "^4.1.4"
+    "vitest": "^4.1.4",
+    "wrangler": "^4.151.1",
+    "ws": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "overrides": {
+    "y-partyserver": {
+      "@cloudflare/workers-types": "$@cloudflare/workers-types"
+    }
   }
 }

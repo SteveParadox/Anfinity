@@ -315,6 +315,7 @@ class Settings(BaseSettings):
     DATABASE_MAX_OVERFLOW: int = 20  # Increased from 10 for concurrent load testing
     
     # Redis
+    REALTIME_SERVICE_SECRET: str = Field(default="")
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
 
     # Celery

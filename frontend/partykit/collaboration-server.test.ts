@@ -1,17 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as Party from "partykit/server";
+import type * as Party from "./test-types";
+vi.mock("partyserver", () => import("./test-runtime"));
+vi.mock("y-partyserver", () => import("./test-runtime"));
+vi.mock("./security", () => ({ authorizeMessage: async () => ({ can_view: true, can_update: true }), checkMessageBudget: () => true, watchAuthorization: () => () => {} }));
 import { COLLABORATION_TYPING_TIMEOUT_MS } from "../src/lib/collaboration/constants";
 import NoteCollaborationServer from "./collaboration-server";
 
 const NOTE_ID = "11111111-1111-4111-8111-111111111111";
-
-const { onConnectMock } = vi.hoisted(() => ({
-  onConnectMock: vi.fn(async () => {}),
-}));
-
-vi.mock("y-partykit", () => ({
-  onConnect: onConnectMock,
-}));
 
 class FakeConnection {
   readonly sent: string[] = [];
@@ -68,7 +63,7 @@ function parseSentMessage(connection: FakeConnection) {
 describe("NoteCollaborationServer", () => {
   beforeEach(() => {
     vi.useRealTimers();
-    onConnectMock.mockClear();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ id: NOTE_ID, content: "" })));
     vi.restoreAllMocks();
   });
 
@@ -171,7 +166,7 @@ describe("NoteCollaborationServer", () => {
     await server.onConnect(connection as unknown as Party.Connection, createContextForUser("user-1"));
     connection.sent.length = 0;
 
-    await server.onMessage("{bad json", connection as unknown as Party.Connection);
+    await server.onCustomMessage(connection as unknown as Party.Connection, "{bad json");
 
     expect(parseSentMessage(connection)).toMatchObject({
       type: "server_error",
@@ -190,14 +185,14 @@ describe("NoteCollaborationServer", () => {
     connection.sent.length = 0;
     vi.mocked(room.broadcast).mockClear();
 
-    await server.onMessage(JSON.stringify({
+    await server.onCustomMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "selection_change",
       payload: {
         from: 10,
         to: 2,
         empty: false,
       },
-    }), connection as unknown as Party.Connection);
+    }));
 
     expect(parseSentMessage(connection)).toMatchObject({
       type: "server_error",
@@ -240,13 +235,10 @@ describe("NoteCollaborationServer", () => {
     await server.onConnect(second as unknown as Party.Connection, createContextForUser("user-2"));
     vi.mocked(room.broadcast).mockClear();
 
-    await server.onMessage(
-      JSON.stringify({
+    await server.onCustomMessage(first as unknown as Party.Connection, JSON.stringify({
         type: "typing_indicator",
         payload: { isTyping: true },
-      }),
-      first as unknown as Party.Connection,
-    );
+      }));
 
     expect(room.broadcast).toHaveBeenCalledWith(
       expect.stringContaining('"type":"typing_indicator"'),
@@ -273,33 +265,24 @@ describe("NoteCollaborationServer", () => {
     await server.onConnect(observer as unknown as Party.Connection, createContextForUser("user-2"));
     vi.mocked(room.broadcast).mockClear();
 
-    await server.onMessage(
-      JSON.stringify({
+    await server.onCustomMessage(first as unknown as Party.Connection, JSON.stringify({
         type: "typing_indicator",
         payload: { isTyping: true },
-      }),
-      first as unknown as Party.Connection,
-    );
+      }));
 
     expect(room.broadcast).toHaveBeenCalledTimes(1);
 
-    await server.onMessage(
-      JSON.stringify({
+    await server.onCustomMessage(second as unknown as Party.Connection, JSON.stringify({
         type: "typing_indicator",
         payload: { isTyping: true },
-      }),
-      second as unknown as Party.Connection,
-    );
+      }));
 
     expect(room.broadcast).toHaveBeenCalledTimes(1);
 
-    await server.onMessage(
-      JSON.stringify({
+    await server.onCustomMessage(first as unknown as Party.Connection, JSON.stringify({
         type: "typing_indicator",
         payload: { isTyping: false },
-      }),
-      first as unknown as Party.Connection,
-    );
+      }));
 
     expect(room.broadcast).toHaveBeenCalledTimes(1);
 
@@ -321,13 +304,10 @@ describe("NoteCollaborationServer", () => {
     await server.onConnect(connection as unknown as Party.Connection, createContextForUser("user-1", false));
     vi.mocked(room.broadcast).mockClear();
 
-    await server.onMessage(
-      JSON.stringify({
+    await server.onCustomMessage(connection as unknown as Party.Connection, JSON.stringify({
         type: "typing_indicator",
         payload: { isTyping: true },
-      }),
-      connection as unknown as Party.Connection,
-    );
+      }));
 
     expect(room.broadcast).not.toHaveBeenCalled();
   });

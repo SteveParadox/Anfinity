@@ -1677,14 +1677,14 @@ async def sync_note_collaboration(
 
     await ensure_note_permission(note, current_user, db, "update")
 
+    if updates.content == note.content:
+        return serialize_note(note)
+
     if updates.base_content is not None and updates.base_content != note.content:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Collaborative note content changed since this client last synced",
         )
-
-    if updates.content == note.content:
-        return serialize_note(note)
 
     note.content = updates.content
     note.word_count = calculate_word_count(updates.content)

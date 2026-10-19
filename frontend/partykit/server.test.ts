@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type * as Party from "partykit/server";
-import RootPartyServer from "./server";
+import type * as Party from "./test-types";
+vi.mock("partyserver", () => import("./test-runtime"));
+vi.mock("y-partyserver", () => import("./test-runtime"));
+import NoteCollaborationServer from "./collaboration-server";
+import ThinkingSessionServer from "./thinking-session-server";
+import { parseRoomPath } from "./security";
 
 const NOTE_ID = "11111111-1111-4111-8111-111111111111";
 const SESSION_ID = "22222222-2222-4222-8222-222222222222";
@@ -40,7 +44,7 @@ describe("RootPartyServer room routing", () => {
       headers: new Headers(),
     } as unknown as Party.Request;
 
-    const result = await RootPartyServer.onBeforeConnect(request, createLobby());
+    const result = await NoteCollaborationServer.onBeforeConnect(request, createLobby());
 
     expect(result).toBe(request);
     expect(String(fetchMock.mock.calls[0][0])).toBe(`http://backend.test/notes/${NOTE_ID}/access`);
@@ -70,11 +74,23 @@ describe("RootPartyServer room routing", () => {
       headers: new Headers(),
     } as unknown as Party.Request;
 
-    const result = await RootPartyServer.onBeforeConnect(request, createLobby());
+    const result = await ThinkingSessionServer.onBeforeConnect(request, createLobby());
 
     expect(result).toBe(request);
     expect(String(fetchMock.mock.calls[0][0])).toBe(
       `http://backend.test/thinking-sessions/${SESSION_ID}/access`,
     );
+  });
+});
+
+
+describe("strict room paths", () => {
+  it("preserves main namespace and rejects unknown and malformed rooms", () => {
+    expect(parseRoomPath(`/parties/main/note:${NOTE_ID}`)?.kind).toBe("note");
+    expect(parseRoomPath("/parties/main/NOTE:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")?.room).toBe("note:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    expect(parseRoomPath(`/parties/main/thinking-session:${SESSION_ID}`)?.kind).toBe("thinking-session");
+    for (const path of ["/parties/main/anything", "/parties/main/note:", `/parties/notes/note:${NOTE_ID}`, `/parties/main/note:${NOTE_ID}/extra`, "/parties/main/%XX"]) {
+      expect(parseRoomPath(path)).toBeNull();
+    }
   });
 });

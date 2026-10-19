@@ -1,3 +1,4 @@
+import { api } from "@/lib/api";
 import {
   useCallback,
   useEffect,
@@ -7,7 +8,7 @@ import {
 } from "react";
 import PartySocket from "partysocket";
 import type { ThinkingSession } from "@/types";
-import { getPartykitHost } from "@/lib/collaboration/noteRoom";
+import { getRealtimeHost } from "@/lib/collaboration/noteRoom";
 import { transformThinkingSessionFromAPI } from "@/lib/transformers";
 import { getThinkingSessionRoomId } from "@/lib/thinkingSessions/room";
 import {
@@ -138,10 +139,21 @@ export function useThinkingSessionRoom({
     }
 
     const nextSocket = new PartySocket({
-      host: getPartykitHost(),
+      host: getRealtimeHost(),
       room: getThinkingSessionRoomId(trimmedSessionId),
-      query: {
-        token: trimmedToken,
+      maxRetries: 12,
+      query: async () => {
+        try {
+          const { ticket } = await api.createRealtimeTicket(getThinkingSessionRoomId(trimmedSessionId));
+          return { ticket };
+        } catch (error) {
+          const status = (error as { status?: number }).status;
+          if (status === 401 || status === 403 || status === 404) {
+            nextSocket.close();
+            setLastError("Access expired or revoked. Reopen this session.");
+          }
+          throw error;
+        }
       },
     });
 
@@ -256,7 +268,11 @@ export function useThinkingSessionRoom({
       }
     };
 
-    const handleClose = () => {
+    const handleClose = (event: CloseEvent) => {
+      if (event.code === 4401 || event.code === 4403) {
+        nextSocket.close();
+        setLastError("Access expired or revoked. Reopen this session.");
+      }
       if (disposed) {
         return;
       }

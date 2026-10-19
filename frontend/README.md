@@ -2,9 +2,9 @@
 
 Anfinity is an AI knowledge operating system for teams that need to capture, organize, search, understand, and approve knowledge across notes, documents, and connected tools.
 
-Deployment is documented in [../DEPLOYMENT.md](../DEPLOYMENT.md). The production
-frontend is intended to run on Vercel from this `Frontend/` directory, with
-PartyKit deployed separately for collaboration rooms.
+Deployment is documented in [../docs/cloudflare-deployment.md](../docs/cloudflare-deployment.md). The production
+frontend is intended to run on Vercel from this `frontend/` directory, with
+Cloudflare PartyServer deployed separately for collaboration rooms. See [local realtime setup](../docs/realtime-local-development.md).
 
 The product is positioned around one sharp workflow:
 

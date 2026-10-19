@@ -81,10 +81,13 @@ export function CollaborativeNoteEditor({
 }: CollaborativeNoteEditorProps) {
   const onPlainTextChangeRef = useRef(onPlainTextChange);
   const session = useNoteCollaborationSession({
+    userId: user.userId,
     noteId,
     token,
     enabled: Boolean(noteId && token),
   });
+  const syncedRef = useRef(session.isSynced);
+  useEffect(() => { syncedRef.current = session.isSynced; }, [session.isSynced]);
   const localUser = useMemo<CollaboratorIdentity>(() => ({
     userId: user.userId,
     email: user.email,
@@ -111,7 +114,7 @@ export function CollaborativeNoteEditor({
     }
 
     if (session.status === "disconnected") {
-      return "Disconnected";
+      return "Reconnecting — local edits retained";
     }
 
     return "Preparing room";
@@ -129,7 +132,7 @@ export function CollaborativeNoteEditor({
   const editor = useEditor(
     {
       immediatelyRender: false,
-      editable,
+      editable: editable && session.isSynced,
       extensions: [
         StarterKit.configure({
           history: false,
@@ -159,14 +162,14 @@ export function CollaborativeNoteEditor({
       },
       onCreate: ({ editor: nextEditor }) => {
         syncLocalUserAwareness(session.provider, localUser);
-        onPlainTextChangeRef.current?.(getEditorText(nextEditor));
+        if (syncedRef.current) onPlainTextChangeRef.current?.(getEditorText(nextEditor));
       },
       onUpdate: ({ editor: nextEditor, transaction }) => {
         if (!transaction.docChanged) {
           return;
         }
 
-        onPlainTextChangeRef.current?.(getEditorText(nextEditor));
+        if (syncedRef.current) onPlainTextChangeRef.current?.(getEditorText(nextEditor));
         session.setTypingIndicator(true);
       },
       onSelectionUpdate: ({ editor: nextEditor }) => {
@@ -219,9 +222,9 @@ export function CollaborativeNoteEditor({
       return;
     }
 
-    editor.setEditable(editable);
+    editor.setEditable(editable && session.isSynced);
     syncLocalUserAwareness(session.provider, localUser);
-  }, [editable, editor, localUser, session.provider]);
+  }, [editable, editor, localUser, session.provider, session.isSynced]);
 
   useEffect(() => {
     return () => {
@@ -240,6 +243,8 @@ export function CollaborativeNoteEditor({
       }}
     >
       <div
+        role="status"
+        aria-live="polite"
         style={{
           display: "flex",
           alignItems: "flex-start",

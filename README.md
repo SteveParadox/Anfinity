@@ -751,3 +751,7 @@ curl -X POST http://localhost:8000/answers/generate \
 
 **Last Updated**: March 5, 2026
 **Status**: ✅ Production Ready & Fully Tested
+
+## Real-time infrastructure
+
+Collaboration uses Cloudflare PartyServer, Workers and Durable Objects. See [local setup](docs/realtime-local-development.md), [architecture](docs/realtime-architecture.md), [deployment](docs/cloudflare-deployment.md), [migration](docs/realtime-migration.md) and [troubleshooting](docs/realtime-troubleshooting.md).

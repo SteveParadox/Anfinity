@@ -1,78 +1,59 @@
-import type * as Party from "partykit/server";
+import { getServerByName } from "partyserver";
 import NoteCollaborationServer from "./collaboration-server";
 import ThinkingSessionServer from "./thinking-session-server";
-import { isThinkingSessionRoomId } from "../src/lib/thinkingSessions/room";
+import { backendUrl, parseRoomPath, type RealtimeEnv } from "./security";
 
-type DelegatedServer = Party.Server & {
-  constructor: {
-    onBeforeConnect?: (
-      request: Party.Request,
-      lobby: Party.Lobby,
-    ) => Promise<Party.Request | Response>;
-  };
-};
+export { NoteCollaborationServer, ThinkingSessionServer };
 
-function resolveServerClass(roomId: string) {
-  return isThinkingSessionRoomId(roomId)
-    ? ThinkingSessionServer
-    : NoteCollaborationServer;
+export async function handleRequest(request: Request, env: RealtimeEnv): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.pathname === "/health" && request.method === "GET") {
+    return Response.json({ status: "ok", service: "anfinity-realtime" }, { headers: { "Cache-Control": "no-store" } });
+  }
+  const route = parseRoomPath(url.pathname);
+  if (route) console.log(JSON.stringify({ event: "connection_attempt", kind: route.kind }));
+  if (!route) return new Response("Not found", { status: 404 });
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+  const origins = (env.REALTIME_ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!origins.includes(request.headers.get("Origin") ?? "")) return new Response("Forbidden origin", { status: 403 });
+  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("WebSocket upgrade required", { status: 426 });
+  const ticket = url.searchParams.get("ticket");
+  if (!ticket || ticket.length > 128) return new Response("Unauthorized", { status: 401 });
+  if (!env.REALTIME_SERVICE_SECRET) return new Response("Service unavailable", { status: 503 });
+  try {
+    const redemption = await fetch(`${backendUrl(env)}/realtime/redeem`, {
+      method: "POST", signal: AbortSignal.timeout(5000),
+      headers: { "Content-Type": "application/json", "X-Realtime-Secret": env.REALTIME_SERVICE_SECRET },
+      body: JSON.stringify({ ticket, room: route.room }),
+    });
+    if (!redemption.ok) return new Response("Unauthorized", { status: redemption.status === 503 ? 503 : 401 });
+    const { token } = await redemption.json() as { token: string };
+    // Never forward browser-supplied trusted identity headers.
+    const headers = new Headers(request.headers);
+    for (const name of [...headers.keys()]) {
+      if (/^x-(collab|thinking)-/i.test(name)) headers.delete(name);
+    }
+    const internalUrl = new URL(request.url);
+    internalUrl.pathname = `/parties/main/${route.room}`;
+    internalUrl.searchParams.delete("ticket");
+    internalUrl.searchParams.delete("token");
+    // The legacy authorization helper consumes this private, server-only URL.
+    internalUrl.searchParams.set("token", token);
+    const internal = new Request(internalUrl, { headers });
+    const ServerClass = route.kind === "note" ? NoteCollaborationServer : ThinkingSessionServer;
+    const authorized = await ServerClass.onBeforeConnect(internal, { env });
+    if (authorized instanceof Response) return authorized;
+    // Remove bearer credentials from connection URI and request-line logs.
+    internalUrl.searchParams.delete("token");
+    const clean = new Request(internalUrl, { headers: authorized.headers });
+    const namespace = route.kind === "note" ? env.NOTES : env.THINKING;
+    const server = await getServerByName(namespace, route.room);
+    console.log(JSON.stringify({ event: "connection_authorized", kind: route.kind }));
+    return await server.fetch(clean);
+  } catch {
+    console.error(JSON.stringify({ event: "realtime_handshake_failed" }));
+    return new Response("Service unavailable", { status: 503 });
+  }
 }
 
-function getRoomIdFromRequest(requestUrl: string): string {
-  const url = new URL(requestUrl);
-  return url.pathname.split("/").filter(Boolean).at(-1) ?? "";
-}
-
-export default class RootPartyServer implements Party.Server {
-  private readonly delegate: DelegatedServer;
-
-  constructor(readonly room: Party.Room) {
-    const ServerClass = resolveServerClass(room.id);
-    this.delegate = new ServerClass(room) as DelegatedServer;
-  }
-
-  static async onBeforeConnect(
-    request: Party.Request,
-    lobby: Party.Lobby,
-  ): Promise<Party.Request | Response> {
-    const roomId = getRoomIdFromRequest(request.url);
-    const ServerClass = resolveServerClass(roomId);
-
-    if (typeof ServerClass.onBeforeConnect === "function") {
-      return ServerClass.onBeforeConnect(request, lobby);
-    }
-
-    return request;
-  }
-
-  readonly options = {
-    hibernate: false,
-  };
-
-  async onConnect(connection: Party.Connection, ctx: Party.ConnectionContext): Promise<void> {
-    if (typeof this.delegate.onConnect === "function") {
-      await this.delegate.onConnect(connection, ctx);
-    }
-  }
-
-  async onMessage(
-    message: string | ArrayBuffer | ArrayBufferView,
-    sender: Party.Connection,
-  ): Promise<void> {
-    if (typeof this.delegate.onMessage === "function") {
-      await this.delegate.onMessage(message, sender);
-    }
-  }
-
-  async onClose(connection: Party.Connection): Promise<void> {
-    if (typeof this.delegate.onClose === "function") {
-      await this.delegate.onClose(connection);
-    }
-  }
-
-  async onError(connection: Party.Connection, error: Error): Promise<void> {
-    if (typeof this.delegate.onError === "function") {
-      await this.delegate.onError(connection, error);
-    }
-  }
-}
+export default { fetch: handleRequest } satisfies ExportedHandler<RealtimeEnv>;

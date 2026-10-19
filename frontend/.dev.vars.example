@@ -1,0 +1,2 @@
+# Must match backend REALTIME_SERVICE_SECRET; never use a VITE_ variable.
+REALTIME_SERVICE_SECRET=replace-with-a-random-secret-at-least-32-characters

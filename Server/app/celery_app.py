@@ -20,6 +20,7 @@ from app.config import settings
 # Use Redis for broker and a simpler backend to avoid conflicts
 celery_app = Celery(
     "app",
+    include=["app.tasks.thinking_synthesis"],
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL.replace("/0", "/1"),
 )
