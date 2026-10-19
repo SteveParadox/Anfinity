@@ -125,9 +125,12 @@ async def temporary_rls_bypass(db: AsyncSession):
         await restore_previous_context(suppress_sqlalchemy_errors=False)
 
 
-async def get_note_with_bypass(db: AsyncSession, note_id: UUID) -> Optional[Note]:
+async def get_note_with_bypass(db: AsyncSession, note_id: UUID, *, for_update: bool = False) -> Optional[Note]:
     async with temporary_rls_bypass(db):
-        result = await db.execute(select(Note).where(Note.id == note_id))
+        query = select(Note).where(Note.id == note_id)
+        if for_update:
+            query = query.with_for_update(of=Note).execution_options(populate_existing=True)
+        result = await db.execute(query)
         return result.scalar_one_or_none()
 
 

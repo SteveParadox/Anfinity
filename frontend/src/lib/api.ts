@@ -527,6 +527,10 @@ class ApiClient {
     this.logger = new RequestLogger();
   }
 
+  async createRealtimeTicket(room: string): Promise<{ ticket: string }> {
+    return this.request("/realtime/ticket", { method: "POST", body: JSON.stringify({ room }), timeout: 5000, retries: false });
+  }
+
   /**
    * Set authentication token
    */

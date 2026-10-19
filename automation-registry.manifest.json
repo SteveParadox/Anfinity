@@ -1,0 +1,75 @@
+{
+  "triggerTypes": [
+    "note.created",
+    "note.updated",
+    "note.deleted",
+    "note.approval_submitted",
+    "note.approval_approved",
+    "note.approval_rejected",
+    "note.approval_needs_changes",
+    "document.completed",
+    "thinking_session.completed",
+    "webhook.received",
+    "competitive_intelligence.urgent_finding"
+  ],
+  "actionTypes": [
+    "send_notification",
+    "create_note",
+    "update_note",
+    "append_note_content",
+    "add_note_tags",
+    "remove_note_tags",
+    "set_note_type",
+    "link_notes",
+    "submit_for_approval",
+    "approve_note",
+    "reject_note",
+    "request_approval_changes",
+    "call_webhook",
+    "send_email"
+  ],
+  "conditionOperators": [
+    "equals",
+    "not_equals",
+    "contains",
+    "not_contains",
+    "matches_regex",
+    "greater_than",
+    "less_than",
+    "exists"
+  ],
+  "noteTypes": [
+    "note",
+    "web-clip",
+    "document",
+    "voice",
+    "ai-generated"
+  ],
+  "approvalPriorities": [
+    "low",
+    "normal",
+    "high",
+    "critical"
+  ],
+  "httpMethods": [
+    "POST",
+    "PUT",
+    "PATCH"
+  ],
+  "actionExecution": {
+    "send_notification": "backend",
+    "create_note": "backend",
+    "update_note": "backend",
+    "append_note_content": "backend",
+    "add_note_tags": "backend",
+    "remove_note_tags": "backend",
+    "set_note_type": "backend",
+    "link_notes": "backend",
+    "submit_for_approval": "backend",
+    "approve_note": "backend",
+    "reject_note": "backend",
+    "request_approval_changes": "backend",
+    "call_webhook": "http",
+    "send_email": "http"
+  }
+}

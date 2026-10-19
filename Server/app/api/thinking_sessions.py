@@ -9,7 +9,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,14 +21,11 @@ from app.database.models import (
 from app.database.session import get_db
 from app.services.billing import enforce_entitlement_limit, increment_usage_counter
 from app.services.thinking_sessions import (
-    build_facilitation_prompt,
     build_thinking_session_snapshot,
-    claim_synthesis_run_for_streaming,
-    complete_synthesis_run,
     create_contribution,
     create_thinking_session,
     ensure_thinking_session_permission,
-    fail_synthesis_run,
+    fail_stalled_synthesis_run,
     get_thinking_session_or_404,
     get_thinking_synthesis_run_or_404,
     list_thinking_sessions_for_workspace,
@@ -378,57 +374,77 @@ async def stream_thinking_session_synthesis_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     session = await get_thinking_session_or_404(session_id, db)
-    run = await claim_synthesis_run_for_streaming(session, payload.run_id, current_user, db)
-    prompt_text, messages = build_facilitation_prompt(session, run)
-    run.facilitation_prompt = prompt_text
-    await db.commit()
-    await db.refresh(run)
+    await ensure_thinking_session_permission(session, current_user, db, "control")
+    run = await get_thinking_synthesis_run_or_404(session_id, payload.run_id, db)
+    run_id = run.id
+    run_status = str(getattr(run.status, "value", run.status))
+    if run_status in {"pending", "streaming"} and (session.active_synthesis_run_id != run_id or str(getattr(session.phase, "value", session.phase)) != "synthesizing"):
+        raise HTTPException(409, "This synthesis run is no longer active")
+    # Enqueue before streaming; the task owns its database session and provider request.
+    # Duplicate dispatch is harmless because the producer atomically claims PENDING.
+    if run_status == "pending":
+        from app.tasks.thinking_synthesis import run_thinking_synthesis
+        try:
+            run_thinking_synthesis.apply_async(
+                args=[str(session_id), str(run_id), str(current_user.id)],
+                task_id=f"thinking-synthesis-{run_id}",
+            )
+        except Exception:
+            raise HTTPException(503, "Synthesis queue unavailable; reconnect to retry") from None
 
-    if not settings.OPENAI_API_KEY:
-        await fail_synthesis_run(session, run, "OpenAI API key is not configured for synthesis", db)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OpenAI API key is not configured for synthesis",
-        )
-
-    client_kwargs = {
-        "api_key": settings.OPENAI_API_KEY,
-        "timeout": float(settings.THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS),
-    }
-    if getattr(settings, "OPENAI_BASE_URL", None):
-        client_kwargs["base_url"] = settings.OPENAI_BASE_URL
-
-    client = AsyncOpenAI(**client_kwargs)
+    model = run.model
+    user_id = current_user.id
+    # Do not retain the request connection throughout a long-lived observer.
+    await db.close()
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        full_output_parts: list[str] = []
-        try:
-            yield f"data: {json.dumps({'type': 'start', 'run_id': str(run.id), 'session_id': str(session.id), 'model': run.model})}\n\n"
-            stream = await client.chat.completions.create(
-                model=run.model,
-                messages=messages,
-                temperature=0.3,
-                stream=True,
-            )
-            async for chunk in stream:
-                delta = ((chunk.choices[0].delta.content or "") if chunk.choices else "")
-                if not delta:
-                    continue
-                full_output_parts.append(delta)
-                yield f"data: {json.dumps({'type': 'token', 'text': delta, 'run_id': str(run.id)})}\n\n"
+        import asyncio
+        from datetime import datetime, timezone
+        from app.database.session import async_session_scope
+        # Replaying full text is safe: Worker consumes absolute full_text snapshots.
+        previous = ""
+        yield f"data: {json.dumps({'type': 'start', 'run_id': str(run_id), 'session_id': str(session_id), 'model': model})}\n\n"
+        while True:
+            events = []
+            async with async_session_scope() as poll_db:
+                from sqlalchemy import select
+                from app.database.session import bind_db_user_context
+                bind_db_user_context(poll_db, user_id)
+                observer = (await poll_db.execute(select(DBUser).where(DBUser.id == user_id))).scalar_one_or_none()
+                if observer is None or not observer.is_active:
+                    raise HTTPException(403, "Access revoked")
+                current = await get_thinking_session_or_404(session_id, poll_db)
+                await ensure_thinking_session_permission(current, observer, poll_db, "control")
+                current_run = await get_thinking_synthesis_run_or_404(session_id, run_id, poll_db)
+                run_status = str(getattr(current_run.status, "value", current_run.status))
+                output = current_run.output_text or ""
+                if output != previous:
+                    events.append({"type": "token", "text": output[len(previous):] if output.startswith(previous) else output, "full_text": output, "run_id": str(run_id)})
+                    previous = output
+                # Interrupted producers retain their last committed partial output.
+                updated_at = current_run.updated_at
+                if updated_at and updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                stale_after = max(120, settings.THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS * 2)
+                if run_status == "streaming" and updated_at and (datetime.now(timezone.utc) - updated_at).total_seconds() > stale_after:
+                    current, failed = await fail_stalled_synthesis_run(session_id, run_id, stale_after, poll_db)
+                    if failed:
+                        run_status = "failed"
+                if run_status in {"completed", "failed"}:
+                    # A terminal run may have committed after the first session SELECT.
+                    await poll_db.refresh(current)
+                    snapshot = await build_thinking_session_snapshot(current, poll_db)
+                    event = {"type": "done" if run_status == "completed" else "error", "run_id": str(run_id), "text": output, "session": snapshot}
+                    if run_status == "failed":
+                        event["message"] = "Synthesis interrupted; partial output is retained"
+                    events.append(event)
+            # Release the database connection before network backpressure can suspend us.
+            for event in events:
+                yield f"data: {json.dumps(event)}\n\n"
+            if run_status in {"completed", "failed"}:
+                return
+            yield ": heartbeat\n\n"
+            await asyncio.sleep(0.75)
 
-            full_output = "".join(full_output_parts).strip()
-            updated_session = await complete_synthesis_run(session, run, full_output, db)
-            updated_snapshot = await build_thinking_session_snapshot(updated_session, db)
-            yield f"data: {json.dumps({'type': 'done', 'run_id': str(run.id), 'text': full_output, 'session': updated_snapshot})}\n\n"
-        except Exception as exc:
-            logger.exception("Thinking session synthesis failed: session_id=%s run_id=%s", session.id, run.id)
-            failed_session = await fail_synthesis_run(session, run, str(exc), db)
-            failed_snapshot = await build_thinking_session_snapshot(failed_session, db)
-            yield f"data: {json.dumps({'type': 'error', 'run_id': str(run.id), 'message': str(exc), 'session': failed_snapshot})}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type * as Party from "partykit/server";
+import type * as Party from "./test-types";
+vi.mock("partyserver", () => import("./test-runtime"));
+vi.mock("y-partyserver", () => import("./test-runtime"));
+vi.mock("./security", () => ({ authorizeMessage: async () => ({ can_view: true, can_update: true }), checkMessageBudget: () => true, watchAuthorization: () => () => {}, decodeIdentityHeader: (value: string | null) => value ? decodeURIComponent(value) : "" }));
 import ThinkingSessionServer from "./thinking-session-server";
 
 const SESSION_ID = "22222222-2222-4222-8222-222222222222";
@@ -231,7 +234,7 @@ describe("ThinkingSessionServer", () => {
     await server.onConnect(connection as unknown as Party.Connection, createContextForUser("user-1"));
     connection.sent.length = 0;
 
-    await server.onMessage("{bad json", connection as unknown as Party.Connection);
+    await server.onMessage(connection as unknown as Party.Connection, "{bad json");
 
     expect(parseLastSent(connection)).toMatchObject({
       type: "server_error",
@@ -252,10 +255,10 @@ describe("ThinkingSessionServer", () => {
     }));
     connection.sent.length = 0;
 
-    await server.onMessage(JSON.stringify({
+    await server.onMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "submit_contribution",
       payload: { content: "I should not be allowed" },
-    }), connection as unknown as Party.Connection);
+    }));
 
     expect(parseLastSent(connection)).toMatchObject({
       type: "server_error",
@@ -275,20 +278,20 @@ describe("ThinkingSessionServer", () => {
     await server.onConnect(connection as unknown as Party.Connection, createContextForUser("user-1"));
     connection.sent.length = 0;
 
-    await server.onMessage(JSON.stringify({
+    await server.onMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "transition_phase",
       payload: { targetPhase: "synthesizing" },
-    }), connection as unknown as Party.Connection);
+    }));
 
     expect(parseLastSent(connection)).toMatchObject({
       type: "server_error",
       payload: { code: "forbidden" },
     });
 
-    await server.onMessage(JSON.stringify({
+    await server.onMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "update_refinement",
       payload: { refinedOutput: "Not allowed" },
-    }), connection as unknown as Party.Connection);
+    }));
 
     expect(parseLastSent(connection)).toMatchObject({
       type: "server_error",
@@ -311,10 +314,10 @@ describe("ThinkingSessionServer", () => {
     }));
     connection.sent.length = 0;
 
-    await server.onMessage(JSON.stringify({
+    await server.onMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "toggle_vote",
       payload: { contributionId: "not-a-uuid" },
-    }), connection as unknown as Party.Connection);
+    }));
 
     expect(parseLastSent(connection)).toMatchObject({
       type: "server_error",
@@ -325,7 +328,7 @@ describe("ThinkingSessionServer", () => {
 
   it("broadcasts presence leave only after the last connection closes", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValue(new Response(JSON.stringify(buildRawSession()), { status: 200 }));
+      .mockImplementation(async () => Response.json(buildRawSession()));
     vi.stubGlobal("fetch", fetchMock);
 
     const room = createRoom();
@@ -379,15 +382,15 @@ describe("ThinkingSessionServer", () => {
       isHost: true,
     }));
 
-    await server.onMessage(JSON.stringify({
+    await server.onMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "transition_phase",
       payload: { targetPhase: "synthesizing" },
-    }), connection as unknown as Party.Connection);
+    }));
 
-    await server.onMessage(JSON.stringify({
+    await server.onMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "transition_phase",
       payload: { targetPhase: "synthesizing" },
-    }), connection as unknown as Party.Connection);
+    }));
 
     await flushPromises();
 
@@ -419,10 +422,10 @@ describe("ThinkingSessionServer", () => {
       isHost: true,
     }));
 
-    await server.onMessage(JSON.stringify({
+    await server.onMessage(connection as unknown as Party.Connection, JSON.stringify({
       type: "transition_phase",
       payload: { targetPhase: "synthesizing" },
-    }), connection as unknown as Party.Connection);
+    }));
 
     await flushPromises();
     let synthesisCalls = fetchMock.mock.calls.filter((call) => String(call[0]).includes("/synthesis/stream"));

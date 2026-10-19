@@ -1,5 +1,10 @@
-import type * as Party from "partykit/server";
-import { onConnect } from "y-partykit";
+import { loadSnapshot, saveSnapshot } from "./snapshot";
+import type { Connection, ConnectionContext, WSMessage } from "partyserver";
+import { YServer } from "y-partyserver";
+import * as Y from "yjs";
+import { yDocToPlainText } from "../src/lib/collaboration/content";
+import type { RealtimeEnv } from "./security";
+import { authorizeMessage, checkMessageBudget, watchAuthorization, decodeIdentityHeader } from "./security";
 import {
   COLLABORATION_AUTH_TIMEOUT_MS,
   COLLABORATION_TYPING_TIMEOUT_MS,
@@ -56,7 +61,7 @@ type ConnectionPresenceState = CollaboratorIdentity & {
 
 function getBackendUrl(env: Record<string, unknown>): string {
   const value = String(
-    env.PARTYKIT_BACKEND_URL ?? DEFAULT_PARTYKIT_BACKEND_URL,
+    env.REALTIME_BACKEND_URL ?? env.PARTYKIT_BACKEND_URL ?? DEFAULT_PARTYKIT_BACKEND_URL,
   ).trim();
 
   return value.replace(/\/+$/, "");
@@ -193,12 +198,16 @@ function parseClientMessage(rawMessage: string): CollaborationClientMessage | nu
   return null;
 }
 
+class BackendResponseError extends Error {
+  constructor(readonly status: number) { super(`Backend request failed: ${status}`); }
+}
+
 async function fetchJson<T>(
   input: string,
   init: RequestInit,
   timeoutMs = COLLABORATION_AUTH_TIMEOUT_MS,
 ): Promise<T> {
-  const maxRetries = 3;
+  const maxRetries = (init.method && init.method !== "GET") ? 0 : 2;
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -214,8 +223,7 @@ async function fetchJson<T>(
       clearTimeout(timeout);
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
-        throw new Error(`Backend request failed: ${response.status} ${errorText.slice(0, 100)}`);
+        throw new BackendResponseError(response.status);
       }
 
       return (await response.json()) as T;
@@ -224,7 +232,7 @@ async function fetchJson<T>(
       lastError = error instanceof Error ? error : new Error(String(error));
 
       // Don't retry on client errors (4xx) or if this is the last attempt
-      if (error instanceof Error && error.message.includes("status 4")) {
+      if (error instanceof Error && /failed: 4\d\d/.test(error.message)) {
         throw error;
       }
 
@@ -281,26 +289,102 @@ function toIdentity(state: ConnectionPresenceState): CollaboratorIdentity {
 }
 
 /**
- * One PartyKit room per note.
- * Binary Yjs sync is delegated to y-partykit, while string messages implement
+ * One Durable Object per note.
+ * Binary Yjs sync is delegated to YServer, while string messages implement
  * note-specific presence, cursor, selection, and typing signals.
  */
-export class NoteCollaborationServer implements Party.Server {
+export class NoteCollaborationServer extends YServer<RealtimeEnv> {
   private readonly connections = new Map<string, ConnectionPresenceState>();
   private readonly userConnections = new Map<string, Set<string>>();
   private readonly typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly typingConnections = new Map<string, Set<string>>();
 
-  constructor(readonly room: Party.Room) {}
+  private readonly authWatchers = new Map<string, () => void>();
+  private initialized = false;
+  private initializePromise: Promise<void> | null = null;
+  private saveChain: Promise<void> = Promise.resolve();
+  private messageChain: Promise<void> = Promise.resolve();
+  private pendingMessages = 0;
+  private backendContent = "";
+  private projectionToken = "";
+  private revision = 0;
+  private persistedRevision = -1;
+  private persistedBackendContent = "";
 
-  readonly options = {
+  async onLoad(): Promise<void> {
+    const saved = await loadSnapshot(this.ctx.storage, this.document);
+    if (saved) {
+      this.backendContent = saved.backendContent;
+      this.initialized = true;
+      this.persistedRevision = 0;
+      this.persistedBackendContent = this.backendContent;
+    }
+    this.document.on("update", () => { this.revision++; });
+  }
+
+  private async checkpoint(): Promise<void> {
+    if (!this.initialized || (this.persistedRevision === this.revision && this.persistedBackendContent === this.backendContent)) return;
+    const revision = this.revision;
+    const backendContent = this.backendContent;
+    await saveSnapshot(this.ctx.storage, this.document, backendContent);
+    this.persistedRevision = revision;
+    this.persistedBackendContent = backendContent;
+  }
+
+  isReadOnly(connection: Connection): boolean {
+    return !this.connections.get(connection.id)?.canUpdate;
+  }
+
+  async onSave(): Promise<void> {
+    // Serialize projections: a slow request must never overwrite a newer save.
+    const save = async () => {
+      await this.checkpoint();
+      const content = yDocToPlainText(this.document);
+      if (!this.initialized || content === this.backendContent.replace(/\r\n/g, "\n") || !this.projectionToken) return;
+      try {
+        const tokens = [...new Set([
+          ...[...this.connections.entries()].filter(([, presence]) => presence.canUpdate)
+            .map(([id]) => this.connectionTokens.get(id)).filter((token): token is string => Boolean(token)),
+          this.projectionToken,
+        ])];
+        let saved = false;
+        for (const token of tokens) {
+          try {
+            const note = await fetchJson<BackendNoteResponse>(
+              `${getBackendUrl(this.env)}/notes/${getNoteIdFromRoomId(this.name)}/collaboration`,
+              { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ content, base_content: this.backendContent }) },
+            );
+            this.projectionToken = token;
+            this.backendContent = note.content ?? content;
+            saved = true;
+            break;
+          } catch (error) {
+            // Authentication/permission failures cannot have committed a mutation.
+            if (!(error instanceof BackendResponseError) || ![401, 403].includes(error.status)) throw error;
+          }
+        }
+        if (!saved) throw new Error("No authorized editor credential available");
+        await this.checkpoint();
+      } catch {
+        console.error(JSON.stringify({ event: "note_projection_failed" }));
+        this.broadcastEvent({ type: "server_error", payload: { code: "persistence_failed", message: "Changes are retained in collaboration storage; backend save needs recovery" } });
+        throw new Error("Backend projection failed");
+      }
+    };
+    const pending = this.saveChain.then(save, save);
+    this.saveChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  static options = {
     hibernate: false,
   };
 
   static async onBeforeConnect(
-    request: Party.Request,
-    lobby: Party.Lobby,
-  ): Promise<Party.Request | Response> {
+    request: Request,
+    lobby: { env: RealtimeEnv },
+  ): Promise<Request | Response> {
     const token = getBearerToken(request.url);
     const roomId = getRoomIdFromRequest(request.url);
     const noteId = roomId ? getNoteIdFromRoomId(roomId) : null;
@@ -322,34 +406,48 @@ export class NoteCollaborationServer implements Party.Server {
       const presence = await resolveConnectionContext(backendUrl, token, noteId);
 
       request.headers.set(HEADER_USER_ID, presence.userId);
-      request.headers.set(HEADER_USER_EMAIL, presence.email);
-      request.headers.set(HEADER_USER_NAME, presence.name);
+      request.headers.set(HEADER_USER_EMAIL, encodeURIComponent(presence.email));
+      request.headers.set(HEADER_USER_NAME, encodeURIComponent(presence.name));
       request.headers.set(HEADER_USER_COLOR, presence.color);
       request.headers.set(HEADER_CAN_UPDATE, presence.canUpdate ? "1" : "0");
       request.headers.set(HEADER_CONNECTED_AT, presence.connectedAt);
       request.headers.set(HEADER_AUTH_TOKEN, token);
 
       return request;
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      return new Response(`Unauthorized: ${errorMsg}`, { status: 401 });
+    } catch {
+      console.warn(JSON.stringify({ event: "note_auth_failed" }));
+      return new Response("Unauthorized", { status: 401 });
     }
   }
 
   async onConnect(
-    connection: Party.Connection,
-    ctx: Party.ConnectionContext,
+    connection: Connection,
+    ctx: ConnectionContext,
   ): Promise<void> {
     const presence = this.readPresenceFromHeaders(connection, ctx.request.headers);
     const token = ctx.request.headers.get(HEADER_AUTH_TOKEN)?.trim() || "";
 
     const isFirstConnectionForUser = this.registerConnection(connection, presence);
+    this.connectionTokens.set(connection.id, token);
+    this.authWatchers.set(connection.id, watchAuthorization(this.env, connection, token, this.name));
 
-    await onConnect(connection, this.room, {
-      load: async () => this.loadInitialDocument(token),
-      persist: { mode: "snapshot" },
-      readOnly: !presence.canUpdate,
-    });
+    if (presence.canUpdate) this.projectionToken = token;
+    if (!this.initialized) {
+      this.initializePromise ??= (async () => {
+        const note = await fetchJson<BackendNoteResponse>(`${getBackendUrl(this.env)}/notes/${getNoteIdFromRoomId(this.name)}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const seed = createYDocFromPlainText(note.content ?? "");
+        if (seed) { Y.applyUpdate(this.document, Y.encodeStateAsUpdate(seed)); seed.destroy(); }
+        this.backendContent = note.content ?? "";
+        this.initialized = true;
+        await this.checkpoint();
+      })().catch((error) => { this.initializePromise = null; throw error; });
+      await this.initializePromise;
+    }
+    await super.onConnect(connection, ctx);
+    // A restored dirty snapshot must project even if nobody types after reopening it.
+    if (presence.canUpdate) this.ctx.waitUntil(this.onSave().catch(() => undefined));
 
     this.sendToConnection(connection, {
       type: "presence_snapshot",
@@ -359,19 +457,43 @@ export class NoteCollaborationServer implements Party.Server {
     });
 
     if (isFirstConnectionForUser) {
-      this.broadcast({
+      this.broadcastEvent({
         type: "presence_join",
         payload: {
-          collaborator: this.toPresence(presence.userId),
+          collaborator: this.toPresence(presence.userId)!,
         },
       }, [connection.id]);
     }
   }
 
-  async onMessage(
-    message: string | ArrayBuffer | ArrayBufferView,
-    sender: Party.Connection,
-  ): Promise<void> {
+  onMessage(sender: Connection, message: WSMessage): Promise<void> {
+    if (!checkMessageBudget(sender, message)) return Promise.resolve();
+    if (this.pendingMessages >= 32) { sender.close(4429, "Room queue full"); return Promise.resolve(); }
+    this.pendingMessages++;
+    const pending = this.messageChain.then(() => this.processMessage(sender, message)).finally(() => { this.pendingMessages--; });
+    this.messageChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  private async processMessage(sender: Connection, message: WSMessage): Promise<void> {
+    const token = this.connectionTokens.get(sender.id);
+    const access = token ? await authorizeMessage(this.env, token, this.name) : null;
+    if (!access) {
+      sender.close(4403, "Access expired or revoked"); return;
+    }
+    const presence = this.connections.get(sender.id);
+    if (presence?.canUpdate && !access.can_update) {
+      sender.close(4403, "Editing permission revoked"); return;
+    }
+    if (presence) presence.canUpdate = Boolean(access.can_update);
+    // YServer checks isReadOnly for both sync step 2 and update frames.
+    super.onMessage(sender, message);
+    await this.checkpoint();
+  }
+
+  private readonly connectionTokens = new Map<string, string>();
+
+  onCustomMessage(sender: Connection, message: string): void {
     if (typeof message !== "string") {
       return;
     }
@@ -388,7 +510,7 @@ export class NoteCollaborationServer implements Party.Server {
     }
 
     if (parsed.type === "cursor_move") {
-      this.broadcast({
+      this.broadcastEvent({
         type: "cursor_move",
         payload: {
           collaborator: toIdentity(presence),
@@ -399,7 +521,7 @@ export class NoteCollaborationServer implements Party.Server {
     }
 
     if (parsed.type === "selection_change") {
-      this.broadcast({
+      this.broadcastEvent({
         type: "selection_change",
         payload: {
           collaborator: toIdentity(presence),
@@ -418,52 +540,34 @@ export class NoteCollaborationServer implements Party.Server {
     }
   }
 
-  async onClose(connection: Party.Connection): Promise<void> {
+  async onClose(connection: Connection): Promise<void> {
+    super.onClose(connection, 1000, "", true);
     this.unregisterConnection(connection);
+    await this.onSave();
   }
 
-  async onError(connection: Party.Connection): Promise<void> {
+  async onError(connection: Connection): Promise<void> {
+    super.onClose(connection, 1011, "", false);
     this.unregisterConnection(connection);
   }
 
   private readPresenceFromHeaders(
-    connection: Party.Connection,
+    connection: Connection,
     headers: Pick<Headers, "get">,
   ): ConnectionPresenceState {
     return {
       connectionId: connection.id,
       userId: headers.get(HEADER_USER_ID)?.trim() || connection.id,
-      email: headers.get(HEADER_USER_EMAIL)?.trim() || "",
-      name: headers.get(HEADER_USER_NAME)?.trim() || "Unknown collaborator",
+      email: decodeIdentityHeader(headers.get(HEADER_USER_EMAIL)).trim(),
+      name: decodeIdentityHeader(headers.get(HEADER_USER_NAME)).trim() || "Unknown collaborator",
       color: headers.get(HEADER_USER_COLOR)?.trim() || getCollaboratorColor(connection.id),
       canUpdate: headers.get(HEADER_CAN_UPDATE) === "1",
       connectedAt: headers.get(HEADER_CONNECTED_AT)?.trim() || new Date().toISOString(),
     };
   }
 
-  private async loadInitialDocument(token: string) {
-    if (!token) {
-      return null;
-    }
-
-    try {
-      const note = await fetchJson<BackendNoteResponse>(
-        `${getBackendUrl(this.room.env)}/notes/${getNoteIdFromRoomId(this.room.id)}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        },
-      );
-
-      return createYDocFromPlainText(note.content ?? "");
-    } catch {
-      return null;
-    }
-  }
-
   private registerConnection(
-    connection: Party.Connection,
+    connection: Connection,
     presence: ConnectionPresenceState,
   ): boolean {
     connection.setState(presence);
@@ -478,15 +582,20 @@ export class NoteCollaborationServer implements Party.Server {
     return isFirstConnection;
   }
 
-  private unregisterConnection(connection: Party.Connection): void {
+  private unregisterConnection(connection: Connection): void {
     const presence = this.connections.get(connection.id);
     if (!presence) {
       return;
     }
 
     this.clearTypingTimeout(connection.id);
-    this.setTypingConnectionState(presence.userId, connection.id, false);
+    if (this.setTypingConnectionState(presence.userId, connection.id, false)) {
+      this.broadcastEvent({ type: "typing_indicator", payload: { collaborator: toIdentity(presence), isTyping: false } });
+    }
     this.connections.delete(connection.id);
+    this.connectionTokens.delete(connection.id);
+    this.authWatchers.get(connection.id)?.();
+    this.authWatchers.delete(connection.id);
 
     const userConnectionIds = this.userConnections.get(presence.userId);
     if (!userConnectionIds) {
@@ -499,7 +608,7 @@ export class NoteCollaborationServer implements Party.Server {
     }
 
     this.userConnections.delete(presence.userId);
-    this.broadcast({
+    this.broadcastEvent({
       type: "presence_leave",
       payload: {
         userId: presence.userId,
@@ -508,7 +617,7 @@ export class NoteCollaborationServer implements Party.Server {
   }
 
   private handleTypingState(
-    sender: Party.Connection,
+    sender: Connection,
     presence: ConnectionPresenceState,
     isTyping: boolean,
   ): void {
@@ -519,7 +628,7 @@ export class NoteCollaborationServer implements Party.Server {
     );
 
     if (typingStateChanged) {
-      this.broadcast({
+      this.broadcastEvent({
         type: "typing_indicator",
         payload: {
           collaborator: toIdentity(presence),
@@ -545,7 +654,7 @@ export class NoteCollaborationServer implements Party.Server {
         false,
       );
       if (typingStateChanged) {
-        this.broadcast({
+        this.broadcastEvent({
           type: "typing_indicator",
           payload: {
             collaborator: toIdentity(presence),
@@ -623,21 +732,21 @@ export class NoteCollaborationServer implements Party.Server {
   }
 
   private sendToConnection(
-    connection: Party.Connection,
+    connection: Connection,
     message: CollaborationServerMessage,
   ): void {
-    connection.send(serializeCollaborationMessage(message));
+    this.sendCustomMessage(connection, serializeCollaborationMessage(message));
   }
 
-  private broadcast(
+  private broadcastEvent(
     message: CollaborationServerMessage,
     without: string[] = [],
   ): void {
-    this.room.broadcast(serializeCollaborationMessage(message), without);
+    this.broadcastCustomMessage(serializeCollaborationMessage(message), without[0] ? this.getConnection(without[0]) : undefined);
   }
 
   private sendError(
-    connection: Party.Connection,
+    connection: Connection,
     code: string,
     message: string,
   ): void {

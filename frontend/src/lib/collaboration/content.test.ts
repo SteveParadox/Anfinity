@@ -28,6 +28,15 @@ describe("collaboration content helpers", () => {
   });
 
   it("does not create a seed document for empty content", () => {
-    expect(createYDocFromPlainText("   ")).toBeNull();
+    expect(createYDocFromPlainText("")).toBeNull();
   });
+});
+
+
+it("preserves whitespace-only content, repeated blank lines and trailing whitespace", () => {
+  for (const text of ["   ", "Alpha\n\n\n\nBeta \n\n"]) {
+    const doc = createYDocFromPlainText(text)!;
+    expect(yDocToPlainText(doc)).toBe(text);
+    doc.destroy();
+  }
 });

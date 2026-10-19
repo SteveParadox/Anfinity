@@ -1,4 +1,6 @@
-import type * as Party from "partykit/server";
+import { Server, type Connection, type ConnectionContext, type WSMessage } from "partyserver";
+import type { RealtimeEnv } from "./security";
+import { authorizeMessage, checkMessageBudget, watchAuthorization, decodeIdentityHeader } from "./security";
 import {
   COLLABORATION_AUTH_TIMEOUT_MS,
   DEFAULT_PARTYKIT_BACKEND_URL,
@@ -31,8 +33,6 @@ const HEADER_IS_HOST = "x-thinking-is-host";
 const HEADER_CONNECTED_AT = "x-thinking-connected-at";
 const HEADER_AUTH_TOKEN = "x-thinking-auth-token";
 
-const HEARTBEAT_INTERVAL_MS = 30_000;
-const SYNTHESIS_PROGRESS_FLUSH_MS = 750;
 const MAX_THINKING_MESSAGE_BYTES = 32_768;
 const MAX_CONTRIBUTION_LENGTH = 5_000;
 const MAX_REFINEMENT_LENGTH = 50_000;
@@ -94,7 +94,7 @@ type ActiveSynthesisStream = {
 
 function getBackendUrl(env: Record<string, unknown>): string {
   const value = String(
-    env.PARTYKIT_BACKEND_URL ?? DEFAULT_PARTYKIT_BACKEND_URL,
+    env.REALTIME_BACKEND_URL ?? env.PARTYKIT_BACKEND_URL ?? DEFAULT_PARTYKIT_BACKEND_URL,
   ).trim();
 
   return value.replace(/\/+$/, "");
@@ -238,7 +238,7 @@ async function fetchJson<T>(
   init: RequestInit,
   timeoutMs = COLLABORATION_AUTH_TIMEOUT_MS,
 ): Promise<T> {
-  const maxRetries = 3;
+  const maxRetries = (init.method && init.method !== "GET") ? 0 : 2;
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
@@ -254,8 +254,7 @@ async function fetchJson<T>(
       clearTimeout(timeout);
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
-        throw new Error(`Backend request failed: ${response.status} ${errorText.slice(0, 200)}`);
+        throw new Error(`Backend request failed: ${response.status}`);
       }
 
       return (await response.json()) as T;
@@ -263,7 +262,7 @@ async function fetchJson<T>(
       clearTimeout(timeout);
       lastError = error instanceof Error ? error : new Error(String(error));
 
-      if (error instanceof Error && error.message.includes("status 4")) {
+      if (error instanceof Error && /failed: 4\d\d/.test(error.message)) {
         throw error;
       }
 
@@ -314,24 +313,26 @@ async function resolveConnectionContext(
   };
 }
 
-export class ThinkingSessionServer implements Party.Server {
+export class ThinkingSessionServer extends Server<RealtimeEnv> {
   private readonly connections = new Map<string, ConnectionState>();
   private readonly userConnections = new Map<string, Set<string>>();
+  private readonly authWatchers = new Map<string, () => void>();
+  private messageChain: Promise<void> = Promise.resolve();
+  private pendingMessages = 0;
   private sessionSnapshot: ThinkingSession | null = null;
   private sessionFetchPromise: Promise<ThinkingSession> | null = null;
   private activeStream: ActiveSynthesisStream | null = null;
   private synthesisRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(readonly room: Party.Room) {}
 
-  readonly options = {
+  static options = {
     hibernate: false,
   };
 
   static async onBeforeConnect(
-    request: Party.Request,
-    lobby: Party.Lobby,
-  ): Promise<Party.Request | Response> {
+    request: Request,
+    lobby: { env: RealtimeEnv },
+  ): Promise<Request | Response> {
     const token = getBearerToken(request.url);
     const roomId = getRoomIdFromRequest(request.url);
 
@@ -357,8 +358,8 @@ export class ThinkingSessionServer implements Party.Server {
       );
 
       request.headers.set(HEADER_USER_ID, presence.userId);
-      request.headers.set(HEADER_USER_EMAIL, presence.email);
-      request.headers.set(HEADER_USER_NAME, presence.name);
+      request.headers.set(HEADER_USER_EMAIL, encodeURIComponent(presence.email));
+      request.headers.set(HEADER_USER_NAME, encodeURIComponent(presence.name));
       request.headers.set(HEADER_USER_COLOR, presence.color);
       request.headers.set(HEADER_CAN_PARTICIPATE, presence.canParticipate ? "1" : "0");
       request.headers.set(HEADER_CAN_CONTROL, presence.canControl ? "1" : "0");
@@ -367,21 +368,23 @@ export class ThinkingSessionServer implements Party.Server {
       request.headers.set(HEADER_AUTH_TOKEN, token);
 
       return request;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return new Response(`Unauthorized: ${errorMessage}`, { status: 401 });
+    } catch {
+      console.warn(JSON.stringify({ event: "thinking_auth_failed" }));
+      return new Response("Unauthorized", { status: 401 });
     }
   }
 
   async onConnect(
-    connection: Party.Connection,
-    ctx: Party.ConnectionContext,
+    connection: Connection,
+    ctx: ConnectionContext,
   ): Promise<void> {
     const state = this.readConnectionState(connection, ctx.request.headers);
     const isFirstConnection = this.registerConnection(connection, state);
+    this.authWatchers.set(connection.id, watchAuthorization(this.env, connection, state.token, this.name));
 
-    await this.pingParticipant(state.token).catch(() => undefined);
-    await this.ensureSessionSnapshot(state.token).catch(() => undefined);
+    // The ping response is a fresh authoritative snapshot, including on reconnect.
+    await this.pingParticipant(state.token);
+    await this.ensureSessionSnapshot(state.token);
 
     this.sendToConnection(connection, {
       type: "presence_snapshot",
@@ -402,7 +405,7 @@ export class ThinkingSessionServer implements Party.Server {
     this.ensurePendingSynthesisStream(state.token);
 
     if (isFirstConnection) {
-      this.broadcast(
+      this.broadcastEvent(
         {
           type: "presence_join",
           payload: {
@@ -414,9 +417,18 @@ export class ThinkingSessionServer implements Party.Server {
     }
   }
 
-  async onMessage(
-    message: string | ArrayBuffer | ArrayBufferView,
-    sender: Party.Connection,
+  onMessage(sender: Connection, message: WSMessage): Promise<void> {
+    if (!checkMessageBudget(sender, message)) return Promise.resolve();
+    if (this.pendingMessages >= 256) { sender.close(4429, "Room queue full"); return Promise.resolve(); }
+    this.pendingMessages++;
+    const pending = this.messageChain.then(() => this.processMessage(sender, message)).finally(() => { this.pendingMessages--; });
+    this.messageChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  private async processMessage(
+    sender: Connection,
+    message: WSMessage,
   ): Promise<void> {
     if (typeof message !== "string") {
       return;
@@ -427,6 +439,10 @@ export class ThinkingSessionServer implements Party.Server {
       return;
     }
 
+    if (!await authorizeMessage(this.env, state.token, `thinking-session:${this.sessionId}`)) {
+      sender.close(4403, "Access expired or revoked");
+      return;
+    }
     const parsed = parseClientMessage(message);
     if (!parsed) {
       this.sendError(sender, "invalid_message", "Malformed thinking session payload");
@@ -435,7 +451,8 @@ export class ThinkingSessionServer implements Party.Server {
 
     try {
       if (parsed.type === "request_snapshot") {
-        const snapshot = await this.ensureSessionSnapshot(state.token);
+        const snapshot = await this.fetchSessionSnapshot(state.token);
+        this.sessionSnapshot = snapshot;
         this.sendToConnection(sender, {
           type: "session_snapshot",
           payload: {
@@ -487,42 +504,42 @@ export class ThinkingSessionServer implements Party.Server {
           return;
         }
         const result = await this.transitionPhase(state.token, parsed.payload.targetPhase);
-        this.broadcastSessionUpdate(result.session);
+        this.broadcastSessionUpdate(transformThinkingSessionFromAPI(result.session));
         if (result.synthesis_run_id) {
           this.startSynthesisStream(result.synthesis_run_id, state.token);
         }
       }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "Unexpected thinking session error";
-      this.sendError(sender, "request_failed", errorMessage);
+    } catch {
+      console.warn(JSON.stringify({ event: "thinking_request_failed" }));
+      this.sendError(sender, "request_failed", "Session request failed; refresh the snapshot before retrying");
     }
   }
 
-  async onClose(connection: Party.Connection): Promise<void> {
+  async onClose(connection: Connection): Promise<void> {
     this.unregisterConnection(connection);
   }
 
-  async onError(connection: Party.Connection): Promise<void> {
+  async onError(connection: Connection): Promise<void> {
     this.unregisterConnection(connection);
   }
 
   private get backendUrl(): string {
-    return getBackendUrl(this.room.env);
+    return getBackendUrl(this.env);
   }
 
   private get sessionId(): string {
-    return getThinkingSessionIdFromRoomId(this.room.id);
+    return getThinkingSessionIdFromRoomId(this.name);
   }
 
   private readConnectionState(
-    connection: Party.Connection,
+    connection: Connection,
     headers: Pick<Headers, "get">,
   ): ConnectionState {
     return {
       connectionId: connection.id,
       userId: headers.get(HEADER_USER_ID)?.trim() || connection.id,
-      email: headers.get(HEADER_USER_EMAIL)?.trim() || "",
-      name: headers.get(HEADER_USER_NAME)?.trim() || "Collaborator",
+      email: decodeIdentityHeader(headers.get(HEADER_USER_EMAIL)).trim(),
+      name: decodeIdentityHeader(headers.get(HEADER_USER_NAME)).trim() || "Collaborator",
       color: headers.get(HEADER_USER_COLOR)?.trim() || getCollaboratorColor(connection.id),
       canParticipate: headers.get(HEADER_CAN_PARTICIPATE) === "1",
       canControl: headers.get(HEADER_CAN_CONTROL) === "1",
@@ -532,7 +549,7 @@ export class ThinkingSessionServer implements Party.Server {
     };
   }
 
-  private registerConnection(connection: Party.Connection, state: ConnectionState): boolean {
+  private registerConnection(connection: Connection, state: ConnectionState): boolean {
     connection.setState(state);
     this.connections.set(connection.id, state);
 
@@ -544,13 +561,15 @@ export class ThinkingSessionServer implements Party.Server {
     return isFirstConnection;
   }
 
-  private unregisterConnection(connection: Party.Connection): void {
+  private unregisterConnection(connection: Connection): void {
     const state = this.connections.get(connection.id);
     if (!state) {
       return;
     }
 
     this.connections.delete(connection.id);
+    this.authWatchers.get(connection.id)?.();
+    this.authWatchers.delete(connection.id);
     const userConnectionIds = this.userConnections.get(state.userId);
     if (!userConnectionIds) {
       return;
@@ -562,7 +581,7 @@ export class ThinkingSessionServer implements Party.Server {
     }
 
     this.userConnections.delete(state.userId);
-    this.broadcast({
+    this.broadcastEvent({
       type: "presence_leave",
       payload: {
         userId: state.userId,
@@ -749,7 +768,7 @@ export class ThinkingSessionServer implements Party.Server {
 
   private broadcastSessionUpdate(session: ThinkingSession): void {
     this.sessionSnapshot = session;
-    this.broadcast({
+    this.broadcastEvent({
       type: "session_updated",
       payload: {
         session: this.getHydratedSessionSnapshot(session),
@@ -796,7 +815,7 @@ export class ThinkingSessionServer implements Party.Server {
       ? snapshot.activeSynthesisRun
       : snapshot.synthesisRuns.find((run) => run.id === activeRunId) ?? null;
 
-    if (!activeRun || activeRun.status !== "pending") {
+    if (!activeRun || !["pending", "streaming"].includes(activeRun.status)) {
       return;
     }
 
@@ -829,7 +848,7 @@ export class ThinkingSessionServer implements Party.Server {
     retryCount: number,
   ): void {
     if (retryCount >= MAX_SYNTHESIS_STREAM_RETRIES) {
-      this.broadcast({
+      this.broadcastEvent({
         type: "server_error",
         payload: {
           code: "synthesis_stream_failed",
@@ -902,8 +921,8 @@ export class ThinkingSessionServer implements Party.Server {
           await this.handleSynthesisEvent(event, runId);
         }
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Synthesis stream failed";
+    } catch {
+      const message = "Synthesis stream interrupted; reconnect to recover committed progress";
       await this.flushPendingSynthesisProgress();
 
       const snapshot = await this.fetchSessionSnapshot(token).catch(() => this.sessionSnapshot);
@@ -912,7 +931,7 @@ export class ThinkingSessionServer implements Party.Server {
         const hydratedSnapshot = this.getHydratedSessionSnapshot(snapshot);
 
         if (snapshot.phase === "refining" || snapshot.phase === "completed") {
-          this.broadcast({
+          this.broadcastEvent({
             type: "synthesis_completed",
             payload: {
               runId,
@@ -921,14 +940,14 @@ export class ThinkingSessionServer implements Party.Server {
             },
           });
         } else if (snapshot.phase === "synthesizing") {
-          this.broadcast({
+          this.broadcastEvent({
             type: "session_updated",
             payload: {
               session: hydratedSnapshot,
             },
           });
         } else {
-          this.broadcast({
+          this.broadcastEvent({
             type: "synthesis_failed",
             payload: {
               runId,
@@ -938,7 +957,7 @@ export class ThinkingSessionServer implements Party.Server {
           });
         }
       } else {
-        this.broadcast({
+        this.broadcastEvent({
           type: "server_error",
           payload: {
             code: "synthesis_stream_failed",
@@ -976,7 +995,7 @@ export class ThinkingSessionServer implements Party.Server {
     }
 
     if (event.type === "start") {
-      this.broadcast({
+      this.broadcastEvent({
         type: "synthesis_started",
         payload: {
           runId,
@@ -993,7 +1012,7 @@ export class ThinkingSessionServer implements Party.Server {
         return;
       }
 
-      this.activeStream.fullText += text;
+      this.activeStream.fullText = isString(event.full_text) ? event.full_text : this.activeStream.fullText + text;
       this.activeStream.pendingPersistText = this.activeStream.fullText;
       if (this.sessionSnapshot) {
         this.sessionSnapshot = {
@@ -1013,8 +1032,8 @@ export class ThinkingSessionServer implements Party.Server {
           )),
         };
       }
-      this.scheduleSynthesisProgressPersist();
-      this.broadcast({
+
+      this.broadcastEvent({
         type: "synthesis_chunk",
         payload: {
           runId,
@@ -1029,7 +1048,7 @@ export class ThinkingSessionServer implements Party.Server {
     if (event.type === "done" && isRecord(event.session)) {
       await this.flushPendingSynthesisProgress();
       this.sessionSnapshot = transformThinkingSessionFromAPI(event.session);
-      this.broadcast({
+      this.broadcastEvent({
         type: "synthesis_completed",
         payload: {
           runId,
@@ -1043,7 +1062,7 @@ export class ThinkingSessionServer implements Party.Server {
     if (event.type === "error" && isRecord(event.session)) {
       await this.flushPendingSynthesisProgress();
       this.sessionSnapshot = transformThinkingSessionFromAPI(event.session);
-      this.broadcast({
+      this.broadcastEvent({
         type: "synthesis_failed",
         payload: {
           runId,
@@ -1054,61 +1073,19 @@ export class ThinkingSessionServer implements Party.Server {
     }
   }
 
-  private scheduleSynthesisProgressPersist(): void {
-    if (!this.activeStream || this.activeStream.persistTimer) {
-      return;
-    }
-
-    this.activeStream.persistTimer = setTimeout(() => {
-      if (this.activeStream) {
-        this.activeStream.persistTimer = null;
-      }
-      void this.flushPendingSynthesisProgress();
-    }, SYNTHESIS_PROGRESS_FLUSH_MS);
-  }
-
   private async flushPendingSynthesisProgress(): Promise<void> {
-    if (!this.activeStream || this.activeStream.persistInFlight) {
-      return this.activeStream?.persistInFlight ?? Promise.resolve();
-    }
-
-    const stream = this.activeStream;
-    const partialOutput = stream.pendingPersistText;
-    if (!partialOutput) {
-      return;
-    }
-
-    stream.persistInFlight = fetchJson<{ ok: boolean }>(
-      `${this.backendUrl}/thinking-sessions/${this.sessionId}/synthesis/${stream.runId}/progress`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${stream.token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ partial_output: partialOutput }),
-      },
-    )
-      .then(() => undefined)
-      .catch(() => undefined)
-      .finally(() => {
-        if (this.activeStream?.runId === stream.runId) {
-          this.activeStream.persistInFlight = null;
-        }
-      });
-
-    await stream.persistInFlight;
+    // PostgreSQL progress is committed by the durable synthesis producer.
   }
 
-  private sendToConnection(connection: Party.Connection, message: ThinkingSessionServerMessage): void {
+  private sendToConnection(connection: Connection, message: ThinkingSessionServerMessage): void {
     connection.send(serializeThinkingSessionMessage(message));
   }
 
-  private broadcast(message: ThinkingSessionServerMessage, without: string[] = []): void {
-    this.room.broadcast(serializeThinkingSessionMessage(message), without);
+  private broadcastEvent(message: ThinkingSessionServerMessage, without: string[] = []): void {
+    super.broadcast(serializeThinkingSessionMessage(message), without);
   }
 
-  private sendError(connection: Party.Connection, code: string, message: string): void {
+  private sendError(connection: Connection, code: string, message: string): void {
     this.sendToConnection(connection, {
       type: "server_error",
       payload: {

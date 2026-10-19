@@ -143,7 +143,7 @@ pytest
 ## Production Deployment
 
 See [../DEPLOYMENT.md](../DEPLOYMENT.md) for the current production setup:
-Vercel frontend, hosted PartyKit, and Dockerized FastAPI/Celery services backed
+Vercel frontend, Cloudflare PartyServer, and Dockerized FastAPI/Celery services backed
 by managed PostgreSQL, Redis, Qdrant, and S3.
 
 ### Environment Variables
@@ -190,3 +190,5 @@ services:
 ## License
 
 MIT
+
+Real-time deployment: [Cloudflare guide](../docs/cloudflare-deployment.md); [architecture and persistence](../docs/realtime-architecture.md).

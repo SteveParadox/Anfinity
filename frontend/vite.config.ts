@@ -43,7 +43,7 @@ export default defineConfig(({ command }) => ({
             id.includes('@tiptap')
             || id.includes('prosemirror')
             || id.includes('yjs')
-            || id.includes('y-partykit')
+            || id.includes('y-partyserver')
             || id.includes('y-prosemirror')
             || id.includes('y-protocols')
             || id.includes('@hocuspocus')

@@ -18,7 +18,7 @@ type CollaborativeNoteEditorProps = {
 };
 
 function getEditorText(editor: Editor): string {
-  return editor.getText({ blockSeparator: "\n" }).trimEnd();
+  return editor.getText({ blockSeparator: "\n" });
 }
 
 function renderRemoteCursor(user: Record<string, unknown>): HTMLElement {
@@ -81,10 +81,14 @@ export function CollaborativeNoteEditor({
 }: CollaborativeNoteEditorProps) {
   const onPlainTextChangeRef = useRef(onPlainTextChange);
   const session = useNoteCollaborationSession({
+    userId: user.userId,
     noteId,
     token,
     enabled: Boolean(noteId && token),
   });
+  const canEdit = editable && session.collaborators.find((entry) => entry.userId === user.userId)?.canUpdate !== false;
+  const syncedRef = useRef(session.isSynced);
+  useEffect(() => { syncedRef.current = session.isSynced; }, [session.isSynced]);
   const localUser = useMemo<CollaboratorIdentity>(() => ({
     userId: user.userId,
     email: user.email,
@@ -103,7 +107,7 @@ export function CollaborativeNoteEditor({
     }
 
     if (session.status === "connected" && session.isSynced) {
-      return editable ? "Live sync active" : "Live read-only";
+      return canEdit ? "Live sync active" : "Live read-only";
     }
 
     if (session.status === "connecting") {
@@ -111,11 +115,11 @@ export function CollaborativeNoteEditor({
     }
 
     if (session.status === "disconnected") {
-      return "Disconnected";
+      return "Reconnecting — local edits retained";
     }
 
     return "Preparing room";
-  }, [editable, session.isSynced, session.lastError, session.status]);
+  }, [canEdit, session.isSynced, session.lastError, session.status]);
 
   const remoteTypingUsers = useMemo(() => {
     return session.collaborators.filter((collaborator) => {
@@ -129,7 +133,7 @@ export function CollaborativeNoteEditor({
   const editor = useEditor(
     {
       immediatelyRender: false,
-      editable,
+      editable: canEdit && session.isSynced,
       extensions: [
         StarterKit.configure({
           history: false,
@@ -159,14 +163,14 @@ export function CollaborativeNoteEditor({
       },
       onCreate: ({ editor: nextEditor }) => {
         syncLocalUserAwareness(session.provider, localUser);
-        onPlainTextChangeRef.current?.(getEditorText(nextEditor));
+        if (syncedRef.current) onPlainTextChangeRef.current?.(getEditorText(nextEditor));
       },
       onUpdate: ({ editor: nextEditor, transaction }) => {
         if (!transaction.docChanged) {
           return;
         }
 
-        onPlainTextChangeRef.current?.(getEditorText(nextEditor));
+        if (syncedRef.current) onPlainTextChangeRef.current?.(getEditorText(nextEditor));
         session.setTypingIndicator(true);
       },
       onSelectionUpdate: ({ editor: nextEditor }) => {
@@ -219,9 +223,9 @@ export function CollaborativeNoteEditor({
       return;
     }
 
-    editor.setEditable(editable);
+    editor.setEditable(canEdit && session.isSynced);
     syncLocalUserAwareness(session.provider, localUser);
-  }, [editable, editor, localUser, session.provider]);
+  }, [canEdit, editor, localUser, session.provider, session.isSynced]);
 
   useEffect(() => {
     return () => {
@@ -240,6 +244,8 @@ export function CollaborativeNoteEditor({
       }}
     >
       <div
+        role="status"
+        aria-live="polite"
         style={{
           display: "flex",
           alignItems: "flex-start",
@@ -284,6 +290,7 @@ export function CollaborativeNoteEditor({
               }}
             />
             <span>{statusLabel}</span>
+            {session.recoveryWarning && <span role="status">{session.recoveryWarning}</span>}
           </div>
 
           {showPresence ? (
@@ -401,10 +408,10 @@ export function CollaborativeNoteEditor({
             fontSize: 10,
             letterSpacing: "0.06em",
             textTransform: "uppercase",
-            color: editable ? "var(--theme-accent)" : "var(--theme-text-subtle)",
+            color: canEdit ? "var(--theme-accent)" : "var(--theme-text-subtle)",
           }}
         >
-          {editable ? "Editable" : "Read only"}
+          {canEdit ? "Editable" : "Read only"}
         </span>
       </div>
 

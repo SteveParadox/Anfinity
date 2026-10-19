@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 
 from app.config import get_ollama_request_headers, settings
 from app.database.session import async_engine, init_db, sync_engine
-from app.api import auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions, notifications, approval_workflows, automations, onboarding, competitive_intelligence, preferences, billing
+from app.api import realtime, auth, workspaces, documents, query, knowledge_graph, audit, connectors, ingestion, notes, embeddings, retrieval, answers, conflicts, dlq, monitoring, search, capture, chat, thinking_sessions, notifications, approval_workflows, automations, onboarding, competitive_intelligence, preferences, billing
 from app.core.entitlements import EntitlementRequiredError
 from app.events import websocket_router
 from app.middleware.logging import RequestLoggingMiddleware
@@ -228,6 +228,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # Include routers
 app.include_router(auth.router)
+app.include_router(realtime.router)
 app.include_router(workspaces.router)
 app.include_router(preferences.router)
 app.include_router(billing.router)

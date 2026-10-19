@@ -34,3 +34,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+node_modules/
+.wrangler/
+.dev.vars
+.env
+__pycache__/
+.pytest_cache/
+frontend/dist/

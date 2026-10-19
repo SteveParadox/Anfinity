@@ -12,6 +12,14 @@ from sqlalchemy.exc import IntegrityError
 from app.database.models import NoteComment, NoteCommentMention, NoteCommentReaction, NoteCommentReactionType, User as DBUser, UserNotification, UserNotificationType
 from app.services import note_comments as service
 
+@pytest.fixture(autouse=True)
+def enabled_comment_preferences(monkeypatch):
+    monkeypatch.setattr(service, "workspace_feature_enabled", AsyncMock(return_value=True))
+    async def permitted_recipients(_db, recipient_ids, _kind):
+        return recipient_ids
+    monkeypatch.setattr(service, "filter_notification_recipients", permitted_recipients)
+
+
 
 class FakeResult:
     def __init__(self, value):

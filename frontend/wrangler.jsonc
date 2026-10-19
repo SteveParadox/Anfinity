@@ -1,0 +1,84 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "anfinity-realtime",
+  "main": "partykit/server.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "dev": {
+    "port": 8787
+  },
+  "observability": {
+    "enabled": true,
+    "redact_query_string": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NOTES",
+        "class_name": "NoteCollaborationServer"
+      },
+      {
+        "name": "THINKING",
+        "class_name": "ThinkingSessionServer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1-partyserver",
+      "new_sqlite_classes": [
+        "NoteCollaborationServer",
+        "ThinkingSessionServer"
+      ]
+    }
+  ],
+  "vars": {
+    "REALTIME_ENVIRONMENT": "development",
+    "REALTIME_BACKEND_URL": "http://127.0.0.1:8080",
+    "REALTIME_ALLOWED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173"
+  },
+  "env": {
+    "staging": {
+      "name": "anfinity-realtime-staging",
+      "vars": {
+        "REALTIME_ENVIRONMENT": "staging",
+        "REALTIME_BACKEND_URL": "",
+        "REALTIME_ALLOWED_ORIGINS": ""
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "NOTES",
+            "class_name": "NoteCollaborationServer"
+          },
+          {
+            "name": "THINKING",
+            "class_name": "ThinkingSessionServer"
+          }
+        ]
+      }
+    },
+    "production": {
+      "name": "anfinity-realtime-production",
+      "vars": {
+        "REALTIME_ENVIRONMENT": "production",
+        "REALTIME_BACKEND_URL": "",
+        "REALTIME_ALLOWED_ORIGINS": ""
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "NOTES",
+            "class_name": "NoteCollaborationServer"
+          },
+          {
+            "name": "THINKING",
+            "class_name": "ThinkingSessionServer"
+          }
+        ]
+      }
+    }
+  }
+}
