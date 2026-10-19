@@ -32,7 +32,7 @@ class RedisStub:
 @pytest.fixture
 def ticket_store(monkeypatch):
     store = RedisStub()
-    monkeypatch.setattr(realtime.Redis, "from_url", lambda *_: store)
+    monkeypatch.setattr(realtime.Redis, "from_url", lambda *_, **_kw: store)
     monkeypatch.setattr(realtime, "check_access", AsyncMock())
     monkeypatch.setattr(realtime, "decode_token", lambda _: {"sub": "user"})
     monkeypatch.setattr(realtime.settings, "REALTIME_SERVICE_SECRET", "test-worker-secret")
@@ -98,3 +98,13 @@ async def test_redis_failure_does_not_fall_back_to_unprotected_rooms(ticket_stor
     with pytest.raises(HTTPException) as error:
         await issue()
     assert error.value.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", ["{invalid", '{"room":"'+ROOM+'","aud":"anfinity-realtime","token":"corrupt"}'])
+async def test_corrupt_ticket_records_fail_safely(ticket_store, record):
+    ticket = "x" * 43
+    ticket_store.records[realtime.ticket_key(ticket)] = record
+    with pytest.raises(HTTPException) as error:
+        await realtime.redeem_ticket(realtime.RedeemRequest(room=ROOM, ticket=ticket), worker_request())
+    assert error.value.status_code == 401

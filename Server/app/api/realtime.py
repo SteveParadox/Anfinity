@@ -70,7 +70,7 @@ async def issue_ticket(payload: TicketRequest, request: Request,
     ticket = secrets.token_urlsafe(32)
     record = json.dumps({"room": payload.room, "token": token_encryptor.encrypt(token), "aud": "anfinity-realtime"})
     try:
-        async with Redis.from_url(settings.REDIS_URL) as redis:
+        async with Redis.from_url(settings.REDIS_URL, socket_connect_timeout=3, socket_timeout=3) as redis:
             await redis.set(ticket_key(ticket), record, ex=TICKET_TTL_SECONDS, nx=True)
     except Exception:
         raise HTTPException(503, "Realtime tickets temporarily unavailable") from None
@@ -86,17 +86,20 @@ async def redeem_ticket(payload: RedeemRequest, request: Request):
     if not expected or not hmac.compare_digest(expected.encode(), offered.encode()):
         raise HTTPException(401, "Unauthorized")
     try:
-        async with Redis.from_url(settings.REDIS_URL) as redis:
+        async with Redis.from_url(settings.REDIS_URL, socket_connect_timeout=3, socket_timeout=3) as redis:
             # Atomic consumption across all API replicas; Redis >= 6.2.
             raw = await redis.getdel(ticket_key(payload.ticket))
     except Exception:
         raise HTTPException(503, "Realtime tickets temporarily unavailable") from None
     if not raw:
         raise HTTPException(401, "Expired or consumed ticket")
-    record = json.loads(raw)
-    if record.get("room") != payload.room or record.get("aud") != "anfinity-realtime":
-        raise HTTPException(401, "Invalid ticket scope")
-    token = token_encryptor.decrypt(record["token"])
+    try:
+        record = json.loads(raw)
+        if record.get("room") != payload.room or record.get("aud") != "anfinity-realtime":
+            raise ValueError("Invalid ticket scope")
+        token = token_encryptor.decrypt(record["token"])
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise HTTPException(401, "Invalid ticket") from None
     if not decode_token(token):
         raise HTTPException(401, "Expired credentials")
     # Worker checks current identity and permissions before upgrading.

@@ -12,22 +12,22 @@ See [architecture](realtime-architecture.md), [migration decisions](realtime-mig
 
 | Check | Result |
 | --- | --- |
-| `npm ci` | PASS, clean locked install, 847 packages after final dependency changes |
+| `npm ci` | PASS, clean locked install, 850 packages after review dependency changes |
 | `npm run realtime:typecheck` | PASS |
 | `npm run realtime:lint` | PASS, production Worker entry/classes/security/storage |
-| `npm run test:unit` | PASS: 102 tests / 26 files |
-| `npm run test:realtime` | PASS: 6 real workerd runtime tests |
+| `npm run test:unit` | PASS: 115 tests / 29 files |
+| `npm run test:realtime` | PASS: 9 real workerd runtime tests |
 | `npm run build` | PASS, TypeScript/Vite production build |
 | `npm run realtime:check -- --env staging` | PASS, bundle and bindings validated; blank operator URLs intentionally remain |
 | `npm run realtime:check -- --env production` | PASS, bundle and bindings validated; no remote deployment |
-| Targeted Python pytest command below | PASS: 39 tests |
+| Targeted Python pytest command below | PASS: 58 tests |
 | Python compileall on new/changed realtime modules | PASS |
 | `git -c core.whitespace=cr-at-eol diff --check` | PASS, original mixed/CRLF line endings respected |
-| `npm run lint` | FAIL: 340 errors / 14 warnings repository-wide. Baseline: 340 errors / 16 warnings. Rules were not disabled. |
+| `npm run lint` | FAIL: 339 errors / 14 warnings repository-wide. Baseline: 340 errors / 16 warnings. Rules were not disabled. |
 
 ```bash
 cd Server
-python -m pytest tests/test_realtime_tickets.py tests/test_thinking_synthesis_task.py tests/test_thinking_sessions_service.py tests/test_notes_api_helpers.py tests/test_note_comments_service.py tests/test_auth_google_oauth.py tests/test_automation_registry_codegen.py -q
+python -m pytest tests/test_realtime_consistency.py tests/test_thinking_synthesis_observer.py tests/test_realtime_tickets.py tests/test_thinking_synthesis_task.py tests/test_thinking_sessions_service.py tests/test_notes_api_helpers.py tests/test_note_comments_service.py tests/test_note_invites_service.py tests/test_auth_google_oauth.py tests/test_automation_registry_codegen.py -q
 ```
 
 Python checks used locally installed test/runtime dependencies; the complete pinned backend requirements environment and full backend suite were not reproduced. CI's backend job uses the canonical requirements file and remains UNVERIFIED until it runs.
@@ -67,3 +67,24 @@ Known limitations: non-idempotent contribution/vote operations do not provide fu
 ## Release gate
 
 Review this branch before merging. Supply actual Cloudflare/backend/Vercel values and stage it, inventory/backup any legacy rooms, run authenticated note/session and AI smoke journeys, verify search projections, and resolve/accept the listed limits before production cutover. Never apply the fresh-class migration to unknown existing class identities. Production deployment requires explicit release authorization and valid credentials.
+
+
+## Follow-up defect review
+
+The follow-up commit addresses these verified code paths:
+
+- Save credentials now come from connected editors, with safe 401/403 fallback to another authorized editor; recovered dirty snapshots project on reconnect even without another keystroke.
+- Note frames enter a bounded serialized queue before backend I/O. An editor downgraded to viewer is closed before another update is applied; reconnect presence clamps frontend editability.
+- Unicode names/emails are encoded in trusted internal headers and decoded for presence, avoiding ByteString handshake failures.
+- Initial ticket acquisition has bounded retries with jitter. Disposed note effects cannot open sockets when an outstanding ticket resolves. Ticket HTTP requests have a five-second timeout and a single retry owner.
+- Browser storage failures/timeouts no longer prevent network collaboration. The local adapter preserves the prior update-store format, validates recovery before merging, drains pending writes on close, and merges other tabs' updates transactionally during compaction. Explicit warnings distinguish unavailable local recovery from live synchronization.
+- Invalid/missing host configuration produces inline feedback instead of throwing out the note/session UI; explicit WS/WSS schemes are honored and private production hosts are rejected.
+- Whitespace-only content, trailing whitespace and repeated blank lines survive CRDT projection. Missing content in a collaboration PATCH is rejected instead of silently defaulting to an empty note.
+- Collaboration CAS reads acquire a note row lock. Locked note/session/run reads refresh existing ORM identities; real SQLAlchemy/SQLite identity-map regressions verify refresh behavior while PostgreSQL lock execution remains unverified locally.
+- Stalled synthesis recovery rechecks the heartbeat under locks. SSE reloads/binds the observer's current user, refreshes terminal session state, releases poll sessions before yielding, and rejects superseded pending runs. Producer failures retain the latest partial output, including output received before the periodic flush.
+- Redis ticket operations have bounded I/O timeouts; corrupt encrypted/JSON records return safe 401 responses.
+- Cloudflare observability explicitly redacts query strings from request logs and traces so WebSocket tickets are not retained in platform request URLs.
+
+Additional coverage includes hook unmount/token rotation, transient/permanent connection failures, blocked/corrupt/cross-tab IndexedDB recovery, whitespace round trips, active-editor credential selection, dirty-room recovery, Unicode presence, editor permission revocation, locked ORM refresh, stale-run races, required note content, safe ticket corruption handling, synthesis success/interruption and SSE connection lifetime.
+
+Remote CI was inspected: both jobs on the initial commit had zero executed steps and no runner. GitHub's check annotation states: **"The job was not started because your account is locked due to a billing issue."** This is an external account blocker; CI is not reported as passed. Local validation results above are the execution evidence. Resolve the GitHub account billing lock before relying on Actions validation/deployment.

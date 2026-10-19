@@ -68,7 +68,7 @@ export function createYDocFromPlainText(
   text: string,
   field = DEFAULT_COLLABORATION_FIELD,
 ): Doc | null {
-  if (!text.trim()) {
+  if (text.length === 0) {
     return null;
   }
 
@@ -80,7 +80,5 @@ export function yDocToPlainText(
   field = DEFAULT_COLLABORATION_FIELD,
 ): string {
   const json = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment(field)) as JSONContent;
-  return flattenNodeText(json)
-    .replace(/\n{3,}/g, "\n\n")
-    .trimEnd();
+  return flattenNodeText(json);
 }

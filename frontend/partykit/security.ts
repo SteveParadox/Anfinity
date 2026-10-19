@@ -61,3 +61,9 @@ export function watchAuthorization(env: RealtimeEnv, connection: Connection, tok
   }, 30_000);
   return () => clearInterval(timer);
 }
+
+// HTTP Headers are ByteStrings. Encode display metadata rather than rejecting Unicode users.
+export function decodeIdentityHeader(value: string | null): string {
+  if (!value) return "";
+  try { return decodeURIComponent(value); } catch { return value; }
+}

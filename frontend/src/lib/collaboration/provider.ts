@@ -7,7 +7,8 @@ import {
 import { api } from "../api";
 import YPartyServerProvider from "y-partyserver/provider";
 import * as Y from "yjs";
-import { IndexeddbPersistence } from "y-indexeddb";
+import { LocalDocumentPersistence } from "./localPersistence";
+import { connectInitially } from "./initialConnection";
 import type {
   CollaborationClientMessage,
   CollaborationServerMessage,
@@ -16,7 +17,7 @@ import type {
   SelectionState,
 } from "./protocol";
 import { parseCollaborationServerMessage } from "./protocol";
-import { getRealtimeHost, getNoteRoomId } from "./noteRoom";
+import { getRealtimeConnection, getNoteRoomId } from "./noteRoom";
 
 class BoundedYProvider extends YPartyServerProvider {
   async _reconnectWS(): Promise<void> {
@@ -49,6 +50,7 @@ export type NoteCollaborationSession = {
   remoteCursors: Record<string, CursorState>;
   remoteSelections: Record<string, SelectionState>;
   lastError: string | null;
+  recoveryWarning: string | null;
   sendCollaborationMessage: (message: CollaborationClientMessage) => void;
   sendCursorMove: (payload: CursorState) => void;
   sendSelectionChange: (payload: SelectionState) => void;
@@ -89,6 +91,7 @@ export function useNoteCollaborationSession({
   const [remoteCursors, setRemoteCursors] = useState<Record<string, CursorState>>({});
   const [remoteSelections, setRemoteSelections] = useState<Record<string, SelectionState>>({});
   const [lastError, setLastError] = useState<string | null>(null);
+  const [recoveryWarning, setRecoveryWarning] = useState<string | null>(null);
 
   const providerRef = useRef<YPartyServerProvider | null>(null);
   const documentRef = useRef<{ noteId: string; userId?: string; doc: Y.Doc } | null>(null);
@@ -217,22 +220,34 @@ export function useNoteCollaborationSession({
       setIsSynced(false);
       resetTransientState();
       setLastError(null);
+      setRecoveryWarning(null);
       return;
     }
 
     if (documentRef.current && (documentRef.current.noteId !== trimmedNoteId || documentRef.current.userId !== userId)) documentRef.current.doc.destroy();
     const nextDoc = documentRef.current?.noteId === trimmedNoteId && documentRef.current.userId === userId ? documentRef.current.doc : new Y.Doc();
     documentRef.current = { noteId: trimmedNoteId, userId, doc: nextDoc };
+    let isDisposed = false;
+    const abort = new AbortController();
+    let connection: ReturnType<typeof getRealtimeConnection>;
+    try { connection = getRealtimeConnection(); } catch {
+      setLastError("Real-time service configuration is missing or invalid. Contact your workspace administrator.");
+      setStatus("disconnected"); setIsSynced(false); setProvider(null); setDoc(nextDoc);
+      return;
+    }
     const nextProvider = new BoundedYProvider(
-      getRealtimeHost(),
+      connection.host,
       getNoteRoomId(trimmedNoteId),
       nextDoc,
       {
         connect: false,
+        protocol: connection.protocol,
         disableBc: true,
         params: async () => {
+          if (isDisposed) throw new DOMException("Connection disposed", "AbortError");
           try {
             const { ticket } = await api.createRealtimeTicket(getNoteRoomId(trimmedNoteId));
+            if (isDisposed) throw new DOMException("Connection disposed", "AbortError");
             return { ticket };
           } catch (error) {
             const status = (error as { status?: number }).status;
@@ -243,8 +258,10 @@ export function useNoteCollaborationSession({
       },
     );
 
-    const persistence = userId ? new IndexeddbPersistence(`anfinity:${userId}:note:${trimmedNoteId}`, nextDoc) : null;
-    let isDisposed = false;
+    setRecoveryWarning(null);
+    const persistence = userId ? new LocalDocumentPersistence(`anfinity:${userId}:note:${trimmedNoteId}`, nextDoc, () => {
+      if (!isDisposed) setRecoveryWarning("Local recovery is unavailable. Keep this note open until live sync completes.");
+    }) : null;
 
     const handleStatus = (event: { status: ProviderStatus }) => {
       if (isDisposed) {
@@ -311,14 +328,20 @@ export function useNoteCollaborationSession({
     resetTransientState();
     setLastError(null);
 
-    void (persistence?.whenSynced ?? Promise.resolve()).then(() => {
-      if (!isDisposed) return nextProvider.connect();
-    }).catch(() => {
-      if (!isDisposed) { setLastError("Unable to authenticate collaboration. Reopen this note to retry."); setStatus("disconnected"); }
-    });
+    void (persistence?.ready ?? Promise.resolve()).then(() => connectInitially(
+      () => nextProvider.connect(), abort.signal,
+      (error) => {
+        if (!isDisposed) {
+          const permanent = [401, 403, 404].includes((error as { status?: number }).status ?? 0);
+          setLastError(permanent ? "Access expired or revoked. Reopen this note after signing in." : "Collaboration retries exhausted. Reopen this note to retry.");
+          setStatus("disconnected");
+        }
+      },
+    ));
 
     return () => {
       isDisposed = true;
+      abort.abort();
       nextProvider.off("custom-message", handleCustomMessage);
       nextProvider.off("status", handleStatus);
       nextProvider.off("synced", handleSynced);
@@ -326,7 +349,7 @@ export function useNoteCollaborationSession({
       nextProvider.off("connection-close", handleConnectionClose);
       nextProvider.awareness.setLocalState(null);
       nextProvider.destroy();
-      void persistence?.destroy();
+      persistence?.destroy();
       // Keep unsent CRDT edits when credentials rotate for the same note.
 
       if (providerRef.current === nextProvider) {
@@ -345,6 +368,7 @@ export function useNoteCollaborationSession({
     remoteCursors,
     remoteSelections,
     lastError,
+    recoveryWarning,
     sendCollaborationMessage,
     sendCursorMove,
     sendSelectionChange,

@@ -49,3 +49,26 @@ async def test_provider_failure_is_durable_and_safe(producer, monkeypatch):
     task.fail_synthesis_run.assert_awaited_once()
     assert "review backend logs" in task.fail_synthesis_run.call_args.args[2]
     task.complete_synthesis_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [True, False])
+async def test_producer_keeps_output_when_provider_finishes_or_fails(producer, monkeypatch, interrupted):
+    user, session, run, _ = producer
+    monkeypatch.setattr(task.settings, "OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(task, "monotonic", lambda: 0)
+    monkeypatch.setattr(task, "persist_synthesis_progress", AsyncMock())
+    async def chunks():
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="partial"))])
+        if interrupted: raise RuntimeError("provider interrupted")
+    class Provider:
+        chat = SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=chunks())))
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+    monkeypatch.setattr(task, "AsyncOpenAI", lambda **_: Provider())
+    await task.produce_synthesis(str(session.id), str(run.id), str(user.id))
+    if interrupted:
+        assert task.persist_synthesis_progress.call_args.args[2] == "partial"
+        task.fail_synthesis_run.assert_awaited_once()
+    else:
+        assert task.complete_synthesis_run.call_args.args[2] == "partial"

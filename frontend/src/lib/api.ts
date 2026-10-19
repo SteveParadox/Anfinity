@@ -528,7 +528,7 @@ class ApiClient {
   }
 
   async createRealtimeTicket(room: string): Promise<{ ticket: string }> {
-    return this.request("/realtime/ticket", { method: "POST", body: JSON.stringify({ room }) });
+    return this.request("/realtime/ticket", { method: "POST", body: JSON.stringify({ room }), timeout: 5000, retries: false });
   }
 
   /**

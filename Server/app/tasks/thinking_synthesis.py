@@ -15,7 +15,7 @@ from sqlalchemy.pool import NullPool
 from app.celery_app import celery_app
 from app.config import settings
 from app.database.models import User
-from app.database.session import ASYNC_DATABASE_URL, ssl_context
+from app.database.session import ASYNC_DATABASE_URL, ssl_context, bind_db_user_context
 from app.services.thinking_sessions import (
     build_facilitation_prompt, claim_synthesis_run_for_streaming,
     complete_synthesis_run, fail_synthesis_run, get_thinking_session_or_404, get_thinking_synthesis_run_or_404,
@@ -32,6 +32,7 @@ async def produce_synthesis(session_id: str, run_id: str, user_id: str) -> None:
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with sessions() as db:
+            bind_db_user_context(db, UUID(user_id))
             session = await get_thinking_session_or_404(UUID(session_id), db)
             user = (await db.execute(select(User).where(User.id == UUID(user_id)))).scalar_one_or_none()
             if user is None or not user.is_active:
@@ -43,6 +44,7 @@ async def produce_synthesis(session_id: str, run_id: str, user_id: str) -> None:
                 if exc.status_code == 409:
                     return
                 raise
+            parts: list[str] = []
             try:
                 prompt, messages = build_facilitation_prompt(session, run)
                 run.facilitation_prompt = prompt
@@ -53,7 +55,6 @@ async def produce_synthesis(session_id: str, run_id: str, user_id: str) -> None:
                            "timeout": float(settings.THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS)}
                 if getattr(settings, "OPENAI_BASE_URL", None):
                     options["base_url"] = settings.OPENAI_BASE_URL
-                parts: list[str] = []
                 last_save = monotonic()
                 async with AsyncOpenAI(**options) as client:
                     stream = await client.chat.completions.create(model=run.model, messages=messages, temperature=0.3, stream=True)
@@ -71,6 +72,8 @@ async def produce_synthesis(session_id: str, run_id: str, user_id: str) -> None:
                 # Rollback expires ORM attributes: reload before accessing ids or marking failure.
                 session = await get_thinking_session_or_404(UUID(session_id), db)
                 run = await get_thinking_synthesis_run_or_404(UUID(session_id), UUID(run_id), db)
+                if parts:
+                    await persist_synthesis_progress(session, run, "".join(parts), db)
                 # Keep provider errors/secrets out of WebSocket messages.
                 await fail_synthesis_run(session, run, "Synthesis execution failed; review backend logs", db)
     finally:

@@ -104,7 +104,7 @@ class NoteUpdate(BaseModel):
 
 class NoteCollaborationSync(BaseModel):
     """Schema for lightweight collaborative content persistence."""
-    content: str = Field(default="")
+    content: str
     base_content: Optional[str] = None
 
 
@@ -425,8 +425,8 @@ def serialize_note_contribution(summary) -> NoteContributionResponse:
     )
 
 
-async def load_note_or_404(note_id: UUID, db: AsyncSession) -> Note:
-    note = await get_note_with_bypass(db, note_id)
+async def load_note_or_404(note_id: UUID, db: AsyncSession, *, for_update: bool = False) -> Note:
+    note = await get_note_with_bypass(db, note_id, for_update=for_update)
     if note is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1673,7 +1673,7 @@ async def sync_note_collaboration(
     db: AsyncSession = Depends(get_db)
 ):
     """Persist collaborative content without creating version or task storms."""
-    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db)
+    note = await load_note_or_404(parse_uuid_or_422(note_id, "note_id"), db, for_update=True)
 
     await ensure_note_permission(note, current_user, db, "update")
 

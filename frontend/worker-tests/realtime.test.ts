@@ -1,3 +1,4 @@
+import { createYDocFromPlainText } from "../src/lib/collaboration/content";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import { loadSnapshot, saveSnapshot } from "../partykit/snapshot";
@@ -195,4 +196,87 @@ it("atomically stores large binary documents and projections in bounded chunks",
     expect(await state.storage.get("document:chunk:1")).toBeUndefined();
     expect(await state.storage.get("projection:chunk:1")).toBeUndefined();
   });
+});
+
+it("projects with an active editor when the last collaborator credential expires", async () => {
+  const room = "note:33333333-3333-4333-8333-333333333333";
+  let joins = 0;
+  const writes: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/realtime/redeem") return Response.json({ token: ++joins === 1 ? "live-token" : "expired-token" });
+    if (path === "/auth/me") return Response.json({ id: `user-${joins}`, email: "user@example.com", full_name: "李 👩🏾‍💻" });
+    if (path.endsWith("/access")) return Response.json({ can_view: true, can_update: true });
+    if (path.endsWith("/collaboration")) {
+      const authorization = new Headers(init?.headers).get("Authorization")!;
+      writes.push(authorization);
+      return authorization.includes("expired") ? new Response("Unauthorized", { status: 401 }) : Response.json({ content: JSON.parse(init!.body as string).content });
+    }
+    return Response.json({ content: "base" });
+  }));
+  const sockets: WebSocket[] = [];
+  for (let index = 0; index < 2; index++) {
+    const response = await worker.fetch(request(`/parties/main/${room}?ticket=valid-ticket&_pk=${index}`), bindings);
+    expect(response.status).toBe(101);
+    response.webSocket!.accept(); sockets.push(response.webSocket!);
+  }
+  const stub = await getServerByName(bindings.NOTES, room);
+  await runInDurableObject(stub, async (instance) => {
+    expect([...instance.getConnections()][0].state.name).toBe("李 👩🏾‍💻");
+    const paragraph = instance.document.getXmlFragment("default").get(0) as Y.XmlElement;
+    (paragraph.get(0) as Y.XmlText).insert(4, " updated");
+    await instance.onSave();
+  });
+  expect(writes).toContain("Bearer live-token");
+  for (const socket of sockets) socket.close();
+  vi.unstubAllGlobals();
+});
+
+it("flushes a recovered dirty snapshot when an editor reconnects without typing", async () => {
+  const room = "note:44444444-4444-4444-8444-444444444444";
+  const writes: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/realtime/redeem") return Response.json({ token: "fresh-token" });
+    if (path === "/auth/me") return Response.json({ id: "editor", email: "editor@example.com" });
+    if (path.endsWith("/access")) return Response.json({ can_view: true, can_update: true });
+    if (path.endsWith("/collaboration")) {
+      const body = JSON.parse(init!.body as string); writes.push(body.content);
+      expect(body.base_content).toBe("base");
+      return Response.json({ content: body.content });
+    }
+    throw new Error("Recovered rooms must not reload stale backend text");
+  }));
+  const stub = await getServerByName(bindings.NOTES, room);
+  await runInDurableObject(stub, async (_instance, state) => {
+    const doc = createYDocFromPlainText("recovered edits")!;
+    await saveSnapshot(state.storage, doc, "base"); doc.destroy();
+  });
+  await expect(runInDurableObject(stub, (_instance, state) => { state.abort("test dirty recovery"); })).rejects.toThrow();
+  const response = await worker.fetch(request(`/parties/main/${room}?ticket=fresh-ticket`), bindings);
+  expect(response.status).toBe(101); response.webSocket!.accept();
+  await vi.waitFor(() => expect(writes).toContain("recovered edits"));
+  response.webSocket!.close(); vi.unstubAllGlobals();
+});
+
+it("closes downgraded editors before applying their next update", async () => {
+  const room = "note:55555555-5555-4555-8555-555555555555";
+  let canUpdate = true;
+  vi.stubGlobal("fetch", vi.fn(async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/realtime/redeem") return Response.json({ token: "token" });
+    if (path === "/auth/me") return Response.json({ id: "editor", email: "editor@example.com" });
+    if (path.endsWith("/access")) return Response.json({ can_view: true, can_update: canUpdate });
+    return Response.json({ content: "base" });
+  }));
+  const response = await worker.fetch(request(`/parties/main/${room}?ticket=ticket`), bindings);
+  const socket = response.webSocket!; socket.accept();
+  canUpdate = false;
+  const close = new Promise<number>((resolve) => socket.addEventListener("close", (event) => resolve(event.code)));
+  const edit = new Y.Doc(); edit.getText("denied").insert(0, "should never apply");
+  socket.send(frame(edit));
+  expect(await close).toBe(4403);
+  const stub = await getServerByName(bindings.NOTES, room);
+  await runInDurableObject(stub, async (instance) => { expect(instance.document.getText("denied").length).toBe(0); });
+  vi.unstubAllGlobals();
 });

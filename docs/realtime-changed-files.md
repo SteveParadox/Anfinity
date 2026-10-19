@@ -54,3 +54,16 @@
 | `frontend/worker-tests/realtime.test.ts` | Real workerd WebSocket, CRDT, authorization, restart and storage tests. |
 | `frontend/wrangler.jsonc` | Separate local/staging/production namespaces, SQLite migration and Worker bindings. |
 | `docs/realtime-changed-files.md` | This inventory. |
+| `Server/app/services/note_invites.py` | Lock and refresh note records for collaboration compare-and-swap. |
+| `Server/app/services/thinking_sessions.py` | Refresh locked ORM state and recheck stalled synthesis heartbeats atomically. |
+| `Server/tests/test_realtime_consistency.py` | Real SQLAlchemy stale-identity regressions and stale-heartbeat race coverage. |
+| `Server/tests/test_thinking_synthesis_observer.py` | Observer permission, database lifetime, and superseded-run regressions. |
+| `frontend/src/lib/collaboration/initialConnection.ts` | Abortable bounded retry policy for first-ticket acquisition. |
+| `frontend/src/lib/collaboration/initialConnection.test.ts` | Transient/permanent failure and cancellation regression tests. |
+| `frontend/src/lib/collaboration/localPersistence.ts` | Bounded and failure-safe browser CRDT update storage with cross-tab-safe compaction. |
+| `frontend/src/lib/collaboration/localPersistence.test.ts` | Recovery, corruption, blocked storage, and multi-tab compaction tests. |
+| `frontend/src/lib/collaboration/provider.test.tsx` | Hook unmount, token rotation, and invalid configuration tests. |
+| `frontend/src/lib/collaboration/content.ts` | Lossless plaintext whitespace round trips for backend projections. |
+| `frontend/src/lib/collaboration/content.test.ts` | Whitespace-only and trailing blank-line regression tests. |
+| `frontend/src/lib/collaboration/noteRoom.test.ts` | Explicit protocol and production-host validation regressions. |
+| `Server/tests/test_notes_api_helpers.py` | Required content and locked CAS API regression tests. |

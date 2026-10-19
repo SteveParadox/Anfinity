@@ -8,7 +8,7 @@ import {
 } from "react";
 import PartySocket from "partysocket";
 import type { ThinkingSession } from "@/types";
-import { getRealtimeHost } from "@/lib/collaboration/noteRoom";
+import { getRealtimeConnection } from "@/lib/collaboration/noteRoom";
 import { transformThinkingSessionFromAPI } from "@/lib/transformers";
 import { getThinkingSessionRoomId } from "@/lib/thinkingSessions/room";
 import {
@@ -138,8 +138,15 @@ export function useThinkingSessionRoom({
       return;
     }
 
+    let connection: ReturnType<typeof getRealtimeConnection>;
+    try { connection = getRealtimeConnection(); } catch {
+      setLastError("Real-time service configuration is missing or invalid. Contact your workspace administrator.");
+      setStatus("disconnected");
+      return;
+    }
     const nextSocket = new PartySocket({
-      host: getRealtimeHost(),
+      host: connection.host,
+      protocol: connection.protocol,
       room: getThinkingSessionRoomId(trimmedSessionId),
       maxRetries: 12,
       query: async () => {

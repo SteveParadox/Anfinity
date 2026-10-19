@@ -1,6 +1,6 @@
 import { Server, type Connection, type ConnectionContext, type WSMessage } from "partyserver";
 import type { RealtimeEnv } from "./security";
-import { authorizeMessage, checkMessageBudget, watchAuthorization } from "./security";
+import { authorizeMessage, checkMessageBudget, watchAuthorization, decodeIdentityHeader } from "./security";
 import {
   COLLABORATION_AUTH_TIMEOUT_MS,
   DEFAULT_PARTYKIT_BACKEND_URL,
@@ -358,8 +358,8 @@ export class ThinkingSessionServer extends Server<RealtimeEnv> {
       );
 
       request.headers.set(HEADER_USER_ID, presence.userId);
-      request.headers.set(HEADER_USER_EMAIL, presence.email);
-      request.headers.set(HEADER_USER_NAME, presence.name);
+      request.headers.set(HEADER_USER_EMAIL, encodeURIComponent(presence.email));
+      request.headers.set(HEADER_USER_NAME, encodeURIComponent(presence.name));
       request.headers.set(HEADER_USER_COLOR, presence.color);
       request.headers.set(HEADER_CAN_PARTICIPATE, presence.canParticipate ? "1" : "0");
       request.headers.set(HEADER_CAN_CONTROL, presence.canControl ? "1" : "0");
@@ -538,8 +538,8 @@ export class ThinkingSessionServer extends Server<RealtimeEnv> {
     return {
       connectionId: connection.id,
       userId: headers.get(HEADER_USER_ID)?.trim() || connection.id,
-      email: headers.get(HEADER_USER_EMAIL)?.trim() || "",
-      name: headers.get(HEADER_USER_NAME)?.trim() || "Collaborator",
+      email: decodeIdentityHeader(headers.get(HEADER_USER_EMAIL)).trim(),
+      name: decodeIdentityHeader(headers.get(HEADER_USER_NAME)).trim() || "Collaborator",
       color: headers.get(HEADER_USER_COLOR)?.trim() || getCollaboratorColor(connection.id),
       canParticipate: headers.get(HEADER_CAN_PARTICIPATE) === "1",
       canControl: headers.get(HEADER_CAN_CONTROL) === "1",

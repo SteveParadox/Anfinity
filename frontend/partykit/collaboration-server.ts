@@ -4,7 +4,7 @@ import { YServer } from "y-partyserver";
 import * as Y from "yjs";
 import { yDocToPlainText } from "../src/lib/collaboration/content";
 import type { RealtimeEnv } from "./security";
-import { authorizeMessage, checkMessageBudget, watchAuthorization } from "./security";
+import { authorizeMessage, checkMessageBudget, watchAuthorization, decodeIdentityHeader } from "./security";
 import {
   COLLABORATION_AUTH_TIMEOUT_MS,
   COLLABORATION_TYPING_TIMEOUT_MS,
@@ -198,6 +198,10 @@ function parseClientMessage(rawMessage: string): CollaborationClientMessage | nu
   return null;
 }
 
+class BackendResponseError extends Error {
+  constructor(readonly status: number) { super(`Backend request failed: ${status}`); }
+}
+
 async function fetchJson<T>(
   input: string,
   init: RequestInit,
@@ -219,7 +223,7 @@ async function fetchJson<T>(
       clearTimeout(timeout);
 
       if (!response.ok) {
-        throw new Error(`Backend request failed: ${response.status}`);
+        throw new BackendResponseError(response.status);
       }
 
       return (await response.json()) as T;
@@ -299,6 +303,8 @@ export class NoteCollaborationServer extends YServer<RealtimeEnv> {
   private initialized = false;
   private initializePromise: Promise<void> | null = null;
   private saveChain: Promise<void> = Promise.resolve();
+  private messageChain: Promise<void> = Promise.resolve();
+  private pendingMessages = 0;
   private backendContent = "";
   private projectionToken = "";
   private revision = 0;
@@ -334,14 +340,31 @@ export class NoteCollaborationServer extends YServer<RealtimeEnv> {
     const save = async () => {
       await this.checkpoint();
       const content = yDocToPlainText(this.document);
-      if (!this.initialized || content === this.backendContent || !this.projectionToken) return;
+      if (!this.initialized || content === this.backendContent.replace(/\r\n/g, "\n") || !this.projectionToken) return;
       try {
-        const note = await fetchJson<BackendNoteResponse>(
-          `${getBackendUrl(this.env)}/notes/${getNoteIdFromRoomId(this.name)}/collaboration`,
-          { method: "PATCH", headers: { Authorization: `Bearer ${this.projectionToken}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ content, base_content: this.backendContent }) },
-        );
-        this.backendContent = note.content ?? content;
+        const tokens = [...new Set([
+          ...[...this.connections.entries()].filter(([, presence]) => presence.canUpdate)
+            .map(([id]) => this.connectionTokens.get(id)).filter((token): token is string => Boolean(token)),
+          this.projectionToken,
+        ])];
+        let saved = false;
+        for (const token of tokens) {
+          try {
+            const note = await fetchJson<BackendNoteResponse>(
+              `${getBackendUrl(this.env)}/notes/${getNoteIdFromRoomId(this.name)}/collaboration`,
+              { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ content, base_content: this.backendContent }) },
+            );
+            this.projectionToken = token;
+            this.backendContent = note.content ?? content;
+            saved = true;
+            break;
+          } catch (error) {
+            // Authentication/permission failures cannot have committed a mutation.
+            if (!(error instanceof BackendResponseError) || ![401, 403].includes(error.status)) throw error;
+          }
+        }
+        if (!saved) throw new Error("No authorized editor credential available");
         await this.checkpoint();
       } catch {
         console.error(JSON.stringify({ event: "note_projection_failed" }));
@@ -383,8 +406,8 @@ export class NoteCollaborationServer extends YServer<RealtimeEnv> {
       const presence = await resolveConnectionContext(backendUrl, token, noteId);
 
       request.headers.set(HEADER_USER_ID, presence.userId);
-      request.headers.set(HEADER_USER_EMAIL, presence.email);
-      request.headers.set(HEADER_USER_NAME, presence.name);
+      request.headers.set(HEADER_USER_EMAIL, encodeURIComponent(presence.email));
+      request.headers.set(HEADER_USER_NAME, encodeURIComponent(presence.name));
       request.headers.set(HEADER_USER_COLOR, presence.color);
       request.headers.set(HEADER_CAN_UPDATE, presence.canUpdate ? "1" : "0");
       request.headers.set(HEADER_CONNECTED_AT, presence.connectedAt);
@@ -423,6 +446,8 @@ export class NoteCollaborationServer extends YServer<RealtimeEnv> {
       await this.initializePromise;
     }
     await super.onConnect(connection, ctx);
+    // A restored dirty snapshot must project even if nobody types after reopening it.
+    if (presence.canUpdate) this.ctx.waitUntil(this.onSave().catch(() => undefined));
 
     this.sendToConnection(connection, {
       type: "presence_snapshot",
@@ -441,14 +466,25 @@ export class NoteCollaborationServer extends YServer<RealtimeEnv> {
     }
   }
 
-  async onMessage(sender: Connection, message: WSMessage): Promise<void> {
-    if (!checkMessageBudget(sender, message)) return;
+  onMessage(sender: Connection, message: WSMessage): Promise<void> {
+    if (!checkMessageBudget(sender, message)) return Promise.resolve();
+    if (this.pendingMessages >= 32) { sender.close(4429, "Room queue full"); return Promise.resolve(); }
+    this.pendingMessages++;
+    const pending = this.messageChain.then(() => this.processMessage(sender, message)).finally(() => { this.pendingMessages--; });
+    this.messageChain = pending.catch(() => undefined);
+    return pending;
+  }
+
+  private async processMessage(sender: Connection, message: WSMessage): Promise<void> {
     const token = this.connectionTokens.get(sender.id);
     const access = token ? await authorizeMessage(this.env, token, this.name) : null;
     if (!access) {
       sender.close(4403, "Access expired or revoked"); return;
     }
     const presence = this.connections.get(sender.id);
+    if (presence?.canUpdate && !access.can_update) {
+      sender.close(4403, "Editing permission revoked"); return;
+    }
     if (presence) presence.canUpdate = Boolean(access.can_update);
     // YServer checks isReadOnly for both sync step 2 and update frames.
     super.onMessage(sender, message);
@@ -522,8 +558,8 @@ export class NoteCollaborationServer extends YServer<RealtimeEnv> {
     return {
       connectionId: connection.id,
       userId: headers.get(HEADER_USER_ID)?.trim() || connection.id,
-      email: headers.get(HEADER_USER_EMAIL)?.trim() || "",
-      name: headers.get(HEADER_USER_NAME)?.trim() || "Unknown collaborator",
+      email: decodeIdentityHeader(headers.get(HEADER_USER_EMAIL)).trim(),
+      name: decodeIdentityHeader(headers.get(HEADER_USER_NAME)).trim() || "Unknown collaborator",
       color: headers.get(HEADER_USER_COLOR)?.trim() || getCollaboratorColor(connection.id),
       canUpdate: headers.get(HEADER_CAN_UPDATE) === "1",
       connectedAt: headers.get(HEADER_CONNECTED_AT)?.trim() || new Date().toISOString(),

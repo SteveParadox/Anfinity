@@ -25,7 +25,7 @@ from app.services.thinking_sessions import (
     create_contribution,
     create_thinking_session,
     ensure_thinking_session_permission,
-    fail_synthesis_run,
+    fail_stalled_synthesis_run,
     get_thinking_session_or_404,
     get_thinking_synthesis_run_or_404,
     list_thinking_sessions_for_workspace,
@@ -377,9 +377,12 @@ async def stream_thinking_session_synthesis_endpoint(
     await ensure_thinking_session_permission(session, current_user, db, "control")
     run = await get_thinking_synthesis_run_or_404(session_id, payload.run_id, db)
     run_id = run.id
+    run_status = str(getattr(run.status, "value", run.status))
+    if run_status in {"pending", "streaming"} and (session.active_synthesis_run_id != run_id or str(getattr(session.phase, "value", session.phase)) != "synthesizing"):
+        raise HTTPException(409, "This synthesis run is no longer active")
     # Enqueue before streaming; the task owns its database session and provider request.
     # Duplicate dispatch is harmless because the producer atomically claims PENDING.
-    if str(getattr(run.status, "value", run.status)) == "pending":
+    if run_status == "pending":
         from app.tasks.thinking_synthesis import run_thinking_synthesis
         try:
             run_thinking_synthesis.apply_async(
@@ -390,6 +393,7 @@ async def stream_thinking_session_synthesis_endpoint(
             raise HTTPException(503, "Synthesis queue unavailable; reconnect to retry") from None
 
     model = run.model
+    user_id = current_user.id
     # Do not retain the request connection throughout a long-lived observer.
     await db.close()
 
@@ -401,14 +405,21 @@ async def stream_thinking_session_synthesis_endpoint(
         previous = ""
         yield f"data: {json.dumps({'type': 'start', 'run_id': str(run_id), 'session_id': str(session_id), 'model': model})}\n\n"
         while True:
+            events = []
             async with async_session_scope() as poll_db:
+                from sqlalchemy import select
+                from app.database.session import bind_db_user_context
+                bind_db_user_context(poll_db, user_id)
+                observer = (await poll_db.execute(select(DBUser).where(DBUser.id == user_id))).scalar_one_or_none()
+                if observer is None or not observer.is_active:
+                    raise HTTPException(403, "Access revoked")
                 current = await get_thinking_session_or_404(session_id, poll_db)
-                await ensure_thinking_session_permission(current, current_user, poll_db, "control")
+                await ensure_thinking_session_permission(current, observer, poll_db, "control")
                 current_run = await get_thinking_synthesis_run_or_404(session_id, run_id, poll_db)
                 run_status = str(getattr(current_run.status, "value", current_run.status))
                 output = current_run.output_text or ""
                 if output != previous:
-                    yield f"data: {json.dumps({'type': 'token', 'text': output[len(previous):] if output.startswith(previous) else output, 'full_text': output, 'run_id': str(run_id)})}\n\n"
+                    events.append({"type": "token", "text": output[len(previous):] if output.startswith(previous) else output, "full_text": output, "run_id": str(run_id)})
                     previous = output
                 # Interrupted producers retain their last committed partial output.
                 updated_at = current_run.updated_at
@@ -416,15 +427,22 @@ async def stream_thinking_session_synthesis_endpoint(
                     updated_at = updated_at.replace(tzinfo=timezone.utc)
                 stale_after = max(120, settings.THINKING_SESSION_SYNTHESIS_TIMEOUT_SECONDS * 2)
                 if run_status == "streaming" and updated_at and (datetime.now(timezone.utc) - updated_at).total_seconds() > stale_after:
-                    current = await fail_synthesis_run(current, current_run, "Synthesis worker interrupted; partial output retained", poll_db)
-                    run_status = "failed"
+                    current, failed = await fail_stalled_synthesis_run(session_id, run_id, stale_after, poll_db)
+                    if failed:
+                        run_status = "failed"
                 if run_status in {"completed", "failed"}:
+                    # A terminal run may have committed after the first session SELECT.
+                    await poll_db.refresh(current)
                     snapshot = await build_thinking_session_snapshot(current, poll_db)
                     event = {"type": "done" if run_status == "completed" else "error", "run_id": str(run_id), "text": output, "session": snapshot}
                     if run_status == "failed":
                         event["message"] = "Synthesis interrupted; partial output is retained"
-                    yield f"data: {json.dumps(event)}\n\n"
-                    return
+                    events.append(event)
+            # Release the database connection before network backpressure can suspend us.
+            for event in events:
+                yield f"data: {json.dumps(event)}\n\n"
+            if run_status in {"completed", "failed"}:
+                return
             yield ": heartbeat\n\n"
             await asyncio.sleep(0.75)
 

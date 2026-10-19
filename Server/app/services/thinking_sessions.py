@@ -175,6 +175,7 @@ async def get_thinking_session_for_update(session_id: UUID, db: AsyncSession) ->
         select(ThinkingSession)
         .where(ThinkingSession.id == session_id)
         .with_for_update(of=ThinkingSession)
+        .execution_options(populate_existing=True)
     )
     session = result.scalar_one_or_none()
     if session is None:
@@ -211,6 +212,7 @@ async def get_thinking_synthesis_run_for_update(
             ThinkingSessionSynthesisRun.session_id == session_id,
         )
         .with_for_update(of=ThinkingSessionSynthesisRun)
+        .execution_options(populate_existing=True)
     )
     run = result.scalar_one_or_none()
     if run is None:
@@ -926,6 +928,24 @@ async def complete_synthesis_run(
     await db.commit()
     await db.refresh(session)
     return session
+
+
+async def fail_stalled_synthesis_run(
+    session_id: UUID, run_id: UUID, stale_after: float, db: AsyncSession,
+) -> tuple[ThinkingSession, bool]:
+    """Recheck the heartbeat under the same locks used by the producer."""
+    session = await get_thinking_session_for_update(session_id, db)
+    run = await get_thinking_synthesis_run_for_update(session_id, run_id, db)
+    updated = run.updated_at
+    if updated is not None and updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    if (session.active_synthesis_run_id != run.id
+        or coerce_phase(session.phase) != ThinkingSessionPhase.SYNTHESIZING
+        or coerce_synthesis_status(run.status) != ThinkingSynthesisStatus.STREAMING
+        or updated is None or (utcnow() - updated).total_seconds() <= stale_after):
+        return session, False
+    failed = await fail_synthesis_run(session, run, "Synthesis worker interrupted; partial output retained", db)
+    return failed, True
 
 
 async def fail_synthesis_run(

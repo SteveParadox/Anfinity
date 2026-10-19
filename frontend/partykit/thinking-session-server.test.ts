@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as Party from "./test-types";
 vi.mock("partyserver", () => import("./test-runtime"));
 vi.mock("y-partyserver", () => import("./test-runtime"));
-vi.mock("./security", () => ({ authorizeMessage: async () => ({ can_view: true, can_update: true }), checkMessageBudget: () => true, watchAuthorization: () => () => {} }));
+vi.mock("./security", () => ({ authorizeMessage: async () => ({ can_view: true, can_update: true }), checkMessageBudget: () => true, watchAuthorization: () => () => {}, decodeIdentityHeader: (value: string | null) => value ? decodeURIComponent(value) : "" }));
 import ThinkingSessionServer from "./thinking-session-server";
 
 const SESSION_ID = "22222222-2222-4222-8222-222222222222";

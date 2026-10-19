@@ -93,3 +93,24 @@ async def test_toggle_note_comment_reaction_endpoint_requires_update_permission(
         )
 
     ensure_permission.assert_awaited_once_with(note_obj, user, db, "update")
+
+
+def test_collaboration_payload_requires_explicit_content():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        notes.NoteCollaborationSync.model_validate({})
+    assert notes.NoteCollaborationSync(content="").content == ""
+
+
+@pytest.mark.asyncio
+async def test_collaboration_cas_is_checked_after_locked_read(monkeypatch):
+    from fastapi import BackgroundTasks
+    note = type("NoteStub", (), {"id": uuid4(), "content": "newer"})()
+    load = AsyncMock(return_value=note)
+    monkeypatch.setattr(notes, "load_note_or_404", load)
+    monkeypatch.setattr(notes, "ensure_note_permission", AsyncMock())
+    with pytest.raises(HTTPException) as error:
+        await notes.sync_note_collaboration(str(note.id), notes.NoteCollaborationSync(content="stale", base_content="old"),
+                                            BackgroundTasks(), object(), object(), object())
+    assert error.value.status_code == 409
+    assert load.call_args.kwargs["for_update"] is True
